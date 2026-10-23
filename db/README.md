@@ -25,7 +25,7 @@ Start the isolated test server when needed:
 docker compose --profile test up -d postgres-test
 ```
 
-To run the real PostgreSQL check, keep both database services running and execute:
+Local verification scripts are kept in `db/smoke-test/`, which is ignored by Git. If that folder is present locally, keep both database services running and execute:
 
 ```sh
 bash db/smoke-test/smoke.sh
@@ -56,6 +56,34 @@ The schema owner password is `DB_DEV_OWNER_PASSWORD`; the runtime password is `D
 
 The init script runs only when a service's data directory is empty. Re-running `docker compose up` preserves databases, roles, and data. Editing a password in `.env` does not rotate a password already stored in an initialized volume; use a deliberate PostgreSQL `ALTER ROLE` operation if rotation is required. Adding a service or changing database names likewise does not rename existing resources.
 
-Later versioned application schema files should be applied explicitly to the intended platform database with the schema owner after confirming the target service and database. This setup installs no application tables and does not apply application migrations. The backend connection environment/provider wiring is still a separate integration step; health only proves PostgreSQL provisioning. Keep the test connection fixed to `postgres-test`; do not pass development connection details to tests or cleanup commands.
+The PostgreSQL init script provisions roles and databases only; it installs no application tables and does not apply application migrations. Apply the application schema explicitly with the command below. The backend connection environment/provider wiring is still a separate integration step; health only proves PostgreSQL provisioning. Keep the test connection fixed to `postgres-test`; do not pass development connection details to tests or cleanup commands.
+
+Apply the platform identity schema from the repository root after starting the matching service:
+
+```sh
+bash db/apply.sh test
+bash db/apply.sh dev
+```
+
+The command accepts only `test` or `dev`, maps them to the fixed `test_platform` or `dev_platform` database on the corresponding Compose service, and uses that service's `wbd_schema_owner` credentials. It verifies the platform identity and ownership, then applies sorted `db/migrations/*.sql` files in a transaction. The runner hashes and executes the same byte-for-byte migration snapshot, without line-ending normalization. Each transaction takes a database advisory lock and records version, SHA-256 checksum, and apply time in `app.schema_migrations`. Reapplying a version with the same checksum is a no-op; a changed checksum or unsafe preexisting schema is rejected. A failed migration rolls back its DDL and ledger row. Released migration files are immutable; add a later numbered file for schema changes.
+
+## Platform identity schema
+
+Migration `001_identity.sql` creates six tables in schema `app`. IDs are caller-supplied UUIDs, timestamps are `timestamptz`, and `created_at`/`updated_at` default to the insert time. Application code updates `updated_at` explicitly.
+
+| Table | Purpose and key rules |
+| --- | --- |
+| `app.users` | Identity and encoded password hash; trimmed, case-sensitive unique username, 3–64 characters; active/admin flags and `auth_version` starting at 1. |
+| `app.groups` | Named groups; trimmed, case-sensitive unique name, 1–100 characters. |
+| `app.database_connections` | Connection metadata and encrypted credential bytes/key ID; SSL mode is `disable`, `require`, or `verify-full`; port is 1–65535; active `target_key` values are unique. Soft deletion preserves records. |
+| `app.group_memberships` | Group/user composite key; group deletion cascades, user deletion is restricted. |
+| `app.group_database_grants` | Group/connection composite key; access is `view` or `edit`; group deletion cascades, connection deletion is restricted. |
+| `app.security_guard` | Exactly one `identity_admin` lock row for serialized identity administration. |
+
+The database checks nonblank hashes and ciphertext presence, but does not hash passwords, encrypt credentials, validate cryptographic formats, or calculate `target_key`. Database errors can be mapped using the stable constraint names in the migration: malformed values produce check violations (`23514`), duplicate keys produce unique violations (`23505`), and missing references or restricted deletion produce foreign-key violations (`23503`).
+
+`wbd_schema_owner` owns the schema, migration ledger, and application tables. `wbd_platform_runtime` receives `USAGE` on `app`; `SELECT`, `INSERT`, and `UPDATE` on users and connections; and `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on groups, memberships, and grants. It can `SELECT` the guard and update only its `name` column for row locking; the check constraint preserves its singleton identity. It can read migration versions, but cannot change the ledger, perform hard deletes on users/connections, truncate tables, create schema objects, or assume the owner role. `PUBLIC` receives no application table access. No default privileges grant access to future tables.
+
+The local optional checks exercise PostgreSQL storage and runtime privileges against the test platform. `db/smoke-test/fresh-race.sh` starts only `postgres-test` in a unique temporary Compose project, verifies two concurrent first applies, then stops that container and leaves its named volume in place. Both scripts are ignored by Git and are not required for normal database startup.
 
 To keep data, leave the named volumes in place. Do not use volume removal or reset commands against this project unless intentionally discarding its local databases.
