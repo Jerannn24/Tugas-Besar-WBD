@@ -58,14 +58,14 @@ The init script runs only when a service's data directory is empty. Re-running `
 
 The PostgreSQL init script provisions roles and databases only; it installs no application tables and does not apply application migrations. Apply the application schema explicitly with the command below. The backend connection environment/provider wiring is still a separate integration step; health only proves PostgreSQL provisioning. Keep the test connection fixed to `postgres-test`; do not pass development connection details to tests or cleanup commands.
 
-Apply the platform identity schema from the repository root after starting the matching service:
+Apply the platform schema from the repository root after starting the matching service:
 
 ```sh
 bash db/apply.sh test
 bash db/apply.sh dev
 ```
 
-The command accepts only `test` or `dev`, maps them to the fixed `test_platform` or `dev_platform` database on the corresponding Compose service, and uses that service's `wbd_schema_owner` credentials. It verifies the platform identity and ownership, then applies sorted `db/migrations/*.sql` files in a transaction. The runner hashes and executes the same byte-for-byte migration snapshot, without line-ending normalization. Each transaction takes a database advisory lock and records version, SHA-256 checksum, and apply time in `app.schema_migrations`. Reapplying a version with the same checksum is a no-op; a changed checksum or unsafe preexisting schema is rejected. A failed migration rolls back its DDL and ledger row. Released migration files are immutable; add a later numbered file for schema changes.
+The command accepts only `test` or `dev`, maps them to the fixed `test_platform` or `dev_platform` database on the corresponding Compose service, and uses that service's `wbd_schema_owner` credentials. It verifies platform identity and ownership, then applies sorted `db/migrations/*.sql` files in a transaction. The runner hashes and executes the same byte-for-byte migration snapshot, without line-ending normalization. Each transaction takes a database advisory lock and records version, SHA-256 checksum, and apply time in `app.schema_migrations`. Reapplying a version with the same checksum is a no-op; a changed checksum or unsafe preexisting schema is rejected. A failed migration rolls back its DDL and ledger row. Released migration files are immutable; add a later numbered file for schema changes.
 
 ## Platform identity schema
 
@@ -83,6 +83,31 @@ Migration `001_identity.sql` creates six tables in schema `app`. IDs are caller-
 The database checks nonblank hashes and ciphertext presence, but does not hash passwords, encrypt credentials, validate cryptographic formats, or calculate `target_key`. Database errors can be mapped using the stable constraint names in the migration: malformed values produce check violations (`23514`), duplicate keys produce unique violations (`23505`), and missing references or restricted deletion produce foreign-key violations (`23503`).
 
 `wbd_schema_owner` owns the schema, migration ledger, and application tables. `wbd_platform_runtime` receives `USAGE` on `app`; `SELECT`, `INSERT`, and `UPDATE` on users and connections; and `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on groups, memberships, and grants. It can `SELECT` the guard and update only its `name` column for row locking; the check constraint preserves its singleton identity. It can read migration versions, but cannot change the ledger, perform hard deletes on users/connections, truncate tables, create schema objects, or assume the owner role. `PUBLIC` receives no application table access. No default privileges grant access to future tables.
+
+## Session persistence
+
+Migration `002_sessions.sql` adds `app.session_families` and `app.session_tokens`. A family records its user, authentication-version snapshot, login/activity/rotation timestamps, absolute expiry, and optional revocation time. A token row stores a SHA-256 identifier hash, its family, `current`/`grace`/`retired` state, creation and validity times, and optional encrypted recovery bytes plus a key identifier.
+
+Session IDs and timestamps are supplied by the application. The database enforces row-local time ordering, positive `auth_version`, a 32-byte token hash, allowed token states, nonempty current-token recovery material, and NULL recovery fields for grace/retired tokens. A partial unique index allows at most one current token per family; multiple grace tokens may coexist.
+
+| Table | Column | Type | Null/default |
+| --- | --- | --- | --- |
+| `session_families` | `id`, `user_id` | `uuid` | NOT NULL; no default |
+| `session_families` | `auth_version` | `bigint` | NOT NULL; no default |
+| `session_families` | `created_at`, `last_seen_at`, `absolute_expires_at`, `rotated_at` | `timestamptz` | NOT NULL; no default |
+| `session_families` | `revoked_at` | `timestamptz` | NULL; default NULL |
+| `session_tokens` | `token_hash` | `bytea` | NOT NULL; no default |
+| `session_tokens` | `family_id` | `uuid` | NOT NULL; no default |
+| `session_tokens` | `state` | `text` | NOT NULL; no default |
+| `session_tokens` | `created_at`, `valid_until` | `timestamptz` | NOT NULL; no default |
+| `session_tokens` | `token_ciphertext` | `bytea` | NULL; default NULL |
+| `session_tokens` | `token_key_id` | `text` | NULL; default NULL |
+
+Deleting a user referenced by a family is restricted. Owner deletion of a family cascades to its token rows.
+
+The runtime role has `SELECT`, `INSERT`, and `UPDATE` on both session tables so it can lock and update rows. It has no `DELETE`, `TRUNCATE`, DDL, or migration-ledger write privilege. Maintenance cleanup of expired or revoked families is an owner operation; there is no automatic cleanup job. `PUBLIC` receives no session-table access.
+
+The schema does not implement token generation or validation, cryptography, cookies, CSRF, idle/absolute expiry evaluation, user-active/auth-version rechecks, exact-one-current semantics, or lifecycle transaction ordering. Login/family creation and security changes use the `identity_admin` guard before locking user rows; ordinary activity and rotation do not need that global guard. Runtime locks user rows in ID order before family and token rows, then re-reads state. Family revocation and token transitions stay in the same transaction. Use one server-time value after acquiring locks; activity and rotation must never extend `absolute_expires_at`. Recovery ciphertext exists only for the current token and must not contain or expose plaintext identifiers or key material in logs or API data.
 
 The local optional checks exercise PostgreSQL storage and runtime privileges against the test platform. `db/smoke-test/fresh-race.sh` starts only `postgres-test` in a unique temporary Compose project, verifies two concurrent first applies, then stops that container and leaves its named volume in place. Both scripts are ignored by Git and are not required for normal database startup.
 
