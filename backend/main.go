@@ -2,12 +2,19 @@ package main
 
 import (
 	"log"
-	"net/http"
+
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/config"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/server"
 )
 
 func main() {
-	mux := http.NewServeMux()
+	cfg := config.LoadConfig()
+	db := config.LoadDB()
+	app := server.New(db, cfg.JWTSecret)
 
-	log.Println("Backend berjalan di http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Printf("Server starting on port %s", cfg.Port)
+
+	if err := app.Listen(":" + cfg.Port); err != nil {
+		log.Fatal(err)
+	}
 }
