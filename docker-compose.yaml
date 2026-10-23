@@ -17,3 +17,57 @@ services:
       - "8080:8080"
     volumes:
       - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+    environment:
+      POSTGRES_USER: ${DB_DEV_BOOTSTRAP_USER:?Set DB_DEV_BOOTSTRAP_USER in .env}
+      POSTGRES_PASSWORD: ${DB_DEV_BOOTSTRAP_PASSWORD:?Set DB_DEV_BOOTSTRAP_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      DB_PLATFORM: ${DB_DEV_PLATFORM_DB:?Set DB_DEV_PLATFORM_DB in .env}
+      DB_OWNER: ${DB_DEV_OWNER_USER:?Set DB_DEV_OWNER_USER in .env}
+      DB_OWNER_PASSWORD: ${DB_DEV_OWNER_PASSWORD:?Set DB_DEV_OWNER_PASSWORD in .env}
+      DB_RUNTIME: ${DB_DEV_RUNTIME_USER:?Set DB_DEV_RUNTIME_USER in .env}
+      DB_RUNTIME_PASSWORD: ${DB_DEV_RUNTIME_PASSWORD:?Set DB_DEV_RUNTIME_PASSWORD in .env}
+      DB_TARGET_A: ${DB_DEV_TARGET_A:?Set DB_DEV_TARGET_A in .env}
+      DB_TARGET_B: ${DB_DEV_TARGET_B:?Set DB_DEV_TARGET_B in .env}
+    volumes:
+      - postgres-dev-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  postgres-test:
+    image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: ${DB_TEST_BOOTSTRAP_USER:?Set DB_TEST_BOOTSTRAP_USER in .env}
+      POSTGRES_PASSWORD: ${DB_TEST_BOOTSTRAP_PASSWORD:?Set DB_TEST_BOOTSTRAP_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      DB_PLATFORM: ${DB_TEST_PLATFORM_DB:?Set DB_TEST_PLATFORM_DB in .env}
+      DB_OWNER: ${DB_TEST_OWNER_USER:?Set DB_TEST_OWNER_USER in .env}
+      DB_OWNER_PASSWORD: ${DB_TEST_OWNER_PASSWORD:?Set DB_TEST_OWNER_PASSWORD in .env}
+      DB_RUNTIME: ${DB_TEST_RUNTIME_USER:?Set DB_TEST_RUNTIME_USER in .env}
+      DB_RUNTIME_PASSWORD: ${DB_TEST_RUNTIME_PASSWORD:?Set DB_TEST_RUNTIME_PASSWORD in .env}
+      DB_TARGET_A: ${DB_TEST_TARGET_A:?Set DB_TEST_TARGET_A in .env}
+      DB_TARGET_B: ${DB_TEST_TARGET_B:?Set DB_TEST_TARGET_B in .env}
+    volumes:
+      - postgres-test-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  postgres-dev-data:
+  postgres-test-data:
