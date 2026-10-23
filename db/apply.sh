@@ -9,7 +9,7 @@ service=postgres
 snapshot=
 trap '[[ -z ${snapshot:-} ]] || rm -f -- "$snapshot"' EXIT
 
-# The Compose service supplies only its own fixed platform database and owner credentials.
+# Layanan Compose menentukan database platform dan kredensial pemiliknya.
 compose=(docker compose)
 [[ $service == postgres-test ]] && compose+=(--profile test)
 "${compose[@]}" ps --status running "$service" | grep -q "$service" || fail "$service is not running"
@@ -30,7 +30,7 @@ for migration in db/migrations/*.sql; do
   cp -- "$migration" "$snapshot"
   checksum=$(sha256sum "$snapshot" | cut -d ' ' -f1)
 
-  # Hash and execute the same immutable file snapshot; migrations in this repo use LF.
+  # Hash dan eksekusi memakai salinan yang sama.
   {
     cat <<'SQL'
 \set ON_ERROR_STOP on
