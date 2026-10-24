@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -63,5 +64,58 @@ func TestSafeMethods(t *testing.T) {
 	}
 	if !IsCSRFRequired(http.MethodPost) {
 		t.Fatal("POST should require CSRF")
+	}
+}
+
+func TestResolveActorRejectsNilUserID(t *testing.T) {
+	s := &service{}
+
+	_, err := s.ResolveActor(context.Background(), uuid.Nil)
+	if !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("error = %v, want ErrUnauthenticated", err)
+	}
+}
+
+func TestEffectiveAccessRejectsNilActorID(t *testing.T) {
+	s := &service{}
+
+	access, err := s.EffectiveAccess(
+		context.Background(),
+		uuid.Nil,
+		uuid.New(),
+	)
+	if !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("error = %v, want ErrUnauthenticated", err)
+	}
+	if access != AccessNone {
+		t.Fatalf("access = %q, want %q", access, AccessNone)
+	}
+}
+
+func TestEffectiveAccessRejectsNilDatabaseID(t *testing.T) {
+	s := &service{}
+
+	access, err := s.EffectiveAccess(
+		context.Background(),
+		uuid.New(),
+		uuid.Nil,
+	)
+	if !errors.Is(err, ErrInvalidID) {
+		t.Fatalf("error = %v, want ErrInvalidID", err)
+	}
+	if access != AccessNone {
+		t.Fatalf("access = %q, want %q", access, AccessNone)
+	}
+}
+
+func TestRequireAdminRejectsNilActorID(t *testing.T) {
+	s := &service{}
+
+	err := s.RequireAdmin(Actor{
+		ID:      uuid.Nil,
+		IsAdmin: true,
+	})
+	if !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("error = %v, want ErrUnauthenticated", err)
 	}
 }

@@ -242,3 +242,56 @@ func TestConcurrentSessionRotationOnlyOneSucceeds(t *testing.T) {
 		t.Fatalf("expected exactly one successful rotation, got %d", successes)
 	}
 }
+
+func TestLoadDuration(t *testing.T) {
+	t.Setenv("TEST_SESSION_DURATION", "5m")
+
+	got := LoadDuration("TEST_SESSION_DURATION", time.Minute)
+	if got != 5*time.Minute {
+		t.Fatalf("LoadDuration() = %v, want 5m", got)
+	}
+}
+
+func TestLoadDurationUsesDefaultWhenUnset(t *testing.T) {
+	t.Setenv("TEST_SESSION_DURATION", "")
+
+	want := 10 * time.Minute
+	got := LoadDuration("TEST_SESSION_DURATION", want)
+
+	if got != want {
+		t.Fatalf("LoadDuration() = %v, want %v", got, want)
+	}
+}
+
+func TestValidatePassword(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+		wantErr  bool
+	}{
+		{
+			name:     "strong password",
+			password: "StrongPassword123!",
+			wantErr:  false,
+		},
+		{
+			name:     "empty password",
+			password: "",
+			wantErr:  true,
+		},
+		{
+			name:     "short password",
+			password: "short",
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errs := ValidatePassword(tt.password)
+			if gotErr := len(errs) > 0; gotErr != tt.wantErr {
+				t.Fatalf("ValidatePassword() errors = %v, wantErr %v", errs, tt.wantErr)
+			}
+		})
+	}
+}
