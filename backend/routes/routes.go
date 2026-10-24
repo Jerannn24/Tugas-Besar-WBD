@@ -20,7 +20,8 @@ func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
 	})
 
 	authRepo := auth.NewRepository(db)
-	authService := auth.NewService(authRepo, jwtSecret)
+	authSessions := auth.NewSessionRepository(db)
+	authService := auth.NewService(authRepo, authSessions, auth.LoadSessionConfig(jwtSecret))
 	authHandler := auth.NewHandler(authService)
-	auth.RegisterRoutes(api, authHandler)
+	auth.RegisterRoutes(api, authHandler, auth.SessionMiddleware(authService))
 }

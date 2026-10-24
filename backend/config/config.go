@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"log"
+	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -15,9 +16,9 @@ type Config struct {
 
 func LoadConfig() Config {
 	return Config{
-		Port:      "8080",
-		JWTSecret: "secret_key",
-		DB:        "postgres://username:password@localhost:5432/dbname",
+		Port:      LoadEnv("PORT", "8080"),
+		JWTSecret: LoadEnv("JWT_SECRET", "secret_key"),
+		DB:        LoadEnv("DATABASE_URL", "postgres://username:password@localhost:5432/dbname"),
 	}
 }
 
@@ -27,5 +28,18 @@ func LoadDB() *pgxpool.Pool {
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
 	}
+
+	if err := dbpool.Ping(context.Background()); err != nil {
+		log.Fatalf("Unable to ping database: %v\n", err)
+	}
+
 	return dbpool
+}
+
+func LoadEnv(key, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	return value
 }
