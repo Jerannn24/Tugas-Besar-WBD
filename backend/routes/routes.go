@@ -1,9 +1,14 @@
 package routes
 
 import (
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/admin"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/auth"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/databaseapi"
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"log"
 )
 
 func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
@@ -20,7 +25,31 @@ func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
 	})
 
 	authRepo := auth.NewRepository(db)
-	authService := auth.NewService(authRepo, jwtSecret)
+	authSessions := auth.NewSessionRepository(db)
+	authService := auth.NewService(authRepo, authSessions, auth.LoadSessionConfig(jwtSecret))
 	authHandler := auth.NewHandler(authService)
-	auth.RegisterRoutes(api, authHandler)
+	sessionMiddleware := auth.SessionMiddleware(authService)
+	auth.RegisterRoutes(api, authHandler, sessionMiddleware)
+
+	authorizer := authz.NewService(authz.NewRepository(db))
+	adminHandler := admin.NewHandler(admin.NewService(admin.NewRepository(db)))
+	protected := api.Group("", sessionMiddleware, authz.ActorMiddleware(authorizer))
+	admin.RegisterRoutes(protected, adminHandler, authz.AdminMiddleware(authorizer), auth.CSRFMiddleware())
+	connectionRepository := connections.NewRepository(db, jwtSecret)
+	connectionPools := connections.NewPoolManager(connectionRepository)
+	connectionService := connections.NewService(connectionRepository, connectionPools)
+	connectionHandler := connections.NewHandler(connectionService)
+	connections.RegisterRoutes(protected, connectionHandler, authz.AdminMiddleware(authorizer), auth.CSRFMiddleware())
+	
+	if platform, err := databaseapi.OpenPlatform(); err != nil {
+		log.Printf("database API disabled: %v", err)
+	} else if err := databaseapi.Register(app, platform, authService, authorizer, connectionPools); err != nil {
+		_ = platform.Close()
+		log.Printf("database API disabled: %v", err)
+	} else {
+		app.Hooks().OnShutdown(func() error {
+			connectionPools.Close()
+			return platform.Close()
+		})
+	}
 }
