@@ -42,10 +42,7 @@ func TestRegisterRejectsMissingDependencies(t *testing.T) {
 			var sessionNil = tt.sessionNil
 			var authzNil = tt.authzNil
 			var poolsNil = tt.poolsNil
-
-			// Setiap dependency sengaja nil untuk menguji validasi awal.
-			// Karena Register memeriksa dependency satu per satu dengan
-			// kondisi OR, cukup satu dependency nil untuk menghasilkan error.
+			
 			_ = platformNil
 			_ = sessionNil
 			_ = authzNil
