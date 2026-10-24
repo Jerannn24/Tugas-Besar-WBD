@@ -13,6 +13,7 @@ export type ApiFailure = Exclude<ApiResult<unknown>, { ok: true }>
 export type RequestOptions = {
   body?: unknown
   redirectOn401?: boolean
+  timeoutMs?: number
 }
 
 export type TransportRequest = {
@@ -20,6 +21,7 @@ export type TransportRequest = {
   path: string
   headers: Record<string, string>
   body?: string
+  signal?: AbortSignal
 }
 
 const MUTATING: ReadonlySet<HttpMethod> = new Set(['POST', 'PATCH', 'PUT', 'DELETE'])
@@ -38,6 +40,7 @@ async function transport(req: TransportRequest): Promise<Response> {
     headers: req.headers,
     body: req.body,
     credentials: 'same-origin',
+    signal: req.signal,
   })
 }
 
@@ -78,6 +81,7 @@ export async function request<T>(
   const extraHeaders: Record<string, string> = {}
   if (MUTATING.has(method)) {
     const token = await getCsrfToken()
+    
     if (!token.ok) return token
     extraHeaders['X-CSRF-Token'] = token.data
   }
@@ -101,15 +105,20 @@ async function send<T>(
 ): Promise<ApiResult<T>> {
   const headers: Record<string, string> = { Accept: 'application/json', ...extraHeaders }
   let body: string | undefined
+
   if (options.body !== undefined) {
     headers['Content-Type'] = 'application/json'
     body = JSON.stringify(options.body)
   }
 
+  const controller = options.timeoutMs !== undefined ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), options.timeoutMs) : undefined
+
   let response: Response
   try {
-    response = await transport({ method, path, headers, body })
+    response = await transport({ method, path, headers, body, signal: controller?.signal })
   } catch {
+    clearTimeout(timer)
     return { ok: false, kind: 'network' }
   }
 
@@ -117,8 +126,11 @@ async function send<T>(
   try {
     payload = await response.json()
   } catch {
+    clearTimeout(timer)
+    if (controller?.signal.aborted) return { ok: false, kind: 'network' }
     return { ok: false, kind: 'invalid_response', status: response.status }
   }
+  clearTimeout(timer)
 
   if (response.ok && isObject(payload) && 'data' in payload) {
     return { ok: true, status: response.status, data: payload.data as T }
@@ -171,7 +183,7 @@ export function errorMessage(failure: ApiFailure): string {
       if (code === 'INVALID_CREDENTIALS' || code === 'CSRF_INVALID' || code === 'INTERNAL_ERROR') {
         return GENERIC_MESSAGES[code]
       }
-      
+
       return message || GENERIC_MESSAGES[code] || 'Permintaan gagal.'
     }
   }

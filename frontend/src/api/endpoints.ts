@@ -106,4 +106,7 @@ export const listMigrations = (databaseId: ID) =>
 export const getMigration = (databaseId: ID, executionId: ID) =>
   request<Execution>('GET', `${db(databaseId)}/migrations/${e(executionId)}`)
 export const executeDraft = (databaseId: ID, draftId: ID, input: ExecuteInput) =>
-  request<Execution>('POST', `${db(databaseId)}/drafts/${e(draftId)}/execute`, { body: input })
+  request<Execution>('POST', `${db(databaseId)}/drafts/${e(draftId)}/execute`, {
+    body: input,
+    timeoutMs: 30_000,
+  })

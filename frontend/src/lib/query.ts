@@ -6,3 +6,7 @@ export function getQueryParam(name: string): string | null {
 export function pageUrl(path: string, params: Record<string, string>): string {
   return `${path}?${new URLSearchParams(params)}`
 }
+
+export function replaceQueryParams(params: Record<string, string>): void {
+  window.history.replaceState(window.history.state, '', pageUrl(window.location.pathname, params))
+}
