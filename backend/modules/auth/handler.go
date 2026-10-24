@@ -88,13 +88,15 @@ func (h *Handler) CSRF(c *fiber.Ctx) error {
 }
 
 func (h *Handler) Logout(c *fiber.Ctx) error {
-	if er := h.setCSRFCookie(c); er != nil {
-		return response.Fail(c, fiber.StatusInternalServerError, "INTERNAL_ERROR", "Terjadi kesalahan internal")
-	}
+	err := h.service.Logout(c.UserContext(), c.Cookies(SessionCookieName))
 	h.clearCookie(c, SessionCookieName)
 	h.clearCookie(c, CSRFCookieName)
+	if err != nil {
+		return response.Fail(c, fiber.StatusInternalServerError, "INTERNAL_ERROR", "Terjadi kesalahan internal")
+	}
 	return response.JSON(c, fiber.StatusOK, fiber.Map{"message": "Logout berhasil"})
 }
+
 func (h *Handler) setSessionCookie(c *fiber.Ctx, sessionID string, expiresAt time.Time) {
 	config := h.service.SessionConfig()
 	c.Cookie(&fiber.Cookie{

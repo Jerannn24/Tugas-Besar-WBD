@@ -95,7 +95,7 @@ func (r *SessionRepository) CreateSession(ctx context.Context, user *User, token
 	defer tx.Rollback(ctx)
 
 	_, err = tx.Exec(ctx,
-		`INSERT INTO app.sessions_families
+		`INSERT INTO app.session_families
 			(id, user_id, auth_version, created_at, last_seen_at, absolute_expires_at, rotated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		familyID, user.ID, user.AuthVersion, now, now, expires, now,

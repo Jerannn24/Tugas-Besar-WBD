@@ -9,16 +9,20 @@ import (
 )
 
 type Config struct {
-	Port      string
-	JWTSecret string
-	DB        string
+	Port                   string
+	JWTSecret              string
+	DB                     string
+	BootstrapAdminUsername string
+	BootstrapAdminPassword string
 }
 
 func LoadConfig() Config {
 	return Config{
-		Port:      LoadEnv("PORT", "8080"),
-		JWTSecret: LoadEnv("JWT_SECRET", "secret_key"),
-		DB:        LoadEnv("DATABASE_URL", "postgres://username:password@localhost:5432/dbname"),
+		Port:                   LoadEnv("PORT", "8080"),
+		JWTSecret:              LoadEnv("JWT_SECRET", "secret_key"),
+		DB:                     LoadEnv("DATABASE_URL", "postgres://username:password@localhost:5432/dbname"),
+		BootstrapAdminUsername: LoadEnv("DB_DEV_BOOTSTRAP_USER", "admin"),
+		BootstrapAdminPassword: LoadEnv("DB_DEV_BOOTSTRAP_PASSWORD", "admin123"),
 	}
 }
 
