@@ -17,7 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const SessionCookieName = "session_token"
+const SessionCookieName = "app_session"
 const CSRFCookieName = "csrf_token"
 
 var (
@@ -38,9 +38,9 @@ type SessionConfig struct {
 
 func LoadSessionConfig(jwtSecret string) SessionConfig {
 	return SessionConfig{
-		IdleTimeout:      LoadDuration("SESSION_IDLE_TIMEOUT", 30*time.Minute),
+		IdleTimeout:      LoadDuration("SESSION_IDLE_TIMEOUT", 20*time.Minute),
 		AbsoluteLifetime: LoadDuration("SESSION_ABSOLUTE_LIFETIME", 8*time.Hour),
-		RotationInterval: LoadDuration("SESSION_ROTATION_INTERVAL", 15*time.Minute),
+		RotationInterval: LoadDuration("SESSION_ROTATION_INTERVAL", 10*time.Minute),
 		GracePeriod:      LoadDuration("SESSION_GRACE_PERIOD", 30*time.Second),
 		CookieSecure:     os.Getenv("SESSION_COOKIE_SECURE") == "true",
 		CookieDomain:     os.Getenv("SESSION_COOKIE_DOMAIN"),

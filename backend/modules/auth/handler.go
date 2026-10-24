@@ -87,6 +87,16 @@ func (h *Handler) CSRF(c *fiber.Ctx) error {
 	})
 }
 
+func (h *Handler) Session(c *fiber.Ctx) error {
+	session, ok := SessionFromContext(c)
+	if !ok || session == nil || session.Session == nil {
+		return response.Fail(c, fiber.StatusUnauthorized, "UNAUTHENTICATED", "Sesi tidak valid")
+	}
+	return response.JSON(c, fiber.StatusOK, fiber.Map{
+		"absolute_expires_at": session.Session.AbsoluteExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
 func (h *Handler) Logout(c *fiber.Ctx) error {
 	err := h.service.Logout(c.UserContext(), c.Cookies(SessionCookieName))
 	h.clearCookie(c, SessionCookieName)

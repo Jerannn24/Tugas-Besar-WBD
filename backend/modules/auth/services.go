@@ -97,7 +97,7 @@ func (s *service) SessionConfig() SessionConfig {
 func ValidatePassword(password string) []error {
 
 	var (
-		hasMinLen  = len(password) >= 8
+		hasMinLen  = len(password) >= 12
 		hasUpper   bool
 		hasLower   bool
 		hasNumber  bool
@@ -119,7 +119,7 @@ func ValidatePassword(password string) []error {
 	var Errors []error
 
 	if !hasMinLen {
-		Errors = append(Errors, errors.New("password must be at least 8 characters long"))
+		Errors = append(Errors, errors.New("password must be at least 12 characters long"))
 	}
 	if !hasUpper {
 		Errors = append(Errors, errors.New("password must contain at least one uppercase letter"))
