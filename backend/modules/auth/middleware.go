@@ -27,7 +27,7 @@ func SessionMiddleware(service Service) fiber.Handler {
 func CSRFMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		switch c.Method() {
-		case fiber.MethodGet, fiber.MethodConnect, fiber.MethodOptions:
+		case fiber.MethodGet, fiber.MethodHead, fiber.MethodOptions:
 			return c.Next()
 		}
 		cookie := c.Cookies(CSRFCookieName)

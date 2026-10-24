@@ -17,6 +17,7 @@ type User struct {
 	Username     string    `json:"username"`
 	HashPassword string    `json:"-"`
 	AuthVersion  int64     `json:"-"`
+	IsAdmin      bool      `json:"-"`
 }
 
 type Repository interface {
@@ -75,10 +76,10 @@ func (r *postgresRepository) FindByUsername(ctx context.Context, username string
 
 	var user User
 	err := r.db.QueryRow(ctx,
-		`SELECT id, username, password_hash, auth_version
+		`SELECT id, username, password_hash, auth_version, is_admin
 		 FROM app.users
 		 WHERE username = $1 AND is_active = true`,
-		username).Scan(&user.ID, &user.Username, &user.HashPassword, &user.AuthVersion)
+		username).Scan(&user.ID, &user.Username, &user.HashPassword, &user.AuthVersion, &user.IsAdmin)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
