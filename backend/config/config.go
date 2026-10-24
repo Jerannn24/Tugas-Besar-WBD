@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 
@@ -19,15 +20,27 @@ type Config struct {
 func LoadConfig() Config {
 	return Config{
 		Port:                   LoadEnv("PORT", "8080"),
-		JWTSecret:              LoadEnv("JWT_SECRET", "secret_key"),
-		DB:                     LoadEnv("DATABASE_URL", "postgres://username:password@localhost:5432/dbname"),
-		BootstrapAdminUsername: LoadEnv("DB_DEV_BOOTSTRAP_USER", "admin"),
-		BootstrapAdminPassword: LoadEnv("DB_DEV_BOOTSTRAP_PASSWORD", "admin123"),
+		JWTSecret:              os.Getenv("JWT_SECRET"),
+		DB:                     os.Getenv("DATABASE_URL"),
+		BootstrapAdminUsername: os.Getenv("BOOTSTRAP_ADMIN_USERNAME"),
+		BootstrapAdminPassword: os.Getenv("BOOTSTRAP_ADMIN_PASSWORD"),
 	}
 }
 
-func LoadDB() *pgxpool.Pool {
-	config := LoadConfig()
+func (c Config) Validate() error {
+	if c.JWTSecret == "" {
+		return errors.New("JWT_SECRET is required")
+	}
+	if c.DB == "" {
+		return errors.New("DATABASE_URL is required")
+	}
+	if (c.BootstrapAdminUsername == "") != (c.BootstrapAdminPassword == "") {
+		return errors.New("BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD must be provided together")
+	}
+	return nil
+}
+
+func LoadDB(config Config) *pgxpool.Pool {
 	dbpool, err := pgxpool.New(context.Background(), config.DB)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
