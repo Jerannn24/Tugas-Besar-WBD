@@ -54,8 +54,29 @@ func createAuthTestUser(t *testing.T, db *pgxpool.Pool) *User {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, _ = db.Exec(ctx, `DELETE FROM app.session_families WHERE user_id = $1`, user.ID)
-		_, _ = db.Exec(ctx, `DELETE FROM app.users WHERE id = $1`, user.ID)
+		cleanupURL := os.Getenv("AUTH_TEST_CLEANUP_DATABASE_URL")
+		if cleanupURL == "" {
+			_, err1 := db.Exec(ctx, `UPDATE app.session_families SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, user.ID)
+			_, err2 := db.Exec(ctx, `UPDATE app.users SET is_active = false WHERE id = $1`, user.ID)
+			if err1 != nil || err2 != nil {
+				t.Errorf("deactivate test user: %v %v", err1, err2)
+			}
+			t.Log("AUTH_TEST_CLEANUP_DATABASE_URL not set; test user deactivated, not deleted")
+			return
+		}
+		cleanup, err := pgxpool.New(ctx, cleanupURL)
+		if err != nil {
+			t.Errorf("open cleanup pool: %v", err)
+			return
+		}
+		defer cleanup.Close()
+		if _, err := cleanup.Exec(ctx, `DELETE FROM app.session_families WHERE user_id = $1`, user.ID); err != nil {
+			t.Errorf("delete test sessions: %v", err)
+			return
+		}
+		if _, err := cleanup.Exec(ctx, `DELETE FROM app.users WHERE id = $1`, user.ID); err != nil {
+			t.Errorf("delete test user: %v", err)
+		}
 	})
 	return user
 }
@@ -109,35 +130,131 @@ func TestBootstrapAdminIsIdempotent(t *testing.T) {
 	})
 }
 
+func familyOf(t *testing.T, db *pgxpool.Pool, user *User) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := db.QueryRow(context.Background(),
+		`SELECT id FROM app.session_families WHERE user_id = $1`, user.ID).Scan(&id); err != nil {
+		t.Fatalf("find family: %v", err)
+	}
+	return id
+}
+
+func countTokens(t *testing.T, db *pgxpool.Pool, familyID uuid.UUID, state string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(context.Background(),
+		`SELECT count(*) FROM app.session_tokens WHERE family_id = $1 AND state = $2`, familyID, state).Scan(&n); err != nil {
+		t.Fatalf("count tokens: %v", err)
+	}
+	return n
+}
+
+func mustHash(t *testing.T, id string) []byte {
+	t.Helper()
+	h, err := hashSessionID(id)
+	if err != nil {
+		t.Fatalf("hash session id: %v", err)
+	}
+	return h
+}
+
+func loginUser(t *testing.T, service *service, user *User) string {
+	t.Helper()
+	login, err := service.createSession(context.Background(), user)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	return login.SessionID
+}
+
 func TestSessionLifecycle(t *testing.T) {
 	db := openAuthTestDB(t)
 	defer db.Close()
 
 	user := createAuthTestUser(t, db)
-	config := testSessionConfig()
-	service := newTestService(db, config)
+	service := newTestService(db, testSessionConfig())
+	id := loginUser(t, service, user)
 
-	login, err := service.createSession(context.Background(), user)
-	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
-	if login.SessionID == "" {
-		t.Fatal("expected session ID")
-	}
-
-	authenticated, err := service.Authenticate(context.Background(), login.SessionID)
+	authenticated, err := service.Authenticate(context.Background(), id)
 	if err != nil {
 		t.Fatalf("authenticate session: %v", err)
 	}
-	if authenticated.SessionID != login.SessionID {
+	if authenticated.SessionID != id {
 		t.Fatalf("expected unchanged session ID, got %q", authenticated.SessionID)
 	}
 
-	if err := service.Logout(context.Background(), login.SessionID); err != nil {
+	if err := service.Logout(context.Background(), id); err != nil {
 		t.Fatalf("logout session: %v", err)
 	}
-	if _, err := service.Authenticate(context.Background(), login.SessionID); !errors.Is(err, ErrUnauthenticated) {
+	if _, err := service.Authenticate(context.Background(), id); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("expected revoked session to be unauthenticated, got %v", err)
+	}
+}
+
+func TestSessionForcedRotation(t *testing.T) {
+	db := openAuthTestDB(t)
+	defer db.Close()
+
+	user := createAuthTestUser(t, db)
+	config := testSessionConfig()
+	config.GracePeriod = time.Minute
+	config.RotationInterval = -time.Second
+	service := newTestService(db, config)
+	oldID := loginUser(t, service, user)
+	familyID := familyOf(t, db, user)
+
+	var absoluteBefore time.Time
+	if err := db.QueryRow(context.Background(),
+		`SELECT absolute_expires_at FROM app.session_families WHERE id = $1`, familyID).Scan(&absoluteBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := service.Authenticate(context.Background(), oldID)
+	if err != nil {
+		t.Fatalf("rotate session: %v", err)
+	}
+	if rotated.SessionID == oldID {
+		t.Fatal("expected session rotation")
+	}
+
+	var state string
+	var nullCipher, nullKey bool
+	if err := db.QueryRow(context.Background(), `
+		SELECT state, token_ciphertext IS NULL, token_key_id IS NULL
+		FROM app.session_tokens WHERE token_hash = $1`, mustHash(t, oldID)).Scan(&state, &nullCipher, &nullKey); err != nil {
+		t.Fatal(err)
+	}
+	if state != "grace" || !nullCipher || !nullKey {
+		t.Fatalf("old token state=%s nullCipher=%v nullKey=%v, want grace/true/true", state, nullCipher, nullKey)
+	}
+	if n := countTokens(t, db, familyID, "current"); n != 1 {
+		t.Fatalf("current rows = %d, want 1", n)
+	}
+
+	var absoluteAfter time.Time
+	if err := db.QueryRow(context.Background(),
+		`SELECT absolute_expires_at FROM app.session_families WHERE id = $1`, familyID).Scan(&absoluteAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !absoluteAfter.Equal(absoluteBefore) {
+		t.Fatalf("absolute_expires_at changed: %v -> %v", absoluteBefore, absoluteAfter)
+	}
+
+	service.sessionConfig.RotationInterval = time.Hour
+	recovered, err := service.Authenticate(context.Background(), oldID)
+	if err != nil {
+		t.Fatalf("grace request: %v", err)
+	}
+	if recovered.SessionID != rotated.SessionID {
+		t.Fatal("grace request did not recover the current session ID")
+	}
+	if n := countTokens(t, db, familyID, "current"); n != 1 {
+		t.Fatalf("current rows after recovery = %d, want 1", n)
+	}
+	again, err := service.Authenticate(context.Background(), rotated.SessionID)
+	if err != nil || again.SessionID != rotated.SessionID {
+		t.Fatalf("current token should authenticate unchanged: %v", err)
 	}
 }
 
@@ -148,98 +265,145 @@ func TestSessionRotationGraceAndAbsoluteExpiry(t *testing.T) {
 	user := createAuthTestUser(t, db)
 	config := testSessionConfig()
 	config.RotationInterval = -time.Second
-	config.AbsoluteLifetime = 100 * time.Millisecond
+	config.AbsoluteLifetime = 2 * time.Second
 	service := newTestService(db, config)
+	oldID := loginUser(t, service, user)
 
-	login, err := service.createSession(context.Background(), user)
-	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
-
-	rotated, err := service.Authenticate(context.Background(), login.SessionID)
+	rotated, err := service.Authenticate(context.Background(), oldID)
 	if err != nil {
 		t.Fatalf("rotate session: %v", err)
 	}
-	if rotated.SessionID == login.SessionID {
-		t.Fatal("expected session rotation")
-	}
+	service.sessionConfig.RotationInterval = time.Hour
 
-	if _, err := service.Authenticate(context.Background(), login.SessionID); err != nil {
-		t.Fatalf("old session should be valid during grace period: %v", err)
-	}
-
-	time.Sleep(config.GracePeriod + 20*time.Millisecond)
-	if _, err := service.Authenticate(context.Background(), login.SessionID); !errors.Is(err, ErrSessionExpired) {
+	time.Sleep(config.GracePeriod + 50*time.Millisecond)
+	if _, err := service.Authenticate(context.Background(), oldID); !errors.Is(err, ErrSessionExpired) {
 		t.Fatalf("expected old session grace expiry, got %v", err)
 	}
+	if _, err := service.Authenticate(context.Background(), rotated.SessionID); err != nil {
+		t.Fatalf("current token should remain valid after grace expiry: %v", err)
+	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(2 * time.Second)
 	if _, err := service.Authenticate(context.Background(), rotated.SessionID); !errors.Is(err, ErrSessionExpired) {
 		t.Fatalf("expected absolute expiry after rotation, got %v", err)
 	}
 }
 
-func TestConcurrentSessionRotationOnlyOneSucceeds(t *testing.T) {
+func TestSessionRetiredTokenRejected(t *testing.T) {
+	db := openAuthTestDB(t)
+	defer db.Close()
+
+	user := createAuthTestUser(t, db)
+	service := newTestService(db, testSessionConfig())
+	id := loginUser(t, service, user)
+
+	if _, err := db.Exec(context.Background(), `
+		UPDATE app.session_tokens
+		SET state = 'retired', token_ciphertext = NULL, token_key_id = NULL
+		WHERE token_hash = $1`, mustHash(t, id)); err != nil {
+		t.Fatalf("retire token: %v", err)
+	}
+	if _, err := service.Authenticate(context.Background(), id); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("expected retired token rejection, got %v", err)
+	}
+}
+
+func TestSessionRejectedAfterInvalidation(t *testing.T) {
+	cases := map[string]struct {
+		query string
+		want  error
+	}{
+		"revoked family":    {`UPDATE app.session_families SET revoked_at = now() WHERE user_id = $1`, ErrUnauthenticated},
+		"inactive user":     {`UPDATE app.users SET is_active = false WHERE id = $1`, ErrUnauthenticated},
+		"auth version bump": {`UPDATE app.users SET auth_version = auth_version + 1 WHERE id = $1`, ErrSessionExpired},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			db := openAuthTestDB(t)
+			defer db.Close()
+
+			user := createAuthTestUser(t, db)
+			config := testSessionConfig()
+			config.GracePeriod = time.Minute
+			config.RotationInterval = -time.Second
+			service := newTestService(db, config)
+			oldID := loginUser(t, service, user)
+			rotated, err := service.Authenticate(context.Background(), oldID)
+			if err != nil {
+				t.Fatalf("rotate session: %v", err)
+			}
+			service.sessionConfig.RotationInterval = time.Hour
+
+			if _, err := db.Exec(context.Background(), tc.query, user.ID); err != nil {
+				t.Fatalf("invalidate: %v", err)
+			}
+			for label, id := range map[string]string{"grace": oldID, "current": rotated.SessionID} {
+				if _, err := service.Authenticate(context.Background(), id); !errors.Is(err, tc.want) {
+					t.Fatalf("%s token: err = %v, want %v", label, err, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestSessionIdleTimeout(t *testing.T) {
 	db := openAuthTestDB(t)
 	defer db.Close()
 
 	user := createAuthTestUser(t, db)
 	config := testSessionConfig()
+	config.IdleTimeout = 100 * time.Millisecond
 	service := newTestService(db, config)
-	login, err := service.createSession(context.Background(), user)
-	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
+	id := loginUser(t, service, user)
 
-	session, _, err := service.sessions.Find(
-		context.Background(),
-		hashSessionID(login.SessionID),
-		time.Now().UTC(),
-		config.IdleTimeout,
-	)
-	if err != nil {
-		t.Fatalf("find session: %v", err)
+	time.Sleep(200 * time.Millisecond)
+	if _, err := service.Authenticate(context.Background(), id); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("expected idle timeout, got %v", err)
 	}
+}
 
+func TestConcurrentAuthenticateRotatesOnce(t *testing.T) {
+	db := openAuthTestDB(t)
+	defer db.Close()
+
+	user := createAuthTestUser(t, db)
+	config := testSessionConfig()
+	config.GracePeriod = time.Minute
+	config.RotationInterval = -time.Second
+	service := newTestService(db, config)
+	oldID := loginUser(t, service, user)
+	familyID := familyOf(t, db, user)
+
+	const workers = 4
 	var wg sync.WaitGroup
-	results := make(chan error, 2)
-	for i := 0; i < 2; i++ {
+	start := make(chan struct{})
+	ids := make([]string, workers)
+	errs := make([]error, workers)
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			newID, generationErr := newSessionID()
-			if generationErr != nil {
-				results <- generationErr
-				return
+			<-start
+			result, err := service.Authenticate(context.Background(), oldID)
+			errs[i] = err
+			if err == nil {
+				ids[i] = result.SessionID
 			}
-			ciphertext, generationErr := encryptSessionID(newID, config.EncryptionKey)
-			if generationErr != nil {
-				results <- generationErr
-				return
-			}
-			results <- service.sessions.Rotate(
-				context.Background(),
-				session.FamilyID,
-				hashSessionID(login.SessionID),
-				hashSessionID(newID),
-				ciphertext,
-				time.Now().UTC(),
-				time.Now().UTC().Add(config.GracePeriod),
-				session.AbsoluteExpiresAt,
-			)
-		}()
+		}(i)
 	}
+	close(start)
 	wg.Wait()
-	close(results)
 
-	successes := 0
-	for rotationErr := range results {
-		if rotationErr == nil {
-			successes++
+	for i := 0; i < workers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("worker %d: %v", i, errs[i])
+		}
+		if ids[i] == oldID || ids[i] != ids[0] {
+			t.Fatalf("worker %d returned a different or stale ID", i)
 		}
 	}
-	if successes != 1 {
-		t.Fatalf("expected exactly one successful rotation, got %d", successes)
+	if n := countTokens(t, db, familyID, "current"); n != 1 {
+		t.Fatalf("current rows = %d, want 1", n)
 	}
 }
 

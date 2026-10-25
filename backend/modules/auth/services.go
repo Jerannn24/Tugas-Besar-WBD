@@ -78,7 +78,12 @@ func (s *service) Logout(ctx context.Context, sessionID string) error {
 		return nil
 	}
 
-	session, _, err := s.sessions.Find(ctx, hashSessionID(sessionID), time.Now().UTC(), s.sessionConfig.IdleTimeout)
+	hash, err := hashSessionID(sessionID)
+	if err != nil {
+		return nil
+	}
+
+	session, _, err := s.sessions.Find(ctx, hash, time.Now().UTC(), s.sessionConfig.IdleTimeout)
 	if err != nil {
 		return err
 	}
