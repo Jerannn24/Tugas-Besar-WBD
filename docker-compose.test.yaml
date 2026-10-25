@@ -1,0 +1,39 @@
+services:
+  backend-test:
+    image: golang:1.26.1
+    profiles: [test]
+    working_dir: /src/backend
+    environment:
+      TEST_INTEGRATION_REQUIRED: "1"
+      DB_TEST_BOOTSTRAP_USER: ${DB_TEST_BOOTSTRAP_USER:?Set DB_TEST_BOOTSTRAP_USER in .env}
+      DB_TEST_BOOTSTRAP_PASSWORD: ${DB_TEST_BOOTSTRAP_PASSWORD:?Set DB_TEST_BOOTSTRAP_PASSWORD in .env}
+      DB_TEST_RUNTIME_USER: ${DB_TEST_RUNTIME_USER:?Set DB_TEST_RUNTIME_USER in .env}
+      DB_TEST_RUNTIME_PASSWORD: ${DB_TEST_RUNTIME_PASSWORD:?Set DB_TEST_RUNTIME_PASSWORD in .env}
+      DB_TEST_OWNER_USER: ${DB_TEST_OWNER_USER:?Set DB_TEST_OWNER_USER in .env}
+      DB_TEST_OWNER_PASSWORD: ${DB_TEST_OWNER_PASSWORD:?Set DB_TEST_OWNER_PASSWORD in .env}
+      DB_TEST_PLATFORM_DB: ${DB_TEST_PLATFORM_DB:?Set DB_TEST_PLATFORM_DB in .env}
+      DB_TEST_TARGET_A: ${DB_TEST_TARGET_A:?Set DB_TEST_TARGET_A in .env}
+      DB_TEST_TARGET_B: ${DB_TEST_TARGET_B:?Set DB_TEST_TARGET_B in .env}
+      DB_TEST_TARGET_A_EXECUTOR_PASSWORD: ${DB_TEST_TARGET_A_EXECUTOR_PASSWORD:?Set DB_TEST_TARGET_A_EXECUTOR_PASSWORD in .env}
+      DB_TEST_TARGET_A_PREPARER_PASSWORD: ${DB_TEST_TARGET_A_PREPARER_PASSWORD:?Set DB_TEST_TARGET_A_PREPARER_PASSWORD in .env}
+      DB_TEST_TARGET_A_VIEWER_PASSWORD: ${DB_TEST_TARGET_A_VIEWER_PASSWORD:?Set DB_TEST_TARGET_A_VIEWER_PASSWORD in .env}
+      DB_TEST_TARGET_B_EXECUTOR_PASSWORD: ${DB_TEST_TARGET_B_EXECUTOR_PASSWORD:?Set DB_TEST_TARGET_B_EXECUTOR_PASSWORD in .env}
+      DB_TEST_TARGET_B_PREPARER_PASSWORD: ${DB_TEST_TARGET_B_PREPARER_PASSWORD:?Set DB_TEST_TARGET_B_PREPARER_PASSWORD in .env}
+      DB_TEST_TARGET_B_VIEWER_PASSWORD: ${DB_TEST_TARGET_B_VIEWER_PASSWORD:?Set DB_TEST_TARGET_B_VIEWER_PASSWORD in .env}
+    volumes:
+      - ./backend:/src/backend:ro
+      - go-test-modules:/go/pkg/mod
+      - go-test-cache:/root/.cache/go-build
+    entrypoint: ["/bin/bash", "/src/db-test.sh"]
+    configs:
+      - source: test-runner
+        target: /src/db-test.sh
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+configs:
+  test-runner:
+    file: ./db/test-container.sh
+volumes:
+  go-test-modules:
+  go-test-cache:

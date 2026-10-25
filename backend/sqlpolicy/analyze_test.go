@@ -128,3 +128,37 @@ DELETE FROM managed.a WHERE id <> 2`
 		t.Fatal("flags lost")
 	}
 }
+
+func TestAnalyzeAndStatementsTableRenameChain(t *testing.T) {
+	p := newPolicy(t)
+	wantText := []string{
+		`CREATE TABLE managed."original table" (id int)`,
+		`ALTER TABLE managed."original table" RENAME TO "renamed table"`,
+		`INSERT INTO managed."renamed table" (id) VALUES (1)`,
+	}
+	sql := strings.Join(wantText, ";\n") + ";"
+	infos, err := p.Analyze(sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 3 {
+		t.Fatalf("got %d statements", len(infos))
+	}
+	wantKinds := []string{KindCreateTable, KindRenameTable, KindInsert}
+	wantRelations := []Rel{{"managed", "original table"}, {"managed", "original table"}, {"managed", "renamed table"}}
+	for i, info := range infos {
+		if info.Kind != wantKinds[i] || info.Relation != wantRelations[i] || info.Text != wantText[i] {
+			t.Fatalf("statement %d: %+v", i+1, info)
+		}
+	}
+	if infos[1].NewName != "renamed table" {
+		t.Fatalf("rename target: %q", infos[1].NewName)
+	}
+	gotText, err := p.Statements(sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotText, wantText) {
+		t.Fatalf("statements %q want %q", gotText, wantText)
+	}
+}

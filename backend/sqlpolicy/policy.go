@@ -276,7 +276,12 @@ func (v *validator) message(kind string, raw json.RawMessage) error {
 			return v.node(m["def"])
 		}
 	case "RenameStmt":
-		if !oneOf(text(m, "renameType"), "OBJECT_COLUMN", "OBJECT_TABLE") || text(m, "relationType") != "OBJECT_TABLE" || !oneOf(text(m, "behavior"), "", "DROP_RESTRICT") || !identifier(text(m, "newname")) {
+		// Table renames leave relationType at its zero enum value in this parser.
+		// Column renames set it explicitly to the containing relation type.
+		renameType, relationType := text(m, "renameType"), text(m, "relationType")
+		supportedObject := (renameType == "OBJECT_TABLE" && relationType == "OBJECT_ACCESS_METHOD") ||
+			(renameType == "OBJECT_COLUMN" && relationType == "OBJECT_TABLE")
+		if !supportedObject || !oneOf(text(m, "behavior"), "", "DROP_RESTRICT") || !identifier(text(m, "newname")) {
 			return errors.New("unsupported rename")
 		}
 		return v.child(m, "relation", "RangeVar")
