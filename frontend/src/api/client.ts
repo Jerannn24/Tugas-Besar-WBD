@@ -1,3 +1,4 @@
+import { SESSION_ENDED_URL } from '../lib/app'
 import type { ApiErrorBody } from './types'
 
 export type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'
@@ -25,7 +26,6 @@ export type TransportRequest = {
 }
 
 const MUTATING: ReadonlySet<HttpMethod> = new Set(['POST', 'PATCH', 'PUT', 'DELETE'])
-const LOGIN_PAGE = '/login/'
 
 const useFixtures = import.meta.env.DEV && import.meta.env.VITE_USE_FIXTURES === 'true'
 
@@ -44,11 +44,8 @@ async function transport(req: TransportRequest): Promise<Response> {
   })
 }
 
-type CsrfSource = 'unknown' | 'body' | 'cookie'
-
 const CSRF_COOKIE = 'csrf_token'
 
-let csrfSource: CsrfSource = 'unknown'
 let csrfToken: string | null = null
 let csrfInFlight: Promise<ApiResult<string>> | null = null
 
@@ -66,11 +63,9 @@ function readCsrfCookie(): string | null {
 const MISSING_TOKEN: ApiResult<string> = { ok: false, kind: 'invalid_response', status: 200 }
 
 export async function getCsrfToken(): Promise<ApiResult<string>> {
-  if (csrfSource === 'body' && csrfToken !== null) return { ok: true, status: 200, data: csrfToken }
-  if (csrfSource === 'cookie') {
-    const cookie = readCsrfCookie()
-    if (cookie !== null) return { ok: true, status: 200, data: cookie }
-  }
+  const cookie = readCsrfCookie()
+  if (cookie !== null) return { ok: true, status: 200, data: cookie }
+  if (csrfToken !== null) return { ok: true, status: 200, data: csrfToken }
   return refreshCsrfToken()
 }
 
@@ -82,14 +77,9 @@ export function refreshCsrfToken(): Promise<ApiResult<string>> {
     .then((res): ApiResult<string> => {
       if (!res.ok) return res
       const fromBody = isObject(res.data) ? res.data.csrf_token : undefined
-      if (typeof fromBody === 'string' && fromBody !== '') {
-        csrfSource = 'body'
-        csrfToken = fromBody
-        return { ok: true, status: res.status, data: fromBody }
-      }
-      csrfSource = 'cookie'
-      const cookie = readCsrfCookie()
-      return cookie === null ? MISSING_TOKEN : { ok: true, status: res.status, data: cookie }
+      if (typeof fromBody === 'string' && fromBody !== '') csrfToken = fromBody
+      const token = readCsrfCookie() ?? csrfToken
+      return token === null ? MISSING_TOKEN : { ok: true, status: res.status, data: token }
     })
     .finally(() => {
       csrfInFlight = null
@@ -168,7 +158,7 @@ async function send<T>(
   const error = !response.ok && isObject(payload) ? toErrorBody(payload.error) : null
   if (error) {
     if (response.status === 401 && options.redirectOn401 !== false) {
-      window.location.assign(LOGIN_PAGE)
+      window.location.assign(SESSION_ENDED_URL)
     }
     return { ok: false, kind: 'http', status: response.status, error }
   }

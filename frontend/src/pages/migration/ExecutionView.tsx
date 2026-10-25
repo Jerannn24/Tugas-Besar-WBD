@@ -18,27 +18,40 @@ export function ExecutionView({ database, executionId }: { database: DatabaseSum
   const [state, setState] = useState<State>({ status: 'loading' })
   const seq = useRef(0)
 
+  const fetchExecution = useCallback(async () => {
+    const mine = ++seq.current
+    const res = await getMigration(database.id, executionId)
+    if (mine !== seq.current) return
+    setState(
+      res.ok ? { status: 'ready', execution: res.data, refreshing: false } : { status: 'failed', failure: res },
+    )
+  }, [database.id, executionId])
+
   const load = useCallback(
-    async (keepCurrent: boolean) => {
-      const mine = ++seq.current
+    (keepCurrent: boolean) => {
       setState((s) => (keepCurrent && s.status === 'ready' ? { ...s, refreshing: true } : { status: 'loading' }))
-      const res = await getMigration(database.id, executionId)
-      if (mine !== seq.current) return
-      setState(
-        res.ok ? { status: 'ready', execution: res.data, refreshing: false } : { status: 'failed', failure: res },
-      )
+      return fetchExecution()
     },
-    [database.id, executionId],
+    [fetchExecution],
   )
 
   useEffect(() => {
-    void load(false)
-  }, [load])
+    void fetchExecution()
+    const ref = seq
+    return () => {
+      ref.current++
+    }
+  }, [fetchExecution])
 
   if (state.status === 'loading') return <Loading label="Memuat detail execution…" />
   if (state.status === 'failed') {
     return (
-      <FailureAlert failure={state.failure} notFoundTitle="Execution tidak ditemukan" onRetry={() => void load(false)} />
+      <FailureAlert
+        failure={state.failure}
+        notFoundTitle="Execution tidak ditemukan"
+        invalidTitle="ID execution tidak valid"
+        onRetry={() => void load(false)}
+      />
     )
   }
 

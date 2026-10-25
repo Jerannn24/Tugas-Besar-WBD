@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ApiFailure, ApiResult } from '../../api/client'
 import { listDrafts, listMigrations } from '../../api/endpoints'
 import type { DatabaseSummary, Draft, Execution, ID, List } from '../../api/types'
@@ -24,15 +24,27 @@ type ListState<T> =
 function useList<T>(load: () => Promise<ApiResult<List<T>>>) {
   const [state, setState] = useState<ListState<T>>({ status: 'loading' })
 
-  const reload = useCallback(async () => {
-    setState({ status: 'loading' })
+  const seq = useRef(0)
+
+  const fetchList = useCallback(async () => {
+    const mine = ++seq.current
     const res = await load()
+    if (mine !== seq.current) return
     setState(res.ok ? { status: 'ready', items: res.data.items } : { status: 'failed', failure: res })
   }, [load])
 
+  const reload = useCallback(async () => {
+    setState({ status: 'loading' })
+    await fetchList()
+  }, [fetchList])
+
   useEffect(() => {
-    void reload()
-  }, [reload])
+    void fetchList()
+    const ref = seq
+    return () => {
+      ref.current++
+    }
+  }, [fetchList])
 
   return { state, reload }
 }

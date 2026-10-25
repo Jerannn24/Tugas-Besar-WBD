@@ -198,6 +198,13 @@ function Rejected({ failure, historyUrl }: { failure: ApiFailure; historyUrl: st
           {message} Muat versi terbaru draft sebelum menjalankan.
         </Alert>
       )
+    case 'TARGET_UNAVAILABLE':
+      return (
+        <Alert variant="danger" title="Execute ditolak">
+          SQL tidak dijalankan: database target belum siap untuk eksekusi atau tidak dapat dihubungi. Hubungi admin
+          platform.
+        </Alert>
+      )
     case 'FORBIDDEN':
       return (
         <Alert variant="danger" title="Akses ditolak">

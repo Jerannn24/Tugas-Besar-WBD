@@ -3,6 +3,18 @@ import { Alert } from '../../components/Alert'
 import { StatusBadge } from '../../components/StatusBadge'
 import { formatDateTime } from '../../lib/format'
 
+const ERROR_LABELS: Record<string, string> = {
+  SQL_FAILED: 'SQL gagal dijalankan; perubahan di-rollback',
+  RECEIPT_FAILED: 'Pencatatan hasil di database target gagal; perubahan di-rollback',
+  TARGET_PREPARATION_FAILED: 'Persiapan database target gagal',
+  ACCESS_REVOKED: 'Akses dicabut sebelum migration dijalankan',
+  COMMIT_UNCONFIRMED: 'Commit belum terkonfirmasi',
+  RECEIPT_UNCONFIRMED: 'Catatan hasil di database target belum terkonfirmasi',
+  RECEIPT_MISMATCH: 'Catatan hasil di database target tidak cocok',
+  ROLLBACK_UNCONFIRMED: 'Rollback belum terkonfirmasi',
+  OUTCOME_UNCONFIRMED: 'Hasil akhir belum terkonfirmasi',
+}
+
 type Props = { execution: Execution; showSql?: boolean }
 
 export function ExecutionDetail({ execution: x, showSql = true }: Props) {
@@ -40,7 +52,10 @@ export function ExecutionDetail({ execution: x, showSql = true }: Props) {
       )}
       {x.error && (
         <Alert variant="danger" title="Error">
-          <p className="mb-1 mono">{x.error.code}</p>
+          <p className="mb-1">
+            {ERROR_LABELS[x.error.code] && <strong className="me-2">{ERROR_LABELS[x.error.code]}</strong>}
+            <span className="mono">{x.error.code}</span>
+          </p>
           <p className="mb-0" style={{ whiteSpace: 'pre-wrap' }}>
             {x.error.message}
           </p>

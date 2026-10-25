@@ -58,13 +58,15 @@ function databaseRequest(req: TransportRequest, databaseId: string, rest: string
 }
 
 const VIEWER_ROUTE = /^\/api\/databases\/([^/]+)\/(schemas|table|rows)$/
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const schemasFailedOnce = new Set<string>()
 
 async function viewerRequest(req: TransportRequest, databaseId: string, resource: string): Promise<Response> {
   await new Promise((r) => setTimeout(r, 150 + Math.random() * 750))
   return withUser(req, (username) => {
+    if (!UUID.test(databaseId)) return fail(400, 'INVALID_REQUEST', 'Invalid database id')
     const db = VIEWER[databaseId]
-    if (!db) return fail(404, 'NOT_FOUND', 'Database tidak ditemukan.')
+    if (!db) return fail(404, 'NOT_FOUND', 'Database not found')
     if (!(DATABASES_BY_USER[username] ?? []).some((d) => d.id === databaseId)) {
       return fail(403, 'FORBIDDEN', 'Anda tidak memiliki akses ke database ini.')
     }

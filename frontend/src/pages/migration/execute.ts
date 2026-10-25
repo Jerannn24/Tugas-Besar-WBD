@@ -96,7 +96,8 @@ export function useExecute({ databaseId, draftId, onFinal, onRejected }: Options
         return
       }
 
-      if (res.kind === 'http' && res.status < 500) {
+      const targetRejected = res.kind === 'http' && res.status === 502 && res.error.code === 'TARGET_UNAVAILABLE'
+      if (res.kind === 'http' && (res.status < 500 || targetRejected)) {
         intentRef.current = null
         setState({ phase: 'rejected', failure: res })
         callbacks.current.onRejected(res)
@@ -129,6 +130,7 @@ export function useExecute({ databaseId, draftId, onFinal, onRejected }: Options
     const mine = ++seq.current
     setState({ ...state, checking: true, checkFailure: null })
     const res = await getMigration(databaseId, execution.id)
+    
     if (mine !== seq.current) return
     if (res.ok && !isUnresolved(res.data)) finish(res.data)
     else setState({ phase: 'waiting', execution: res.ok ? res.data : execution, checking: false, checkFailure: res.ok ? null : res })

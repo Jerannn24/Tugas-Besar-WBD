@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react'
+import type { ApiResult } from '../../api/client'
 import { createConnection, updateConnection } from '../../api/endpoints'
 import type {
   ConnectionCredentialPatch,
@@ -8,6 +9,7 @@ import type {
 } from '../../api/types'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
+import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { FormField } from '../../components/FormField'
 import { MutationAlert } from '../../components/MutationAlert'
 import { Panel } from '../../components/Panel'
@@ -63,37 +65,55 @@ function fromSummary(c: ConnectionSummary): Form {
 }
 
 const savedUsername = (c: ConnectionSummary | null, role: Role) => (c ? c[`${role}_username`] ?? '' : '')
+const hasCredentials = (c: ConnectionSummary | null) => ROLES.every((r) => savedUsername(c, r) !== '')
+
+const EXECUTOR_SUFFIX = '_executor'
+const PREPARER_SUFFIX = '_preparer'
+
+function sendsCredentials(form: Form, connection: ConnectionSummary | null): boolean {
+  return hasCredentials(connection) || CREDENTIAL_FIELDS.some((f) => form[f].trim() !== '')
+}
 
 function validateCredentials(form: Form, connection: ConnectionSummary | null): Record<string, string> {
   const errors: Record<string, string> = {}
-  const filled = CREDENTIAL_FIELDS.filter((f) => form[f].trim() !== '')
-  if (connection === null) {
-    if (filled.length > 0 && filled.length < CREDENTIAL_FIELDS.length) {
-      for (const f of CREDENTIAL_FIELDS) {
-        if (form[f].trim() === '') errors[f] = 'Isi keempat kredensial eksekusi atau kosongkan semuanya.'
+  if (!sendsCredentials(form, connection)) return errors
+  if (hasCredentials(connection)) {
+    for (const role of ROLES) {
+      if (form[`${role}_username`].trim() === '') {
+        errors[`${role}_username`] = 'Untuk menghapus kredensial, gunakan tombol Hapus kredensial eksekusi.'
       }
     }
-    return errors
+  } else {
+    for (const f of CREDENTIAL_FIELDS) {
+      if (form[f].trim() === '') errors[f] = 'Isi keempat kredensial eksekusi atau kosongkan semuanya.'
+    }
   }
-  if (filled.length === 0 && ROLES.every((r) => savedUsername(connection, r) === '')) return errors
-  for (const role of ROLES) {
-    const username = form[`${role}_username`].trim()
-    if (username === '') {
-      errors[`${role}_username`] =
-        savedUsername(connection, role) !== ''
-          ? 'Menghapus kredensial eksekusi belum didukung kontrak.'
-          : 'Isi kredensial executor dan preparer bersama-sama.'
-    } else if (savedUsername(connection, role) === '' && form[`${role}_password`] === '') {
-      errors[`${role}_password`] = 'Password wajib diisi untuk kredensial baru.'
+  return { ...validateRoleNames(form), ...errors }
+}
+
+function validateRoleNames(form: Form): Record<string, string> {
+  const errors: Record<string, string> = {}
+  const executor = form.executor_username.trim()
+  const preparer = form.preparer_username.trim()
+  const viewer = form.username.trim()
+  const prefix = executor.endsWith(EXECUTOR_SUFFIX) ? executor.slice(0, -EXECUTOR_SUFFIX.length) : ''
+  if (executor !== '') {
+    if (prefix === '') errors.executor_username = `Username executor harus berakhiran ${EXECUTOR_SUFFIX} (mis. app${EXECUTOR_SUFFIX}).`
+    else if (executor === viewer) errors.executor_username = 'Username executor harus berbeda dari username PostgreSQL (viewer).'
+  }
+  if (preparer !== '' && executor !== '') {
+    if (prefix !== '' && preparer !== prefix + PREPARER_SUFFIX) {
+      errors.preparer_username = `Username preparer harus ${prefix}${PREPARER_SUFFIX} (prefiks yang sama dengan executor).`
+    } else if (preparer === viewer) {
+      errors.preparer_username = 'Username preparer harus berbeda dari username PostgreSQL (viewer).'
     }
   }
   return errors
 }
 
-function credentialPatch(form: Form, connection: ConnectionSummary, role: Role): ConnectionCredentialPatch | null {
+function credential(form: Form, role: Role): ConnectionCredentialPatch {
   const username = form[`${role}_username`].trim()
   const password = form[`${role}_password`]
-  if (username === savedUsername(connection, role) && password === '') return null
   return password === '' ? { username } : { username, password }
 }
 
@@ -131,6 +151,7 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
   const [failure, setFailure] = useState<MutationFailure | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
 
   const changed = (Object.keys(form) as (keyof Form)[]).filter((k) => form[k] !== initial[k])
   useBeforeUnload(changed.length > 0)
@@ -153,50 +174,61 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
       password: form.password,
       ssl_mode: form.ssl_mode,
     }
+    const withCredentials = sendsCredentials(form, connection)
 
-    let res
     if (connection) {
-      const { password, ...rest } = values
-      const executor = credentialPatch(form, connection, 'executor')
-      const preparer = credentialPatch(form, connection, 'preparer')
-      const unchanged =
-        password === '' &&
-        executor === null &&
-        preparer === null &&
-        rest.name === connection.name &&
-        rest.host === connection.host &&
-        rest.port === connection.port &&
-        rest.database_name === connection.database_name &&
-        rest.username === connection.username &&
-        rest.ssl_mode === connection.ssl_mode
-      if (unchanged) {
+      if (changed.length === 0) {
         setNotice('Tidak ada perubahan untuk disimpan.')
         return
       }
+      const { password, ...rest } = values
       const patch: ConnectionPatchInput = password === '' ? rest : { ...rest, password }
-      if (executor) patch.executor = executor
-      if (preparer) patch.preparer = preparer
-      setPending(true)
-      res = await updateConnection(connection.id, patch)
+      if (withCredentials) {
+        patch.executor = credential(form, 'executor')
+        patch.preparer = credential(form, 'preparer')
+      }
+      await save(updateConnection(connection.id, patch), 'Perubahan tersimpan.')
     } else {
-      if (form.executor_username.trim() !== '') {
+      if (withCredentials) {
         values.executor = { username: form.executor_username.trim(), password: form.executor_password }
         values.preparer = { username: form.preparer_username.trim(), password: form.preparer_password }
       }
-      setPending(true)
-      res = await createConnection(values)
+      await save(createConnection(values), null)
     }
+  }
+
+  async function clearCredentials() {
+    if (!connection || pending) return
+    setFailure(null)
+    setNotice(null)
+    setErrors({})
+    const patch: ConnectionPatchInput = {
+      name: connection.name,
+      host: connection.host,
+      port: connection.port,
+      database_name: connection.database_name,
+      username: connection.username,
+      ssl_mode: connection.ssl_mode,
+    }
+    await save(updateConnection(connection.id, patch), 'Kredensial eksekusi dihapus. Connection ini sekarang view-only.')
+    setConfirmClear(false)
+  }
+
+  async function save(request: Promise<ApiResult<ConnectionSummary>>, savedNotice: string | null) {
+    setPending(true)
+    const res = await request
     setPending(false)
 
     if (res.ok) {
       setForm(creating ? EMPTY : fromSummary(res.data))
-      setNotice(creating ? `Connection ${res.data.name} dibuat.` : 'Perubahan tersimpan.')
+      setNotice(savedNotice ?? `Connection ${res.data.name} dibuat.`)
       onSaved(res.data, creating)
       return
     }
     const described = describeFailure(res, creating ? 'Connection gagal dibuat' : 'Perubahan gagal disimpan')
     if (!described) return
     if (res.kind === 'http' && res.error.code === 'TARGET_UNAVAILABLE') described.text = UNVERIFIED
+    if (res.kind === 'http' && res.error.code === 'CONFLICT') described.text += ' Muat ulang halaman untuk melihat data terbaru.'
     described.fieldErrors = normalizeFieldErrors(described.fieldErrors)
     setErrors(described.fieldErrors)
     setFailure(described)
@@ -220,13 +252,17 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
     </FormField>
   )
 
-  const credential = (role: Role) => {
+  const configured = hasCredentials(connection)
+  const credentialInputs = (role: Role) => {
     const usernameField = `${role}_username` as const
     const passwordField = `${role}_password` as const
-    const configured = savedUsername(connection, role) !== ''
     return (
       <div className="col-md-6" key={role}>
-        <FormField label={`Username ${role}`} error={errors[usernameField]}>
+        <FormField
+          label={`Username ${role}`}
+          error={errors[usernameField]}
+          hint={role === 'executor' ? `Berakhiran ${EXECUTOR_SUFFIX}.` : `Prefiks executor + ${PREPARER_SUFFIX}.`}
+        >
           {(control) => (
             <input
               {...control}
@@ -335,20 +371,55 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
         <fieldset className="mb-3">
           <legend className="h4 mb-1">Kredensial eksekusi migration (opsional)</legend>
           <p className="text-secondary mb-2">
-            Isi keempatnya agar migration bisa dijalankan, atau kosongkan semuanya untuk connection view-only. Server
+            {configured
+              ? 'Kredensial tersimpan tetap dipakai saat menyimpan perubahan lain.'
+              : 'Isi keempatnya agar migration bisa dijalankan, atau kosongkan semuanya untuk connection view-only.'}{' '}
+            Username executor wajib berakhiran <code>{EXECUTOR_SUFFIX}</code>, username preparer memakai prefiks yang
+            sama dengan akhiran <code>{PREPARER_SUFFIX}</code> (mis. <code>wbd_target_a_executor</code> dan{' '}
+            <code>wbd_target_a_preparer</code>), dan keduanya harus berbeda dari username PostgreSQL di atas. Server
             memverifikasi kredensial ke database target sebelum menyimpan.
           </p>
-          <div className="row">{ROLES.map(credential)}</div>
+          <div className="row">{ROLES.map(credentialInputs)}</div>
+          {configured && (
+            <div className="d-flex flex-wrap align-items-center gap-2">
+              <Button
+                variant="outline-danger"
+                disabled={pending || changed.length > 0}
+                onClick={() => setConfirmClear(true)}
+              >
+                Hapus kredensial eksekusi (jadikan view-only)
+              </Button>
+              {changed.length > 0 && <span className="text-secondary">Simpan atau batalkan perubahan lain dulu.</span>}
+            </div>
+          )}
         </fieldset>
         {!creating && (
           <p className="text-secondary">
-            Mengubah host, port, atau nama database ditolak selama target sedang menjalankan migration.
+            Selama target sedang menjalankan migration, perubahan apa pun selain nama tampilan (host, port, database,
+            username, password, SSL mode, atau kredensial eksekusi) ditolak.
           </p>
         )}
         <Button type="submit" pending={pending}>
           {creating ? 'Tambah connection' : 'Simpan perubahan'}
         </Button>
       </form>
+      <ConfirmDialog
+        open={confirmClear}
+        title="Hapus kredensial eksekusi?"
+        confirmLabel="Ya, jadikan view-only"
+        danger
+        pending={pending}
+        onCancel={() => setConfirmClear(false)}
+        onConfirm={() => void clearCredentials()}
+      >
+        <p className="mb-2">
+          Kredensial executor dan preparer untuk <strong>{connection?.name}</strong> akan dihapus dari server.
+        </p>
+        <p className="mb-0">
+          Schema dan data tetap bisa dilihat, tetapi migration tidak bisa dijalankan pada database ini sampai kredensial
+          eksekusi diisi lagi.
+        </p>
+      </ConfirmDialog>
     </Panel>
   )
 }

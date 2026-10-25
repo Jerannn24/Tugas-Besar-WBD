@@ -7,7 +7,8 @@ import { Button } from '../../components/Button'
 import { Panel } from '../../components/Panel'
 import { pageUrl } from '../../lib/query'
 import { assignWithoutWarning, useBeforeUnload } from '../../lib/unload'
-import { DraftFields, validateDraft, type DraftForm } from './DraftFields'
+import { validateDraft, type DraftForm } from './draft'
+import { DraftFields } from './DraftFields'
 
 export function CreateDraft({ database }: { database: DatabaseSummary }) {
   const [form, setForm] = useState<DraftForm>({ title: '', sql: '' })

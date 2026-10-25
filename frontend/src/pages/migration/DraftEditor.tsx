@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
-import { errorMessage, isErrorCode, type ApiFailure } from '../../api/client'
+import { errorMessage, isErrorCode, type ApiFailure, type ApiResult } from '../../api/client'
 import { getDraft, updateDraft } from '../../api/endpoints'
 import type { DatabaseSummary, Draft, Execution, ID } from '../../api/types'
 import { Alert } from '../../components/Alert'
@@ -11,7 +11,8 @@ import { Panel } from '../../components/Panel'
 import { formatDateTime } from '../../lib/format'
 import { pageUrl } from '../../lib/query'
 import { useBeforeUnload } from '../../lib/unload'
-import { DraftFields, validateDraft, type DraftForm } from './DraftFields'
+import { validateDraft, type DraftForm } from './draft'
+import { DraftFields } from './DraftFields'
 import { ExecutePanel } from './ExecutePanel'
 import { useExecute } from './execute'
 
@@ -35,13 +36,8 @@ export function DraftEditor({ database, draftId }: Props) {
   const [refreshing, setRefreshing] = useState(false)
   const seq = useRef(0)
 
-  const fetchDraft = useCallback(
-    async (mode: 'initial' | 'refresh', notice: SaveMessage | null = null) => {
-      const mine = ++seq.current
-      if (mode === 'initial') setLoad({ status: 'loading' })
-      else setRefreshing(true)
-      const res = await getDraft(database.id, draftId)
-      if (mine !== seq.current) return
+  const applyDraft = useCallback(
+    (mode: 'initial' | 'refresh', res: ApiResult<Draft>, notice: SaveMessage | null) => {
       setRefreshing(false)
       if (res.ok) {
         setLoad({ status: 'ready', saved: res.data })
@@ -55,12 +51,34 @@ export function DraftEditor({ database, draftId }: Props) {
         setSaveMessage({ variant: 'danger', title: 'Gagal memuat ulang draft', text: errorMessage(res) })
       }
     },
-    [database.id, draftId],
+    [],
+  )
+
+  const requestDraft = useCallback(
+    async (mode: 'initial' | 'refresh', notice: SaveMessage | null) => {
+      const mine = ++seq.current
+      const res = await getDraft(database.id, draftId)
+      if (mine === seq.current) applyDraft(mode, res, notice)
+    },
+    [database.id, draftId, applyDraft],
+  )
+
+  const fetchDraft = useCallback(
+    (mode: 'initial' | 'refresh', notice: SaveMessage | null = null) => {
+      if (mode === 'initial') setLoad({ status: 'loading' })
+      else setRefreshing(true)
+      return requestDraft(mode, notice)
+    },
+    [requestDraft],
   )
 
   useEffect(() => {
-    void fetchDraft('initial')
-  }, [fetchDraft])
+    void requestDraft('initial', null)
+    const ref = seq
+    return () => {
+      ref.current++
+    }
+  }, [requestDraft])
 
   const onFinal = useCallback(
     (execution: Execution) => {
@@ -132,6 +150,7 @@ export function DraftEditor({ database, draftId }: Props) {
       <FailureAlert
         failure={load.failure}
         notFoundTitle="Draft tidak ditemukan"
+        invalidTitle="ID draft tidak valid"
         onRetry={() => void fetchDraft('initial')}
       />
     )

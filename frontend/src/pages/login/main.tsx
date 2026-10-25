@@ -6,7 +6,7 @@ import { Button } from '../../components/Button'
 import { FormField } from '../../components/FormField'
 import { Loading } from '../../components/Loading'
 import { Panel } from '../../components/Panel'
-import { APP_NAME, SESSION_ENDED_PARAM } from '../../lib/app'
+import { APP_NAME, SESSION_ENDED_PARAM, SESSION_ENDED_VALUE } from '../../lib/app'
 import { mountPage } from '../../lib/mount'
 import { getQueryParam } from '../../lib/query'
 
@@ -14,7 +14,7 @@ type Feedback =
   | { variant: 'danger' | 'warning'; title: string; message: string }
   | null
 
-const sessionEnded = getQueryParam(SESSION_ENDED_PARAM) !== null
+const sessionEnded = getQueryParam(SESSION_ENDED_PARAM) === SESSION_ENDED_VALUE
 
 type CsrfState = { status: 'loading' } | { status: 'ready' } | { status: 'error'; failure: ApiFailure }
 
@@ -94,8 +94,8 @@ function LoginPage() {
                 </Alert>
               )}
               {sessionEnded && !feedback && (
-                <Alert variant="info" title="Sesi diakhiri">
-                  Akun Anda baru saja diubah sehingga sesi diakhiri. Silakan login kembali.
+                <Alert variant="info">
+                  Sesi Anda berakhir atau hak akses Anda berubah. Silakan masuk kembali.
                 </Alert>
               )}
               {feedback && (

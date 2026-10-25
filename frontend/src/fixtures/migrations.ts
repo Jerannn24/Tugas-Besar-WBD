@@ -16,7 +16,7 @@ type State = {
   seq: number
 }
 
-const STORAGE_KEY = 'fixture_c06_v2'
+const STORAGE_KEY = 'fixture_c06_v3'
 const RUNNING_MS = 6_000
 const UNKNOWN_MS = 90_000
 const SQL_MAX_BYTES = 256 * 1024
@@ -27,6 +27,10 @@ const SECOND = TARGETS.demo_second.id
 const READONLY = TARGETS.demo_readonly.id
 const editor = USERS.demo_editor
 const admin = USERS.demo_admin
+
+const SQL_FAILED = { code: 'SQL_FAILED', message: 'SQL execution failed' }
+const OUTCOME_UNCONFIRMED = { code: 'OUTCOME_UNCONFIRMED', message: 'Execution outcome could not be confirmed' }
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 const draftId = (n: number) => `40000000-0000-4000-8000-${String(n).padStart(12, '0')}`
 const executionId = (n: number) => `50000000-0000-4000-8000-${String(n).padStart(12, '0')}`
@@ -94,6 +98,7 @@ function seed(): State {
     seedDraft(8, 'Contoh DATABASE_BUSY', '-- fixture:busy\nALTER TABLE public.orders ADD COLUMN note text;'),
     seedDraft(9, 'Contoh jaringan putus', '-- fixture:network\nCREATE INDEX events_kind_idx ON public.events (kind);'),
     seedDraft(10, 'Contoh SQL_UNSUPPORTED', 'BEGIN;\nALTER TABLE public.orders DROP COLUMN currency;\nCOMMIT;'),
+    seedDraft(11, 'Contoh target belum siap (502)', '-- fixture:target_unavailable\nALTER TABLE public.orders ADD COLUMN memo text;'),
     seedDraft(20, 'Contoh database view-only (Execute nonaktif)', 'ALTER TABLE public.notes ADD COLUMN tag text;', {
       database_id: READONLY,
     }),
@@ -101,14 +106,11 @@ function seed(): State {
 
   const executions: StoredExecution[] = [
     seedExecution(1, MAIN, draftId(1), '1', 'Buat tabel customers', createCustomers, 'succeeded', '2026-10-01T02:00:00Z', '2026-10-01T02:00:01Z'),
-    seedExecution(2, MAIN, draftId(2), '2', 'Tambah kolom carrier ke shipments', `-- fixture:fail\n${shipmentsSql}`, 'failed', '2026-10-02T02:00:00Z', '2026-10-02T02:00:00Z', {
-      code: '42P01',
-      message: 'relation "public.shipments" does not exist',
-    }),
+    seedExecution(2, MAIN, draftId(2), '2', 'Tambah kolom carrier ke shipments', `-- fixture:fail\n${shipmentsSql}`, 'failed', '2026-10-02T02:00:00Z', '2026-10-02T02:00:00Z', SQL_FAILED),
     seedExecution(3, MAIN, draftId(3), '3', 'Index orders.placed_at', indexSql, 'succeeded', '2026-10-03T02:00:00Z', '2026-10-03T02:00:02Z'),
     seedExecution(11, SECOND, draftId(91), '1', 'Buat tabel products', 'CREATE TABLE inventory.products (sku text PRIMARY KEY);', 'succeeded', '2026-09-20T01:00:00Z', '2026-09-20T01:00:01Z'),
     {
-      ...seedExecution(12, SECOND, draftId(92), '2', 'Hapus stok nol', 'DELETE FROM inventory.products WHERE stock = 0;', 'unknown', '2026-09-21T01:00:00Z', null),
+      ...seedExecution(12, SECOND, draftId(92), '2', 'Hapus stok nol', 'DELETE FROM inventory.products WHERE stock = 0;', 'unknown', '2026-09-21T01:00:00Z', null, OUTCOME_UNCONFIRMED),
       executed_by: { id: admin.id, username: admin.username },
     },
   ]
@@ -145,6 +147,7 @@ function settle(state: State): void {
   for (const x of state.executions) {
     if (unresolved(x) && x.resolve_at !== undefined && x.resolve_at <= t) {
       x.status = 'succeeded'
+      x.error = null
       x.finished_at = new Date(x.resolve_at).toISOString()
       delete x.resolve_at
       const draft = state.drafts.find((d) => d.id === x.draft_id)
@@ -194,7 +197,8 @@ export function handleMigrationRequest(
   const [resource, id, action] = rest
   if (resource !== 'drafts' && resource !== 'migrations') return null
 
-  if (databaseId !== MAIN && databaseId !== SECOND && databaseId !== READONLY) return fail(404, 'NOT_FOUND', 'Database tidak ditemukan.')
+  if (!UUID.test(databaseId)) return fail(400, 'INVALID_REQUEST', 'Invalid database id')
+  if (databaseId !== MAIN && databaseId !== SECOND && databaseId !== READONLY) return fail(404, 'NOT_FOUND', 'Database not found')
   const access = (DATABASES_BY_USER[username] ?? []).find((d) => d.id === databaseId)?.access
   if (!access) return fail(403, 'FORBIDDEN', 'Anda tidak memiliki akses ke database ini.')
   if (resource === 'drafts' && access !== 'edit') {
@@ -337,6 +341,10 @@ function execute(
   if (state.executions.some((x) => x.database_id === databaseId && unresolved(x)) || draft.sql.includes('-- fixture:busy')) {
     return fail(409, 'DATABASE_BUSY', 'Database target sedang menjalankan migration lain.', {}, true)
   }
+  const notReady = (DATABASES_BY_USER[username] ?? []).some((d) => d.id === databaseId && d.execution_ready === false)
+  if (notReady || draft.sql.includes('-- fixture:target_unavailable')) {
+    return fail(502, 'TARGET_UNAVAILABLE', 'Execution target is not ready', {}, true)
+  }
   const unsupported = UNSUPPORTED.exec(draft.sql)
   if (unsupported) {
     return fail(
@@ -365,13 +373,14 @@ function execute(
 
   if (draft.sql.includes('-- fixture:fail')) {
     x.status = 'failed'
-    x.error = { code: '42703', message: 'column "does_not_exist" of relation does not exist' }
+    x.error = SQL_FAILED
   } else if (draft.sql.includes('-- fixture:running')) {
     x.status = 'running'
     x.finished_at = null
     x.resolve_at = started + RUNNING_MS
   } else if (draft.sql.includes('-- fixture:unknown')) {
     x.status = 'unknown'
+    x.error = OUTCOME_UNCONFIRMED
     x.finished_at = null
     x.resolve_at = started + UNKNOWN_MS
   }

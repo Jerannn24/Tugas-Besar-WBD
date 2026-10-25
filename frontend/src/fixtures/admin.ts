@@ -293,7 +293,7 @@ function validateCredentials(input: Record<string, unknown>, self: ConnectionSum
   const sent = ROLES.filter((r) => r in input)
   const configured = (r: (typeof ROLES)[number]) => Boolean(self?.[`${r}_username`])
   const missing = ROLES.find((r) => !sent.includes(r))
-  if (sent.length === 1 && missing && !configured(missing)) errors[missing] = 'Executor dan preparer harus dikirim bersama.'
+  if (sent.length === 1 && missing) errors[missing] = 'Executor dan preparer harus dikirim bersama.'
   for (const r of sent) {
     const v = input[r]
     if (!isObject(v)) {
@@ -310,6 +310,26 @@ function validateCredentials(input: Record<string, unknown>, self: ConnectionSum
   }
 }
 const sendsCredentials = (input: Record<string, unknown>) => ROLES.some((r) => r in input)
+
+function invalidRoleNames(input: Record<string, unknown>): boolean {
+  if (!sendsCredentials(input)) return false
+  const name = (r: (typeof ROLES)[number]) => {
+    const v = input[r]
+    return isObject(v) && typeof v.username === 'string' ? v.username.trim() : ''
+  }
+  const executor = name('executor')
+  const preparer = name('preparer')
+  const viewer = typeof input.username === 'string' ? input.username.trim() : ''
+  const suffix = '_executor'
+  return (
+    !executor.endsWith(suffix) ||
+    executor.length <= suffix.length ||
+    preparer !== `${executor.slice(0, -suffix.length)}_preparer` ||
+    executor === viewer ||
+    preparer === viewer
+  )
+}
+const invalidInput = () => fail(400, 'INVALID_INPUT', 'Invalid connection input')
 const unreachable = (host: string) => host.toLowerCase().endsWith('.invalid')
 const unverified = () => fail(502, 'TARGET_UNAVAILABLE', 'Kredensial tidak dapat diverifikasi ke database target.', {}, true)
 
@@ -320,22 +340,17 @@ function validateConnection(state: State, input: Record<string, unknown>, self: 
   const creating = self === null
   const errors: Record<string, string> = {}
   for (const f of TEXT_FIELDS) {
-    if (!creating && !(f in input)) continue
     const v = typeof input[f] === 'string' ? (input[f] as string).trim() : ''
     if (v === '') errors[f] = 'Wajib diisi.'
     else if (f === 'name' && chars(v) > 100) errors.name = 'Nama maksimal 100 karakter.'
   }
-  if (creating || 'port' in input) {
-    const p = input.port
-    if (typeof p !== 'number' || !Number.isInteger(p) || p < 1 || p > 65535) errors.port = 'Port harus 1 sampai 65535.'
-  }
+  const p = input.port
+  if (typeof p !== 'number' || !Number.isInteger(p) || p < 1 || p > 65535) errors.port = 'Port harus 1 sampai 65535.'
   if (creating || 'password' in input) {
     if (typeof input.password !== 'string' || input.password === '') errors.password = 'Password tidak boleh kosong.'
   }
-  if (creating || 'ssl_mode' in input) {
-    if (typeof input.ssl_mode !== 'string' || !SSL_MODES.includes(input.ssl_mode)) {
-      errors.ssl_mode = 'SSL mode harus disable, require, atau verify-full.'
-    }
+  if (typeof input.ssl_mode !== 'string' || !SSL_MODES.includes(input.ssl_mode)) {
+    errors.ssl_mode = 'SSL mode harus disable, require, atau verify-full.'
   }
   validateCredentials(input, self, errors)
   if (Object.keys(errors).length === 0) {
@@ -374,6 +389,7 @@ function createConnection(state: State, body: unknown): Response {
   if (!isObject(body)) return badRequest()
   const errors = validateConnection(state, body, null)
   if (Object.keys(errors).length > 0) return invalid(errors)
+  if (invalidRoleNames(body)) return invalidInput()
   if (sendsCredentials(body) && unreachable(String(body.host))) return unverified()
   const empty: ConnectionSummary = { id: nextId(state, '30000000'), name: '', host: '', port: 0, database_name: '', username: '', ssl_mode: 'require', ...VIEW_ONLY }
   const created = summary(body, empty) // password tidak disimpan di fixture
@@ -385,10 +401,14 @@ function patchConnection(state: State, id: ID, body: unknown): Response {
   const current = state.connections.find((c) => c.id === id)
   if (!current) return notFound('Connection')
   if (!isObject(body)) return badRequest()
+
   const errors = validateConnection(state, body, current)
   if (Object.keys(errors).length > 0) return invalid(errors)
-  const next = summary(body, current)
+  if (invalidRoleNames(body)) return invalidInput()
+
+  const next = sendsCredentials(body) ? summary(body, current) : { ...summary(body, current), ...VIEW_ONLY }
   if (sendsCredentials(body) && unreachable(next.host)) return unverified()
+    
   const identityChanged = targetKey(next) !== targetKey(current)
   if (identityChanged && hasUnresolvedExecution(id)) {
     return fail(409, 'DATABASE_BUSY', 'Target sedang menjalankan migration; host, port, dan database tidak dapat diubah.', {}, true)

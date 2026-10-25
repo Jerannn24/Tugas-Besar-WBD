@@ -69,11 +69,11 @@ const customers = table(
     col('created_at', 'timestamp with time zone', false, 'now()'),
   ],
   [
-    { name: 'customers_pkey', kind: 'PRIMARY KEY', definition: 'PRIMARY KEY (id)' },
-    { name: 'customers_email_key', kind: 'UNIQUE', definition: 'UNIQUE (email)' },
+    { name: 'customers_pkey', kind: 'primary', definition: 'PRIMARY KEY (id)' },
+    { name: 'customers_email_key', kind: 'unique', definition: 'UNIQUE (email)' },
     {
       name: 'customers_status_check',
-      kind: 'CHECK',
+      kind: 'check',
       definition: "CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text, 'closed'::text])))",
     },
   ],
@@ -118,13 +118,13 @@ const orders = table(
     col('shipped_on', 'date'),
   ],
   [
-    { name: 'orders_pkey', kind: 'PRIMARY KEY', definition: 'PRIMARY KEY (id)' },
+    { name: 'orders_pkey', kind: 'primary', definition: 'PRIMARY KEY (id)' },
     {
       name: 'orders_customer_id_fkey',
-      kind: 'FOREIGN KEY',
+      kind: 'foreign',
       definition: 'FOREIGN KEY (customer_id) REFERENCES public.customers(id) ON DELETE RESTRICT',
     },
-    { name: 'orders_amount_check', kind: 'CHECK', definition: 'CHECK ((amount_cents <> 0))' },
+    { name: 'orders_amount_check', kind: 'check', definition: 'CHECK ((amount_cents <> 0))' },
   ],
   [
     {
@@ -157,7 +157,7 @@ const events = table(
     col('payload', 'json'),
     col('occurred_at', 'timestamp with time zone', false, 'now()'),
   ],
-  [{ name: 'events_pkey', kind: 'PRIMARY KEY', definition: 'PRIMARY KEY (id)' }],
+  [{ name: 'events_pkey', kind: 'primary', definition: 'PRIMARY KEY (id)' }],
   [
     {
       name: 'events_pkey',
@@ -189,7 +189,7 @@ const auditLog = table(
     col('action', 'text', false),
     col('logged_at', 'timestamp with time zone', false, 'now()'),
   ],
-  [{ name: 'audit_log_pkey', kind: 'PRIMARY KEY', definition: 'PRIMARY KEY (id)' }],
+  [{ name: 'audit_log_pkey', kind: 'primary', definition: 'PRIMARY KEY (id)' }],
   [
     {
       name: 'audit_log_pkey',
@@ -211,8 +211,8 @@ const orderItems = table(
     col('select', 'text'),
   ],
   [
-    { name: 'Order Items_pkey', kind: 'PRIMARY KEY', definition: 'PRIMARY KEY ("Item ID")' },
-    { name: 'Order Items_qty_check', kind: 'CHECK', definition: 'CHECK ((qty > 0))' },
+    { name: 'Order Items_pkey', kind: 'primary', definition: 'PRIMARY KEY ("Item ID")' },
+    { name: 'Order Items_qty_check', kind: 'check', definition: 'CHECK ((qty > 0))' },
   ],
   [
     {
@@ -247,8 +247,8 @@ const products = table(
     col('updated_at', 'timestamp with time zone', false, 'now()'),
   ],
   [
-    { name: 'products_pkey', kind: 'PRIMARY KEY', definition: 'PRIMARY KEY (sku)' },
-    { name: 'products_stock_check', kind: 'CHECK', definition: 'CHECK ((stock >= 0))' },
+    { name: 'products_pkey', kind: 'primary', definition: 'PRIMARY KEY (sku)' },
+    { name: 'products_stock_check', kind: 'check', definition: 'CHECK ((stock >= 0))' },
   ],
   [
     {
@@ -271,7 +271,7 @@ const notes = table(
   'public',
   'notes',
   [col('id', 'bigint', false), col('body', 'text')],
-  [{ name: 'notes_pkey', kind: 'PRIMARY KEY', definition: 'PRIMARY KEY (id)' }],
+  [{ name: 'notes_pkey', kind: 'primary', definition: 'PRIMARY KEY (id)' }],
   [{ name: 'notes_pkey', definition: 'CREATE UNIQUE INDEX notes_pkey ON public.notes USING btree (id)', is_unique: true, is_primary: true }],
   [
     ['1', 'Connection ini view-only: kredensial executor/preparer belum dikonfigurasi.'],

@@ -18,3 +18,8 @@ export function assignWithoutWarning(url: string): void {
   bypass = true
   window.location.assign(url)
 }
+
+export function reloadWithoutWarning(): void {
+  bypass = true
+  window.location.reload()
+}

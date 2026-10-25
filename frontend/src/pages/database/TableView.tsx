@@ -91,19 +91,16 @@ export function TableView({ databaseId, selection, tab, onTabChange }: Props) {
   const metaSeq = useRef(0)
   const rowsSeq = useRef(0)
 
-  const loadMeta = useCallback(async () => {
+  const fetchMeta = useCallback(async () => {
     const seq = ++metaSeq.current
-    setMeta({ status: 'loading' })
     const res = await getTable(databaseId, schema, table)
     if (seq !== metaSeq.current) return
     setMeta(res.ok ? { status: 'ready', data: res.data } : { status: 'failed', failure: res })
   }, [databaseId, schema, table])
 
-  const loadRows = useCallback(
+  const fetchRows = useCallback(
     async (offset: number) => {
       const seq = ++rowsSeq.current
-      setRowsOffset(offset)
-      setRows({ status: 'loading' })
       const res = await getRows(databaseId, { schema, table, limit: PAGE_SIZE, offset })
       if (seq !== rowsSeq.current) return
       setRows(res.ok ? { status: 'ready', data: res.data } : { status: 'failed', failure: res })
@@ -111,20 +108,31 @@ export function TableView({ databaseId, selection, tab, onTabChange }: Props) {
     [databaseId, schema, table],
   )
 
+  const loadRows = useCallback(
+    (offset: number) => {
+      setRowsOffset(offset)
+      setRows({ status: 'loading' })
+      return fetchRows(offset)
+    },
+    [fetchRows],
+  )
+
   const reloadAll = useCallback(() => {
-    void loadMeta()
+    setMeta({ status: 'loading' })
+    void fetchMeta()
     void loadRows(0)
-  }, [loadMeta, loadRows])
+  }, [fetchMeta, loadRows])
 
   useEffect(() => {
-    reloadAll()
+    void fetchMeta()
+    void fetchRows(0)
     const metaRef = metaSeq
     const rowsRef = rowsSeq
     return () => {
       metaRef.current++
       rowsRef.current++
     }
-  }, [reloadAll])
+  }, [fetchMeta, fetchRows])
 
   return (
     <section className="card" aria-labelledby="table-view-title">

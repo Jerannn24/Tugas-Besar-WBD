@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
-import { errorMessage, type ApiFailure } from '../../api/client'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { errorMessage, type ApiFailure, type ApiResult } from '../../api/client'
 import { listDatabases } from '../../api/endpoints'
-import type { DatabaseSummary } from '../../api/types'
+import type { DatabaseSummary, List } from '../../api/types'
 import { AccessBadge } from '../../components/AccessBadge'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
@@ -35,21 +35,37 @@ const COLUMNS: DataColumn<DatabaseSummary>[] = [
   },
 ]
 
+function toListState(res: ApiResult<List<DatabaseSummary>>): ListState {
+  if (res.ok) return { status: 'ready', items: res.data.items }
+  if (res.kind === 'http' && res.status === 401) return { status: 'expired' }
+  if (res.kind === 'http' && res.status === 403) return { status: 'forbidden' }
+  return { status: 'error', failure: res }
+}
+
 function DatabaseList({ isAdmin }: { isAdmin: boolean }) {
   const [state, setState] = useState<ListState>({ status: 'loading' })
 
-  const load = useCallback(async () => {
-    setState({ status: 'loading' })
+  const seq = useRef(0)
+
+  const fetchList = useCallback(async () => {
+    const mine = ++seq.current
     const res = await listDatabases()
-    if (res.ok) setState({ status: 'ready', items: res.data.items })
-    else if (res.kind === 'http' && res.status === 401) setState({ status: 'expired' })
-    else if (res.kind === 'http' && res.status === 403) setState({ status: 'forbidden' })
-    else setState({ status: 'error', failure: res })
+    if (mine !== seq.current) return
+    setState(toListState(res))
   }, [])
 
+  const load = useCallback(async () => {
+    setState({ status: 'loading' })
+    await fetchList()
+  }, [fetchList])
+
   useEffect(() => {
-    void load()
-  }, [load])
+    void fetchList()
+    const ref = seq
+    return () => {
+      ref.current++
+    }
+  }, [fetchList])
 
   switch (state.status) {
     case 'loading':

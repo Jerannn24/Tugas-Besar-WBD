@@ -110,5 +110,5 @@ export const getMigration = (databaseId: ID, executionId: ID) =>
 export const executeDraft = (databaseId: ID, draftId: ID, input: ExecuteInput) =>
   request<Execution>('POST', `${db(databaseId)}/drafts/${e(draftId)}/execute`, {
     body: input,
-    timeoutMs: 30_000,
+    timeoutMs: 65_000,
   })

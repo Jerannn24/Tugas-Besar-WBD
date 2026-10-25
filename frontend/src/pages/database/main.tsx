@@ -36,17 +36,25 @@ function Viewer({ database }: { database: DatabaseSummary }) {
   const [tab, setTab] = useState<Tab>('columns')
   const schemasSeq = useRef(0)
 
-  const loadSchemas = useCallback(async () => {
+  const fetchSchemas = useCallback(async () => {
     const seq = ++schemasSeq.current
-    setSchemas({ status: 'loading' })
     const res = await listSchemas(database.id)
     if (seq !== schemasSeq.current) return
     setSchemas(res.ok ? { status: 'ready', schemas: res.data.items } : { status: 'failed', failure: res })
   }, [database.id])
 
+  const loadSchemas = useCallback(async () => {
+    setSchemas({ status: 'loading' })
+    await fetchSchemas()
+  }, [fetchSchemas])
+
   useEffect(() => {
-    void loadSchemas()
-  }, [loadSchemas])
+    void fetchSchemas()
+    const ref = schemasSeq
+    return () => {
+      ref.current++
+    }
+  }, [fetchSchemas])
 
   function select(next: Selection) {
     setSelection(next)
