@@ -33,7 +33,7 @@ func CSRFMiddleware() fiber.Handler {
 		cookie := c.Cookies(CSRFCookieName)
 		header := c.Get("X-CSRF-Token")
 		if cookie == "" || header == "" || cookie != header {
-			return response.Fail(c, fiber.StatusForbidden, "CSRF_FAILED", "Permintaan tidak valid")
+			return response.Fail(c, fiber.StatusForbidden, "CSRF_INVALID", "Permintaan tidak valid")
 		}
 		return c.Next()
 	}
