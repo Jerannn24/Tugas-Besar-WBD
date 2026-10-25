@@ -6,6 +6,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -18,6 +19,7 @@ type Service interface {
 	Login(ctx context.Context, username, password string) (*LoginResult, error)
 	Logout(ctx context.Context, sessionID string) error
 	Authenticate(ctx context.Context, sessionID string) (*AuthenticatedSession, error)
+	CurrentUser(ctx context.Context, userID uuid.UUID) (*User, error)
 	SessionConfig() SessionConfig
 }
 
@@ -93,6 +95,10 @@ func (s *service) Logout(ctx context.Context, sessionID string) error {
 
 func (s *service) Authenticate(ctx context.Context, sessionID string) (*AuthenticatedSession, error) {
 	return s.authenticate(ctx, sessionID)
+}
+
+func (s *service) CurrentUser(ctx context.Context, userID uuid.UUID) (*User, error) {
+	return s.repo.FindByID(ctx, userID)
 }
 
 func (s *service) SessionConfig() SessionConfig {

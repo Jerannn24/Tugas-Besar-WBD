@@ -69,22 +69,19 @@ func (h *Handler) Login(c *fiber.Ctx) error {
 	}
 
 	setSessionCookie(c, h.service.SessionConfig(), result.SessionID, result.ExpiresAt)
-	if err := h.setCSRFCookie(c); err != nil {
+	if _, err := h.setCSRFCookie(c); err != nil {
 		return response.Fail(c, fiber.StatusInternalServerError, "INTERNAL_ERROR", "Terjadi kesalahan internal")
 	}
 
-	return response.JSON(c, fiber.StatusOK, fiber.Map{
-		"message": "Login berhasil",
-	})
+	return response.JSON(c, fiber.StatusOK, newSessionView(result.User, result.ExpiresAt))
 }
 
 func (h *Handler) CSRF(c *fiber.Ctx) error {
-	if err := h.setCSRFCookie(c); err != nil {
+	token, err := h.setCSRFCookie(c)
+	if err != nil {
 		return response.Fail(c, fiber.StatusInternalServerError, "INTERNAL_ERROR", "Terjadi kesalahan internal")
 	}
-	return response.JSON(c, fiber.StatusOK, fiber.Map{
-		"message": "CSRF token siap",
-	})
+	return response.JSON(c, fiber.StatusOK, fiber.Map{"csrf_token": token})
 }
 
 func (h *Handler) Session(c *fiber.Ctx) error {
@@ -92,9 +89,14 @@ func (h *Handler) Session(c *fiber.Ctx) error {
 	if !ok || session == nil || session.Session == nil {
 		return response.Fail(c, fiber.StatusUnauthorized, "UNAUTHENTICATED", "Sesi tidak valid")
 	}
-	return response.JSON(c, fiber.StatusOK, fiber.Map{
-		"absolute_expires_at": session.Session.AbsoluteExpiresAt.UTC().Format(time.RFC3339),
-	})
+	user, err := h.service.CurrentUser(c.UserContext(), session.Session.UserID)
+	if err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			return response.Fail(c, fiber.StatusUnauthorized, "UNAUTHENTICATED", "Sesi tidak valid")
+		}
+		return response.Fail(c, fiber.StatusInternalServerError, "INTERNAL_ERROR", "Terjadi kesalahan internal")
+	}
+	return response.JSON(c, fiber.StatusOK, newSessionView(user, session.Session.AbsoluteExpiresAt))
 }
 
 func (h *Handler) Logout(c *fiber.Ctx) error {
@@ -104,13 +106,13 @@ func (h *Handler) Logout(c *fiber.Ctx) error {
 	if err != nil {
 		return response.Fail(c, fiber.StatusInternalServerError, "INTERNAL_ERROR", "Terjadi kesalahan internal")
 	}
-	return response.JSON(c, fiber.StatusOK, fiber.Map{"message": "Logout berhasil"})
+	return response.JSON(c, fiber.StatusOK, fiber.Map{"logged_out": true})
 }
 
-func (h *Handler) setCSRFCookie(c *fiber.Ctx) error {
+func (h *Handler) setCSRFCookie(c *fiber.Ctx) (string, error) {
 	token, err := newSessionID()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	config := h.service.SessionConfig()
@@ -124,7 +126,7 @@ func (h *Handler) setCSRFCookie(c *fiber.Ctx) error {
 		Domain:   config.CookieDomain,
 		Path:     "/",
 	})
-	return nil
+	return token, nil
 }
 
 func (h *Handler) clearCookie(c *fiber.Ctx, name string) {
@@ -140,4 +142,29 @@ func (h *Handler) clearCookie(c *fiber.Ctx, name string) {
 		Domain:   config.CookieDomain,
 		Path:     "/",
 	})
+}
+
+type userView struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	IsAdmin  bool   `json:"is_admin"`
+	IsActive bool   `json:"is_active"`
+}
+
+type sessionView struct {
+	User              userView `json:"user"`
+	AbsoluteExpiresAt string   `json:"absolute_expires_at"`
+}
+
+// Session dan login hanya untuk user aktif, jadi is_active selalu true.
+func newSessionView(user *User, expiresAt time.Time) sessionView {
+	return sessionView{
+		User: userView{
+			ID:       user.ID.String(),
+			Username: user.Username,
+			IsAdmin:  user.IsAdmin,
+			IsActive: true,
+		},
+		AbsoluteExpiresAt: expiresAt.UTC().Format(time.RFC3339),
+	}
 }

@@ -301,6 +301,7 @@ func (r *SessionRepository) Revoke(ctx context.Context, familyID uuid.UUID, now 
 type LoginResult struct {
 	SessionID string
 	ExpiresAt time.Time
+	User      *User
 }
 
 type AuthenticatedSession struct {
@@ -400,6 +401,7 @@ func (s *service) createSession(ctx context.Context, user *User) (*LoginResult, 
 	return &LoginResult{
 		SessionID: sessionID,
 		ExpiresAt: expires,
+		User:      user,
 	}, nil
 }
 

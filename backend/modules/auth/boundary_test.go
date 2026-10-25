@@ -38,6 +38,9 @@ func (f *fakeService) Authenticate(_ context.Context, sessionID string) (*auth.A
 		Session:   &auth.Session{UserID: f.userID, AbsoluteExpiresAt: time.Now().Add(time.Hour)},
 	}, nil
 }
+func (f *fakeService) CurrentUser(_ context.Context, id uuid.UUID) (*auth.User, error) {
+	return &auth.User{ID: id, Username: "alice", IsAdmin: true}, nil
+}
 func (f *fakeService) SessionConfig() auth.SessionConfig { return auth.SessionConfig{} }
 
 type fakeAuthorizer struct{}
