@@ -265,27 +265,67 @@ func TestSessionRotationGraceAndAbsoluteExpiry(t *testing.T) {
 	user := createAuthTestUser(t, db)
 	config := testSessionConfig()
 	config.RotationInterval = -time.Second
-	config.AbsoluteLifetime = 2 * time.Second
+	config.GracePeriod = time.Minute
 	service := newTestService(db, config)
 	oldID := loginUser(t, service, user)
+	familyID := familyOf(t, db, user)
+	var originalExpiry time.Time
+	if err := db.QueryRow(context.Background(),
+		`SELECT absolute_expires_at FROM app.session_families WHERE id=$1`, familyID).Scan(&originalExpiry); err != nil {
+		t.Fatal(err)
+	}
 
 	rotated, err := service.Authenticate(context.Background(), oldID)
 	if err != nil {
 		t.Fatalf("rotate session: %v", err)
 	}
-	service.sessionConfig.RotationInterval = time.Hour
-
-	time.Sleep(config.GracePeriod + 50*time.Millisecond)
-	if _, err := service.Authenticate(context.Background(), oldID); !errors.Is(err, ErrSessionExpired) {
-		t.Fatalf("expected old session grace expiry, got %v", err)
+	if rotated.SessionID == oldID {
+		t.Fatal("expected session rotation")
 	}
-	if _, err := service.Authenticate(context.Background(), rotated.SessionID); err != nil {
-		t.Fatalf("current token should remain valid after grace expiry: %v", err)
+	var absoluteExpiry, graceExpiry, currentExpiry time.Time
+	if err := db.QueryRow(context.Background(), `
+		SELECT f.absolute_expires_at, old.valid_until, current.valid_until
+		FROM app.session_families f
+		JOIN app.session_tokens old ON old.family_id=f.id AND old.token_hash=$2
+		JOIN app.session_tokens current ON current.family_id=f.id AND current.token_hash=$3
+		WHERE f.id=$1`, familyID, mustHash(t, oldID), mustHash(t, rotated.SessionID)).
+		Scan(&absoluteExpiry, &graceExpiry, &currentExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if !absoluteExpiry.Equal(originalExpiry) || !currentExpiry.Equal(originalExpiry) {
+		t.Fatal("rotation changed the absolute expiry deadline")
+	}
+	if !graceExpiry.Before(absoluteExpiry) {
+		t.Fatal("fixture must expire grace before absolute expiry")
 	}
 
-	time.Sleep(2 * time.Second)
-	if _, err := service.Authenticate(context.Background(), rotated.SessionID); !errors.Is(err, ErrSessionExpired) {
-		t.Fatalf("expected absolute expiry after rotation, got %v", err)
+	// Find accepts the comparison time explicitly. Use persisted deadlines,
+	// since Sleep's monotonic clock can disagree with a VM's adjusted wall clock.
+	for _, tc := range []struct {
+		name, id, state string
+		now             time.Time
+		expired         bool
+	}{
+		{"grace before deadline", oldID, "grace", graceExpiry.Add(-time.Microsecond), false},
+		{"grace at deadline", oldID, "", graceExpiry, true},
+		{"grace after deadline", oldID, "", graceExpiry.Add(time.Microsecond), true},
+		{"current survives grace", rotated.SessionID, "current", graceExpiry.Add(time.Microsecond), false},
+		{"current before absolute deadline", rotated.SessionID, "current", absoluteExpiry.Add(-time.Microsecond), false},
+		{"current at absolute deadline", rotated.SessionID, "", absoluteExpiry, true},
+		{"current after absolute deadline", rotated.SessionID, "", absoluteExpiry.Add(time.Microsecond), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session, state, err := service.sessions.Find(context.Background(), mustHash(t, tc.id), tc.now, config.IdleTimeout)
+			if tc.expired {
+				if !errors.Is(err, ErrSessionExpired) || session != nil {
+					t.Fatalf("expected expired session, got session=%v error=%v", session, err)
+				}
+				return
+			}
+			if err != nil || session == nil || state != tc.state {
+				t.Fatalf("expected valid %s session, got state=%s error=%v", tc.state, state, err)
+			}
+		})
 	}
 }
 
