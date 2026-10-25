@@ -225,14 +225,35 @@ func (r *Repository) DeleteGroup(ctx context.Context, id uuid.UUID) error {
 	if id == uuid.Nil {
 		return ErrInvalidInput
 	}
-	result, err := r.db.Exec(ctx, `DELETE FROM app.groups WHERE id=$1`, id)
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM app.groups WHERE id=$1 FOR UPDATE`, id); err != nil {
+		return err
+	}
+	var hasGrants bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM app.group_database_grants WHERE group_id=$1)`, id).Scan(&hasGrants); err != nil {
+		return err
+	}
+	if hasGrants {
+		members, err := groupMembers(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if err := revokeUsers(ctx, tx, members...); err != nil {
+			return err
+		}
+	}
+	result, err := tx.Exec(ctx, `DELETE FROM app.groups WHERE id=$1`, id)
 	if err != nil {
 		return err
 	}
 	if result.RowsAffected() != 1 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (r *Repository) Members(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
@@ -282,6 +303,10 @@ func (r *Repository) ReplaceGrants(ctx context.Context, id uuid.UUID, grants []G
 	if _, err := tx.Exec(ctx, `SELECT id FROM app.groups WHERE id=$1 FOR UPDATE`, id); err != nil {
 		return nil, err
 	}
+	oldGrants, err := grantsIn(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM app.group_database_grants WHERE group_id=$1`, id); err != nil {
 		return nil, err
 	}
@@ -295,6 +320,21 @@ func (r *Repository) ReplaceGrants(ctx context.Context, id uuid.UUID, grants []G
 			if strings.Contains(err.Error(), "foreign key") {
 				return nil, ErrInvalidInput
 			}
+			return nil, err
+		}
+	}
+	decreased, increased := grantChange(oldGrants, grants)
+	if decreased || increased {
+		members, err := groupMembers(ctx, tx, id)
+		if err != nil {
+			return nil, err
+		}
+		if decreased {
+			err = revokeUsers(ctx, tx, members...)
+		} else {
+			err = requireRotation(ctx, tx, members)
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -324,6 +364,10 @@ func (r *Repository) replaceSet(ctx context.Context, groupID uuid.UUID, userIDs 
 			return nil, ErrInvalidInput
 		}
 	}
+	oldMembers, err := groupMembers(ctx, tx, groupID)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM app.group_memberships WHERE group_id=$1`, groupID); err != nil {
 		return nil, err
 	}
@@ -331,9 +375,13 @@ func (r *Repository) replaceSet(ctx context.Context, groupID uuid.UUID, userIDs 
 		if _, err := tx.Exec(ctx, `INSERT INTO app.group_memberships(group_id,user_id) VALUES($1,$2)`, groupID, id); err != nil {
 			return nil, err
 		}
-		if err := revokeUsers(ctx, tx, id); err != nil {
-			return nil, err
-		}
+	}
+	removed, added := diffMembers(oldMembers, userIDs)
+	if err := revokeUsers(ctx, tx, removed...); err != nil {
+		return nil, err
+	}
+	if err := requireRotation(ctx, tx, added); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -341,9 +389,112 @@ func (r *Repository) replaceSet(ctx context.Context, groupID uuid.UUID, userIDs 
 	return r.Members(ctx, groupID)
 }
 
-func revokeUsers(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error {
-	_, err := tx.Exec(ctx, `UPDATE app.session_families SET revoked_at=$2 WHERE user_id=$1 AND revoked_at IS NULL`, userID, time.Now().UTC())
+func revokeUsers(ctx context.Context, tx pgx.Tx, userIDs ...uuid.UUID) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `UPDATE app.session_families SET revoked_at=$2 WHERE user_id = ANY($1) AND revoked_at IS NULL`, userIDs, time.Now().UTC())
 	return err
+}
+
+// requireRotation flags live sessions so the next request rotates the
+// session identifier (privilege increase).
+func requireRotation(ctx context.Context, tx pgx.Tx, userIDs []uuid.UUID) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `UPDATE app.session_families SET rotation_required=true WHERE user_id = ANY($1) AND revoked_at IS NULL`, userIDs)
+	return err
+}
+
+func groupMembers(ctx context.Context, tx pgx.Tx, groupID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := tx.Query(ctx, `SELECT user_id FROM app.group_memberships WHERE group_id=$1`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		result = append(result, id)
+	}
+	return result, rows.Err()
+}
+
+func grantsIn(ctx context.Context, tx pgx.Tx, groupID uuid.UUID) ([]Grant, error) {
+	rows, err := tx.Query(ctx, `SELECT database_id,access FROM app.group_database_grants WHERE group_id=$1`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Grant
+	for rows.Next() {
+		var g Grant
+		if err := rows.Scan(&g.DatabaseID, &g.Access); err != nil {
+			return nil, err
+		}
+		result = append(result, g)
+	}
+	return result, rows.Err()
+}
+
+// diffMembers returns users only in old (removed) and only in next (added).
+func diffMembers(old, next []uuid.UUID) (removed, added []uuid.UUID) {
+	oldSet := make(map[uuid.UUID]bool, len(old))
+	nextSet := make(map[uuid.UUID]bool, len(next))
+	for _, id := range old {
+		oldSet[id] = true
+	}
+	for _, id := range next {
+		nextSet[id] = true
+	}
+	for _, id := range old {
+		if !nextSet[id] {
+			removed = append(removed, id)
+		}
+	}
+	for _, id := range next {
+		if !oldSet[id] {
+			added = append(added, id)
+		}
+	}
+	return removed, added
+}
+
+func accessRank(access string) int {
+	switch access {
+	case "view":
+		return 1
+	case "edit":
+		return 2
+	}
+	return 0
+}
+
+// grantChange reports whether any database lost or gained access level.
+func grantChange(old, next []Grant) (decreased, increased bool) {
+	oldRank := make(map[uuid.UUID]int, len(old))
+	nextRank := make(map[uuid.UUID]int, len(next))
+	for _, g := range old {
+		oldRank[g.DatabaseID] = accessRank(g.Access)
+	}
+	for _, g := range next {
+		nextRank[g.DatabaseID] = accessRank(g.Access)
+	}
+	for id, o := range oldRank {
+		if nextRank[id] < o {
+			decreased = true
+		}
+	}
+	for id, n := range nextRank {
+		if n > oldRank[id] {
+			increased = true
+		}
+	}
+	return decreased, increased
 }
 
 func itoa(value int) string {

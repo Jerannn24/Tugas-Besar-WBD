@@ -10,8 +10,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type queryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 type Repository struct {
-	db *pgxpool.Pool
+	db queryRower
 }
 
 func NewRepository(db *pgxpool.Pool) *Repository {
@@ -41,24 +45,23 @@ func (r *Repository) EffectiveAccess(ctx context.Context, actorID, databaseID uu
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	var exists bool
 	var rank int
 	err := r.db.QueryRow(ctx, `
-		SELECT COALESCE(MAX(
-			CASE g.access
-				WHEN 'edit' THEN 2
-				WHEN 'view' THEN 1
-				ELSE 0
-			END
-		), 0)
-		FROM app.group_memberships m
-		JOIN app.group_database_grants g ON g.group_id = m.group_id
-		JOIN app.database_connections d ON d.id = g.database_id
-		WHERE m.user_id = $1
-		  AND g.database_id = $2
-		  AND d.deleted_at IS NULL
-	`, actorID, databaseID).Scan(&rank)
+		SELECT
+			EXISTS(SELECT 1 FROM app.database_connections WHERE id = $2 AND deleted_at IS NULL),
+			COALESCE((
+				SELECT MAX(CASE g.access WHEN 'edit' THEN 2 WHEN 'view' THEN 1 ELSE 0 END)
+				FROM app.group_memberships m
+				JOIN app.group_database_grants g ON g.group_id = m.group_id
+				WHERE m.user_id = $1 AND g.database_id = $2
+			), 0)
+	`, actorID, databaseID).Scan(&exists, &rank)
 	if err != nil {
 		return AccessNone, err
+	}
+	if !exists {
+		return AccessNone, ErrNotFound
 	}
 
 	switch rank {

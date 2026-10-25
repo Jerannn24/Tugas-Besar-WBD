@@ -23,6 +23,7 @@ type User struct {
 type Repository interface {
 	Create(ctx context.Context, user *User) error
 	FindByUsername(ctx context.Context, username string) (*User, error)
+	FindByID(ctx context.Context, id uuid.UUID) (*User, error)
 }
 
 type AdminBootstrapper interface {
@@ -88,6 +89,25 @@ func (r *postgresRepository) FindByUsername(ctx context.Context, username string
 		return nil, err
 	}
 
+	return &user, nil
+}
+
+func (r *postgresRepository) FindByID(ctx context.Context, id uuid.UUID) (*User, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	var user User
+	err := r.db.QueryRow(ctx,
+		`SELECT id, username, auth_version, is_admin
+		 FROM app.users
+		 WHERE id = $1 AND is_active = true`,
+		id).Scan(&user.ID, &user.Username, &user.AuthVersion, &user.IsAdmin)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
 	return &user, nil
 }
 
