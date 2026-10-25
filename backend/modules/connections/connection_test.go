@@ -146,3 +146,48 @@ func TestDecryptInvalidCiphertextFails(t *testing.T) {
 		t.Fatal("decrypt should reject invalid ciphertext")
 	}
 }
+
+func pw(s string) *string { return &s }
+
+func roleInput() Input {
+	in := validTestInput()
+	in.Username = "wbd_target_a_viewer"
+	in.Executor = &RoleCredential{Username: "wbd_target_a_executor", Password: pw("x")}
+	in.Preparer = &RoleCredential{Username: "wbd_target_a_preparer", Password: pw("y")}
+	return in
+}
+
+func TestValidateRoles(t *testing.T) {
+	if err := validate(roleInput(), true); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]func(*Input){
+		"executor without preparer": func(i *Input) { i.Preparer = nil },
+		"preparer without executor": func(i *Input) { i.Executor = nil },
+		"create omitted password":   func(i *Input) { i.Executor.Password = nil },
+		"empty password":            func(i *Input) { i.Preparer.Password = pw("") },
+		"bad suffix":                func(i *Input) { i.Executor.Username = "wbd_target_a_exec" },
+		"mismatched pair":           func(i *Input) { i.Preparer.Username = "wbd_target_b_preparer" },
+		"blank username":            func(i *Input) { i.Executor.Username = " " },
+		"viewer equals executor":    func(i *Input) { i.Username = i.Executor.Username },
+	}
+	for name, mutate := range cases {
+		in := roleInput()
+		mutate(&in)
+		if err := validate(in, true); !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	in := roleInput()
+	in.Executor.Password = nil
+	if err := validate(in, false); err != nil {
+		t.Errorf("update may omit role password: %v", err)
+	}
+	in.Preparer.Password = pw("")
+	if err := validate(in, false); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("update must reject empty role password: %v", err)
+	}
+	if err := validate(validTestInput(), true); err != nil {
+		t.Errorf("viewer-only must stay valid: %v", err)
+	}
+}

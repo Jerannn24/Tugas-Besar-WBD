@@ -22,8 +22,8 @@ func LoadConfig() Config {
 		Port:                   LoadEnv("PORT", "8080"),
 		JWTSecret:              os.Getenv("JWT_SECRET"),
 		DB:                     os.Getenv("DATABASE_URL"),
-		BootstrapAdminUsername: os.Getenv("DB_DEV_BOOTSTRAP_USER"),
-		BootstrapAdminPassword: os.Getenv("DB_DEV_BOOTSTRAP_PASSWORD"),
+		BootstrapAdminUsername: os.Getenv("ADMIN_BOOTSTRAP_USERNAME"),
+		BootstrapAdminPassword: os.Getenv("ADMIN_BOOTSTRAP_PASSWORD"),
 	}
 }
 
@@ -35,7 +35,7 @@ func (c Config) Validate() error {
 		return errors.New("DATABASE_URL is required")
 	}
 	if (c.BootstrapAdminUsername == "") != (c.BootstrapAdminPassword == "") {
-		return errors.New("DB_DEV_BOOTSTRAP_USER and DB_DEV_BOOTSTRAP_PASSWORD must be provided together")
+		return errors.New("ADMIN_BOOTSTRAP_USERNAME and ADMIN_BOOTSTRAP_PASSWORD must be provided together")
 	}
 	return nil
 }

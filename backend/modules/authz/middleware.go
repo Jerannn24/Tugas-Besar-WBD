@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"net/http"
 	"errors"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/auth"
@@ -48,4 +49,11 @@ func AdminMiddleware(authorizer Authorizer) fiber.Handler {
 		}
 		return c.Next()
 	}
+}
+
+// ActorFromRequest reads the actor stored by ActorMiddleware when a Fiber
+// request is served through the net/http adaptor.
+func ActorFromRequest(r *http.Request) (Actor, bool) {
+	actor, ok := r.Context().Value(actorLocalKey).(Actor)
+	return actor, ok
 }
