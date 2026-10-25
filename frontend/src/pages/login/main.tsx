@@ -1,9 +1,10 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { errorMessage, isCsrfError, refreshCsrfToken, type ApiFailure } from '../../api/client'
-import { login } from '../../api/endpoints'
+import { getSession, login } from '../../api/endpoints'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { FormField } from '../../components/FormField'
+import { Loading } from '../../components/Loading'
 import { Panel } from '../../components/Panel'
 import { APP_NAME, SESSION_ENDED_PARAM } from '../../lib/app'
 import { mountPage } from '../../lib/mount'
@@ -24,6 +25,7 @@ function LoginPage() {
   const [feedback, setFeedback] = useState<Feedback>(null)
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
   const [csrf, setCsrf] = useState<CsrfState>({ status: 'loading' })
+  const [checkingSession, setCheckingSession] = useState(true)
 
   async function loadCsrf() {
     setCsrf({ status: 'loading' })
@@ -32,7 +34,19 @@ function LoginPage() {
   }
 
   useEffect(() => {
-    void loadCsrf()
+    let active = true
+    getSession({ redirectOn401: false }).then((res) => {
+      if (!active) return
+      if (res.ok) {
+        window.location.assign('/databases/')
+        return
+      }
+      setCheckingSession(false)
+      void loadCsrf()
+    })
+    return () => {
+      active = false
+    }
   }, [])
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -67,65 +81,71 @@ function LoginPage() {
       <div className="container container-tight py-4">
         <h1 className="text-center mb-4">{APP_NAME}</h1>
         <Panel title="Login">
-          {csrf.status === 'error' && (
-            <Alert variant="warning" title="Gagal menyiapkan sesi keamanan">
-              <p className="mb-2">{errorMessage(csrf.failure)}</p>
-              <Button variant="outline-secondary" onClick={() => void loadCsrf()}>
-                Coba lagi
-              </Button>
-            </Alert>
-          )}
-          {sessionEnded && !feedback && (
-            <Alert variant="info" title="Sesi diakhiri">
-              Akun Anda baru saja diubah sehingga sesi diakhiri. Silakan login kembali.
-            </Alert>
-          )}
-          {feedback && (
-            <Alert variant={feedback.variant} title={feedback.title}>
-              {feedback.message}
-            </Alert>
-          )}
-          <form method="post" noValidate onSubmit={handleSubmit}>
-            <FormField label="Username" required error={fieldErrors.username}>
-              {(control) => (
-                <input
-                  {...control}
-                  type="text"
-                  name="username"
-                  className={`form-control${fieldErrors.username ? ' is-invalid' : ''}`}
-                  autoComplete="username"
-                  autoFocus
-                  required
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  disabled={pending}
-                />
+          {checkingSession ? (
+            <Loading label="Memeriksa sesi…" />
+          ) : (
+            <>
+              {csrf.status === 'error' && (
+                <Alert variant="warning" title="Gagal menyiapkan sesi keamanan">
+                  <p className="mb-2">{errorMessage(csrf.failure)}</p>
+                  <Button variant="outline-secondary" onClick={() => void loadCsrf()}>
+                    Coba lagi
+                  </Button>
+                </Alert>
               )}
-            </FormField>
-            <FormField label="Password" required error={fieldErrors.password}>
-              {(control) => (
-                <input
-                  {...control}
-                  type="password"
-                  name="password"
-                  className={`form-control${fieldErrors.password ? ' is-invalid' : ''}`}
-                  autoComplete="current-password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  disabled={pending}
-                />
+              {sessionEnded && !feedback && (
+                <Alert variant="info" title="Sesi diakhiri">
+                  Akun Anda baru saja diubah sehingga sesi diakhiri. Silakan login kembali.
+                </Alert>
               )}
-            </FormField>
-            <Button
-              type="submit"
-              className="w-100"
-              pending={pending}
-              disabled={csrf.status === 'loading'}
-            >
-              {pending ? 'Memproses…' : 'Masuk'}
-            </Button>
-          </form>
+              {feedback && (
+                <Alert variant={feedback.variant} title={feedback.title}>
+                  {feedback.message}
+                </Alert>
+              )}
+              <form method="post" noValidate onSubmit={handleSubmit}>
+                <FormField label="Username" required error={fieldErrors.username}>
+                  {(control) => (
+                    <input
+                      {...control}
+                      type="text"
+                      name="username"
+                      className={`form-control${fieldErrors.username ? ' is-invalid' : ''}`}
+                      autoComplete="username"
+                      autoFocus
+                      required
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value)}
+                      disabled={pending}
+                    />
+                  )}
+                </FormField>
+                <FormField label="Password" required error={fieldErrors.password}>
+                  {(control) => (
+                    <input
+                      {...control}
+                      type="password"
+                      name="password"
+                      className={`form-control${fieldErrors.password ? ' is-invalid' : ''}`}
+                      autoComplete="current-password"
+                      required
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      disabled={pending}
+                    />
+                  )}
+                </FormField>
+                <Button
+                  type="submit"
+                  className="w-100"
+                  pending={pending}
+                  disabled={csrf.status === 'loading'}
+                >
+                  {pending ? 'Memproses…' : 'Masuk'}
+                </Button>
+              </form>
+            </>
+          )}
         </Panel>
       </div>
     </main>

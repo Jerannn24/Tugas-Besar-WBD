@@ -1,7 +1,6 @@
-import { useCallback, useState } from 'react'
-import type { ApiResult } from '../../api/client'
+import { useCallback, useState, type ReactNode } from 'react'
 import { createGroup, deleteGroup, listConnections, listGroups, listUsers, updateGroup } from '../../api/endpoints'
-import type { ConnectionSummary, Group, ID, User } from '../../api/types'
+import type { ID } from '../../api/types'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { ConfirmDialog } from '../../components/ConfirmDialog'
@@ -11,7 +10,7 @@ import { Layout } from '../../components/Layout'
 import { Loading } from '../../components/Loading'
 import { MutationAlert } from '../../components/MutationAlert'
 import { Panel } from '../../components/Panel'
-import { ADMIN_FORBIDDEN, useLoad } from '../../lib/load'
+import { ADMIN_FORBIDDEN, useLoad, type LoadState } from '../../lib/load'
 import { mountPage } from '../../lib/mount'
 import { describeFailure, type MutationFailure } from '../../lib/mutation'
 import { useBeforeUnload } from '../../lib/unload'
@@ -19,18 +18,25 @@ import { GrantEditor } from './GrantEditor'
 import { GroupName } from './GroupName'
 import { MemberEditor } from './MemberEditor'
 
-type PageData = { groups: Group[]; users: User[]; connections: ConnectionSummary[] }
+type SectionProps<T> = {
+  state: LoadState<T>
+  title: string
+  loadingLabel: string
+  onRetry: () => void
+  children: (data: T) => ReactNode
+}
 
-async function loadPage(): Promise<ApiResult<PageData>> {
-  const [groups, users, connections] = await Promise.all([listGroups(), listUsers(), listConnections()])
-  if (!groups.ok) return groups
-  if (!users.ok) return users
-  if (!connections.ok) return connections
-  return {
-    ok: true,
-    status: 200,
-    data: { groups: groups.data.items, users: users.data.items, connections: connections.data.items },
-  }
+function Section<T>({ state, title, loadingLabel, onRetry, children }: SectionProps<T>) {
+  if (state.status === 'ready') return <>{children(state.data)}</>
+  return (
+    <Panel title={title}>
+      {state.status === 'loading' ? (
+        <Loading label={loadingLabel} />
+      ) : (
+        <FailureAlert failure={state.failure} forbiddenText={ADMIN_FORBIDDEN} onRetry={onRetry} />
+      )}
+    </Panel>
+  )
 }
 
 function AccessExplainer() {
@@ -49,7 +55,10 @@ function AccessExplainer() {
 }
 
 function GroupsPage() {
-  const { state, reload, update } = useLoad(loadPage)
+  const groupsLoad = useLoad(listGroups)
+  const usersLoad = useLoad(listUsers)
+  const connectionsLoad = useLoad(listConnections)
+  const update = groupsLoad.update
   const [selectedId, setSelectedId] = useState<ID | null>(null)
   const [pendingSelect, setPendingSelect] = useState<ID | null | undefined>(undefined)
   const [memberDirty, setMemberDirty] = useState(false)
@@ -64,12 +73,7 @@ function GroupsPage() {
   const onMemberDirty = useCallback((d: boolean) => setMemberDirty(d), [])
   const onGrantDirty = useCallback((d: boolean) => setGrantDirty(d), [])
 
-  if (state.status === 'loading') return <Loading label="Memuat group, user, dan connection…" />
-  if (state.status === 'failed') {
-    return <FailureAlert failure={state.failure} forbiddenText={ADMIN_FORBIDDEN} onRetry={() => void reload()} />
-  }
-
-  const { groups, users, connections } = state.data
+  const groups = groupsLoad.state.status === 'ready' ? groupsLoad.state.data.items : []
   const selected = groups.find((g) => g.id === selectedId) ?? null
 
   function select(id: ID | null) {
@@ -98,7 +102,7 @@ function GroupsPage() {
     setDeletePending(false)
     setDeleteOpen(false)
     if (res.ok) {
-      update((d) => ({ ...d, groups: d.groups.filter((g) => g.id !== selected.id) }))
+      update((d) => ({ ...d, items: d.items.filter((g) => g.id !== selected.id) }))
       applySelect(null)
       setNotice(`Group ${selected.name} dihapus.`)
       return
@@ -130,16 +134,39 @@ function GroupsPage() {
                   submitLabel="Ganti nama"
                   failureTitle="Nama group gagal diganti"
                   submit={(name) => updateGroup(selected.id, { name })}
-                  onDone={(g) => update((d) => ({ ...d, groups: d.groups.map((x) => (x.id === g.id ? g : x)) }))}
+                  onDone={(g) => update((d) => ({ ...d, items: d.items.map((x) => (x.id === g.id ? g : x)) }))}
                 />
               </Panel>
-              <MemberEditor key={`m-${selected.id}`} group={selected} users={users} onDirtyChange={onMemberDirty} />
-              <GrantEditor
-                key={`g-${selected.id}`}
-                group={selected}
-                connections={connections}
-                onDirtyChange={onGrantDirty}
-              />
+              <Section
+                state={usersLoad.state}
+                title="Anggota"
+                loadingLabel="Memuat daftar user…"
+                onRetry={() => void usersLoad.reload()}
+              >
+                {(data) => (
+                  <MemberEditor
+                    key={`m-${selected.id}`}
+                    group={selected}
+                    users={data.items}
+                    onDirtyChange={onMemberDirty}
+                  />
+                )}
+              </Section>
+              <Section
+                state={connectionsLoad.state}
+                title="Grant database"
+                loadingLabel="Memuat daftar connection…"
+                onRetry={() => void connectionsLoad.reload()}
+              >
+                {(data) => (
+                  <GrantEditor
+                    key={`g-${selected.id}`}
+                    group={selected}
+                    connections={data.items}
+                    onDirtyChange={onGrantDirty}
+                  />
+                )}
+              </Section>
             </>
           ) : (
             <Panel title="Detail group">
@@ -148,37 +175,48 @@ function GroupsPage() {
           )}
         </div>
         <div>
-          <Panel title="Daftar group">
-            {groups.length === 0 ? (
-              <EmptyState title="Belum ada group">Buat group di bawah lalu beri anggota dan grant.</EmptyState>
-            ) : (
-              <div className="list-group">
-                {groups.map((g) => (
-                  <button
-                    key={g.id}
-                    type="button"
-                    className={`list-group-item list-group-item-action${g.id === selectedId ? ' active' : ''}`}
-                    aria-current={g.id === selectedId ? 'true' : undefined}
-                    onClick={() => select(g.id)}
-                  >
-                    {g.name}
-                  </button>
-                ))}
-              </div>
+          <Section
+            state={groupsLoad.state}
+            title="Daftar group"
+            loadingLabel="Memuat daftar group…"
+            onRetry={() => void groupsLoad.reload()}
+          >
+            {() => (
+              <>
+                <Panel title="Daftar group">
+                  {groups.length === 0 ? (
+                    <EmptyState title="Belum ada group">Buat group di bawah lalu beri anggota dan grant.</EmptyState>
+                  ) : (
+                    <div className="list-group">
+                      {groups.map((g) => (
+                        <button
+                          key={g.id}
+                          type="button"
+                          className={`list-group-item list-group-item-action${g.id === selectedId ? ' active' : ''}`}
+                          aria-current={g.id === selectedId ? 'true' : undefined}
+                          onClick={() => select(g.id)}
+                        >
+                          {g.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </Panel>
+                <Panel title="Buat group">
+                  <GroupName
+                    label="Nama group"
+                    submitLabel="Buat group"
+                    failureTitle="Group gagal dibuat"
+                    submit={(name) => createGroup({ name })}
+                    onDone={(g) => {
+                      update((d) => ({ ...d, items: [...d.items, g] }))
+                      select(g.id)
+                    }}
+                  />
+                </Panel>
+              </>
             )}
-          </Panel>
-          <Panel title="Buat group">
-            <GroupName
-              label="Nama group"
-              submitLabel="Buat group"
-              failureTitle="Group gagal dibuat"
-              submit={(name) => createGroup({ name })}
-              onDone={(g) => {
-                update((d) => ({ ...d, groups: [...d.groups, g] }))
-                select(g.id)
-              }}
-            />
-          </Panel>
+          </Section>
         </div>
       </div>
 

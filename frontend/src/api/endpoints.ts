@@ -43,7 +43,8 @@ export async function login(input: LoginInput) {
   return res
 }
 
-export const getSession = () => request<SessionView>('GET', '/api/session')
+export const getSession = (options: { redirectOn401?: boolean } = {}) =>
+  request<SessionView>('GET', '/api/session', options)
 export const logout = (options: { redirectOn401?: boolean } = {}) =>
   request<LogoutResult>('POST', '/api/logout', { body: {}, ...options })
 

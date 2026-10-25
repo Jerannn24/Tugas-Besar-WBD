@@ -1,6 +1,11 @@
 import { useState, type FormEvent } from 'react'
 import { createConnection, updateConnection } from '../../api/endpoints'
-import type { ConnectionInput, ConnectionPatchInput, ConnectionSummary } from '../../api/types'
+import type {
+  ConnectionCredentialPatch,
+  ConnectionInput,
+  ConnectionPatchInput,
+  ConnectionSummary,
+} from '../../api/types'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { FormField } from '../../components/FormField'
@@ -10,17 +15,92 @@ import { describeFailure, type MutationFailure } from '../../lib/mutation'
 import { useBeforeUnload } from '../../lib/unload'
 
 type SslMode = ConnectionInput['ssl_mode']
-type Form = Omit<ConnectionInput, 'port'> & { port: string }
+type Role = 'executor' | 'preparer'
+type Form = Omit<ConnectionInput, 'port' | Role> & {
+  port: string
+  executor_username: string
+  executor_password: string
+  preparer_username: string
+  preparer_password: string
+}
 type TextField = 'name' | 'host' | 'database_name' | 'username'
 
 const SSL_MODES: SslMode[] = ['disable', 'require', 'verify-full']
-const FIELDS = ['name', 'host', 'port', 'database_name', 'username', 'password', 'ssl_mode']
+const ROLES: Role[] = ['executor', 'preparer']
+const CREDENTIAL_FIELDS = ['executor_username', 'executor_password', 'preparer_username', 'preparer_password'] as const
+const FIELDS = ['name', 'host', 'port', 'database_name', 'username', 'password', 'ssl_mode', ...CREDENTIAL_FIELDS]
 const NAME_MAX = 100
+const UNVERIFIED = 'Kredensial tidak dapat diverifikasi ke database target. Tidak ada yang disimpan.'
 
-const EMPTY: Form = { name: '', host: '', port: '5432', database_name: '', username: '', password: '', ssl_mode: 'require' }
+const EMPTY: Form = {
+  name: '',
+  host: '',
+  port: '5432',
+  database_name: '',
+  username: '',
+  password: '',
+  ssl_mode: 'require',
+  executor_username: '',
+  executor_password: '',
+  preparer_username: '',
+  preparer_password: '',
+}
 
 function fromSummary(c: ConnectionSummary): Form {
-  return { name: c.name, host: c.host, port: String(c.port), database_name: c.database_name, username: c.username, password: '', ssl_mode: c.ssl_mode }
+  return {
+    name: c.name,
+    host: c.host,
+    port: String(c.port),
+    database_name: c.database_name,
+    username: c.username,
+    password: '',
+    ssl_mode: c.ssl_mode,
+    executor_username: c.executor_username ?? '',
+    executor_password: '',
+    preparer_username: c.preparer_username ?? '',
+    preparer_password: '',
+  }
+}
+
+const savedUsername = (c: ConnectionSummary | null, role: Role) => (c ? c[`${role}_username`] ?? '' : '')
+
+function validateCredentials(form: Form, connection: ConnectionSummary | null): Record<string, string> {
+  const errors: Record<string, string> = {}
+  const filled = CREDENTIAL_FIELDS.filter((f) => form[f].trim() !== '')
+  if (connection === null) {
+    if (filled.length > 0 && filled.length < CREDENTIAL_FIELDS.length) {
+      for (const f of CREDENTIAL_FIELDS) {
+        if (form[f].trim() === '') errors[f] = 'Isi keempat kredensial eksekusi atau kosongkan semuanya.'
+      }
+    }
+    return errors
+  }
+  if (filled.length === 0 && ROLES.every((r) => savedUsername(connection, r) === '')) return errors
+  for (const role of ROLES) {
+    const username = form[`${role}_username`].trim()
+    if (username === '') {
+      errors[`${role}_username`] =
+        savedUsername(connection, role) !== ''
+          ? 'Menghapus kredensial eksekusi belum didukung kontrak.'
+          : 'Isi kredensial executor dan preparer bersama-sama.'
+    } else if (savedUsername(connection, role) === '' && form[`${role}_password`] === '') {
+      errors[`${role}_password`] = 'Password wajib diisi untuk kredensial baru.'
+    }
+  }
+  return errors
+}
+
+function credentialPatch(form: Form, connection: ConnectionSummary, role: Role): ConnectionCredentialPatch | null {
+  const username = form[`${role}_username`].trim()
+  const password = form[`${role}_password`]
+  if (username === savedUsername(connection, role) && password === '') return null
+  return password === '' ? { username } : { username, password }
+}
+
+function normalizeFieldErrors(fieldErrors: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, message] of Object.entries(fieldErrors)) out[key.replace('.', '_')] = message
+  return out
 }
 
 function validate(form: Form, creating: boolean): Record<string, string> {
@@ -60,7 +140,7 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
     if (pending) return
     setFailure(null)
     setNotice(null)
-    const local = validate(form, creating)
+    const local = { ...validate(form, creating), ...validateCredentials(form, connection) }
     setErrors(local)
     if (Object.keys(local).length > 0) return
 
@@ -77,8 +157,12 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
     let res
     if (connection) {
       const { password, ...rest } = values
+      const executor = credentialPatch(form, connection, 'executor')
+      const preparer = credentialPatch(form, connection, 'preparer')
       const unchanged =
         password === '' &&
+        executor === null &&
+        preparer === null &&
         rest.name === connection.name &&
         rest.host === connection.host &&
         rest.port === connection.port &&
@@ -90,9 +174,15 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
         return
       }
       const patch: ConnectionPatchInput = password === '' ? rest : { ...rest, password }
+      if (executor) patch.executor = executor
+      if (preparer) patch.preparer = preparer
       setPending(true)
       res = await updateConnection(connection.id, patch)
     } else {
+      if (form.executor_username.trim() !== '') {
+        values.executor = { username: form.executor_username.trim(), password: form.executor_password }
+        values.preparer = { username: form.preparer_username.trim(), password: form.preparer_password }
+      }
       setPending(true)
       res = await createConnection(values)
     }
@@ -106,6 +196,8 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
     }
     const described = describeFailure(res, creating ? 'Connection gagal dibuat' : 'Perubahan gagal disimpan')
     if (!described) return
+    if (res.kind === 'http' && res.error.code === 'TARGET_UNAVAILABLE') described.text = UNVERIFIED
+    described.fieldErrors = normalizeFieldErrors(described.fieldErrors)
     setErrors(described.fieldErrors)
     setFailure(described)
   }
@@ -127,6 +219,48 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
       )}
     </FormField>
   )
+
+  const credential = (role: Role) => {
+    const usernameField = `${role}_username` as const
+    const passwordField = `${role}_password` as const
+    const configured = savedUsername(connection, role) !== ''
+    return (
+      <div className="col-md-6" key={role}>
+        <FormField label={`Username ${role}`} error={errors[usernameField]}>
+          {(control) => (
+            <input
+              {...control}
+              className={`form-control${errors[usernameField] ? ' is-invalid' : ''}`}
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              value={form[usernameField]}
+              disabled={pending}
+              onChange={(e) => setForm({ ...form, [usernameField]: e.target.value })}
+            />
+          )}
+        </FormField>
+        <FormField
+          label={`Password ${role}`}
+          error={errors[passwordField]}
+          hint={configured ? 'Kosong = password lama dipertahankan.' : undefined}
+        >
+          {(control) => (
+            <input
+              {...control}
+              className={`form-control${errors[passwordField] ? ' is-invalid' : ''}`}
+              type="password"
+              autoComplete="new-password"
+              placeholder={configured ? 'Biarkan kosong jika tidak diubah' : undefined}
+              value={form[passwordField]}
+              disabled={pending}
+              onChange={(e) => setForm({ ...form, [passwordField]: e.target.value })}
+            />
+          )}
+        </FormField>
+      </div>
+    )
+  }
 
   return (
     <Panel
@@ -198,6 +332,14 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
             </select>
           )}
         </FormField>
+        <fieldset className="mb-3">
+          <legend className="h4 mb-1">Kredensial eksekusi migration (opsional)</legend>
+          <p className="text-secondary mb-2">
+            Isi keempatnya agar migration bisa dijalankan, atau kosongkan semuanya untuk connection view-only. Server
+            memverifikasi kredensial ke database target sebelum menyimpan.
+          </p>
+          <div className="row">{ROLES.map(credential)}</div>
+        </fieldset>
         {!creating && (
           <p className="text-secondary">
             Mengubah host, port, atau nama database ditolak selama target sedang menjalankan migration.

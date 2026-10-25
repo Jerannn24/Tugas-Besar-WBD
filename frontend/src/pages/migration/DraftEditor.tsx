@@ -20,6 +20,8 @@ type LoadState =
   | { status: 'ready'; saved: Draft }
   | { status: 'failed'; failure: ApiFailure }
 
+type SaveMessage = { variant: 'success' | 'danger' | 'warning'; title: string; text: string }
+
 type Props = { database: DatabaseSummary; draftId: ID }
 
 export function DraftEditor({ database, draftId }: Props) {
@@ -27,16 +29,14 @@ export function DraftEditor({ database, draftId }: Props) {
   const [form, setForm] = useState<DraftForm>({ title: '', sql: '' })
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
-  const [saveMessage, setSaveMessage] = useState<{ variant: 'success' | 'danger'; title: string; text: string } | null>(
-    null,
-  )
+  const [saveMessage, setSaveMessage] = useState<SaveMessage | null>(null)
   const [conflict, setConflict] = useState(false)
   const [confirmReload, setConfirmReload] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const seq = useRef(0)
 
   const fetchDraft = useCallback(
-    async (mode: 'initial' | 'refresh') => {
+    async (mode: 'initial' | 'refresh', notice: SaveMessage | null = null) => {
       const mine = ++seq.current
       if (mode === 'initial') setLoad({ status: 'loading' })
       else setRefreshing(true)
@@ -48,7 +48,7 @@ export function DraftEditor({ database, draftId }: Props) {
         setForm({ title: res.data.title, sql: res.data.sql })
         setErrors({})
         setConflict(false)
-        setSaveMessage(null)
+        setSaveMessage(notice)
       } else if (mode === 'initial') {
         setLoad({ status: 'failed', failure: res })
       } else {
@@ -108,7 +108,11 @@ export function DraftEditor({ database, draftId }: Props) {
       setConflict(true) // teks lokal ga ditimpa
       return
     }
-    if (isErrorCode(res, 'ALREADY_APPLIED')) void fetchDraft('refresh')
+    if (isErrorCode(res, 'ALREADY_APPLIED')) {
+      setSaveMessage(null)
+      void fetchDraft('refresh', { variant: 'warning', title: 'Draft sudah applied', text: errorMessage(res) })
+      return
+    }
     if (res.kind === 'http' && res.error.code === 'VALIDATION_FAILED') setErrors(res.error.field_errors)
     setSaveMessage({
       variant: 'danger',
@@ -208,13 +212,15 @@ export function DraftEditor({ database, draftId }: Props) {
         draft={draft}
         exec={exec}
         blockedReason={
-          conflict
-            ? 'Draft berubah di tempat lain; muat versi terbaru dulu.'
-            : saving
-              ? 'Sedang menyimpan.'
-              : dirty
-                ? 'Simpan perubahan dulu; Execute selalu memakai revision tersimpan.'
-                : null
+          database.execution_ready === false
+            ? 'Database ini belum dikonfigurasi untuk eksekusi migration. Hubungi admin platform.'
+            : conflict
+              ? 'Draft berubah di tempat lain; muat versi terbaru dulu.'
+              : saving
+                ? 'Sedang menyimpan.'
+                : dirty
+                  ? 'Simpan perubahan dulu; Execute selalu memakai revision tersimpan.'
+                  : null
         }
       />
 

@@ -48,6 +48,7 @@ export type DatabaseSummary = {
   id: ID; 
   name: string; 
   access: 'view' | 'edit';
+  execution_ready?: boolean;
 };
 
 export type ConnectionSummary = {
@@ -58,7 +59,12 @@ export type ConnectionSummary = {
   database_name: string; 
   username: string; 
   ssl_mode: 'disable' | 'require' | 'verify-full';
+  executor_username?: string | null;
+  preparer_username?: string | null;
+  execution_ready?: boolean;
 };
+
+export type ConnectionCredential = { username: string; password: string };
 
 export type ConnectionInput = {
   name: string; 
@@ -68,6 +74,8 @@ export type ConnectionInput = {
   username: string; 
   password: string; 
   ssl_mode: 'disable' | 'require' | 'verify-full';
+  executor?: ConnectionCredential;
+  preparer?: ConnectionCredential;
 };
 
 export type SchemaSummary = { 
@@ -183,7 +191,12 @@ export type GroupGrantsInput = {
   }[] 
 };
 
-export type ConnectionPatchInput = Partial<ConnectionInput>;
+export type ConnectionCredentialPatch = { username: string; password?: string };
+export type ConnectionPatchInput = Partial<Omit<ConnectionInput, 'executor' | 'preparer'>> & {
+  executor?: ConnectionCredentialPatch;
+  preparer?: ConnectionCredentialPatch;
+};
+
 export type ConnectionTestResult = { reachable: true };
 export type RowsQuery = { 
   schema: string; 

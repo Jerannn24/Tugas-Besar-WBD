@@ -31,6 +31,18 @@ function TestStatus({ result }: { result: TestResult | undefined }) {
   }
 }
 
+function ExecutionStatus({ connection: c }: { connection: ConnectionSummary }) {
+  if (c.execution_ready === undefined) return <span className="text-secondary">—</span>
+  if (!c.execution_ready) return <span className="badge bg-secondary-lt">View only</span>
+  const roles = [c.executor_username && `executor: ${c.executor_username}`, c.preparer_username && `preparer: ${c.preparer_username}`]
+  return (
+    <>
+      <span className="badge bg-green-lt">Siap eksekusi</span>
+      {roles.some(Boolean) && <div className="small text-secondary mono">{roles.filter(Boolean).join(', ')}</div>}
+    </>
+  )
+}
+
 function ConnectionsPage() {
   const { state, reload, update } = useLoad(listConnections)
   const [editingId, setEditingId] = useState<ID | null>(null)
@@ -88,6 +100,7 @@ function ConnectionsPage() {
     { key: 'database', header: 'Database', render: (c) => <span className="mono">{c.database_name}</span> },
     { key: 'username', header: 'Username', render: (c) => <span className="mono">{c.username}</span> },
     { key: 'ssl', header: 'SSL', render: (c) => c.ssl_mode },
+    { key: 'execution', header: 'Eksekusi', wrap: true, render: (c) => <ExecutionStatus connection={c} /> },
     { key: 'test', header: 'Test', wrap: true, render: (c) => <TestStatus result={tests[c.id]} /> },
     {
       key: 'actions',
@@ -124,7 +137,7 @@ function ConnectionsPage() {
           <DataTable columns={columns} rows={connections} rowKey={(c) => c.id} caption="Daftar connection database target" />
         )}
         <p className="text-secondary mt-3 mb-0">
-          Password tidak pernah dikirim server ke browser. Akses user ke database diatur lewat grant di{' '}
+          Password (termasuk kredensial eksekusi) tidak pernah dikirim server ke browser. Akses user ke database diatur lewat grant di{' '}
           <a href="/admin/groups/">Admin: Groups</a>.
         </p>
       </Panel>
