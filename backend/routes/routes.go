@@ -13,6 +13,10 @@ import (
 
 func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
 	api := app.Group("/api")
+	api.Use(func(c *fiber.Ctx) error {
+		c.Set("Cache-Control", "no-store")
+		return c.Next()
+	})
 
 	api.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{

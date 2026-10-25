@@ -3,6 +3,7 @@ package databaseapi
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -49,17 +50,7 @@ func Register(app *fiber.App, platform *sql.DB, sessionService auth.Service, aut
 		if required == viewer.Edit {
 			access = authz.AccessEdit
 		}
-		if err := authorizer.RequireAccess(ctx, actorID, targetID, access); err != nil {
-			switch {
-			case errors.Is(err, authz.ErrUnauthenticated):
-				return httpError{status: http.StatusUnauthorized, err: err}
-			case errors.Is(err, authz.ErrForbidden):
-				return httpError{status: http.StatusForbidden, err: err}
-			default:
-				return err
-			}
-		}
-		return nil
+		return mapAuthzError(authorizer.RequireAccess(ctx, actorID, targetID, access))
 	}
 	viewerHandler, err := viewer.New(viewer.Dependencies{
 		Platform:  platform,
@@ -100,13 +91,15 @@ func Register(app *fiber.App, platform *sql.DB, sessionService auth.Service, aut
 	if err := draftHandler.Register(draftMux); err != nil {
 		return err
 	}
-	app.All("/api/databases", adaptor.HTTPHandler(viewerMux))
+	viewerAPI := jsonFallback(viewerMux)
+	draftAPI := jsonFallback(draftMux)
+	app.All("/api/databases", adaptor.HTTPHandler(viewerAPI))
 	app.All("/api/databases/*", adaptor.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/drafts") {
-			draftMux.ServeHTTP(w, r)
+			draftAPI.ServeHTTP(w, r)
 			return
 		}
-		viewerMux.ServeHTTP(w, r)
+		viewerAPI.ServeHTTP(w, r)
 	})))
 	return nil
 }
@@ -141,4 +134,63 @@ func OpenPlatform() (*sql.DB, error) {
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 	return db, nil
+}
+
+func mapAuthzError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, authz.ErrUnauthenticated):
+		return httpError{status: http.StatusUnauthorized, err: err}
+	case errors.Is(err, authz.ErrForbidden):
+		return httpError{status: http.StatusForbidden, err: err}
+	case errors.Is(err, authz.ErrNotFound):
+		return httpError{status: http.StatusNotFound, err: err}
+	default:
+		return err
+	}
+}
+
+type statusRecorder struct {
+	header http.Header
+	status int
+}
+
+func (s *statusRecorder) Header() http.Header         { return s.header }
+func (s *statusRecorder) Write(b []byte) (int, error) { return len(b), nil }
+func (s *statusRecorder) WriteHeader(status int)      { s.status = status }
+
+// jsonFallback replaces the mux's plain-text 404/405 with the JSON error contract.
+func jsonFallback(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := mux.Handler(r); pattern != "" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		rec := &statusRecorder{header: http.Header{}, status: http.StatusOK}
+		mux.ServeHTTP(rec, r)
+		if rec.status != http.StatusNotFound && rec.status != http.StatusMethodNotAllowed {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		code, message := "NOT_FOUND", "Endpoint tidak ditemukan"
+		status := http.StatusNotFound
+		if rec.status == http.StatusMethodNotAllowed {
+			status, code, message = http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Method tidak diizinkan"
+		}
+		if allow := rec.header.Get("Allow"); allow != "" {
+			w.Header().Set("Allow", allow)
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"code":         code,
+				"message":      message,
+				"field_errors": map[string]string{},
+				"retryable":    false,
+			},
+		})
+	})
 }

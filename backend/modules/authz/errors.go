@@ -7,4 +7,5 @@ var (
 	ErrForbidden       = errors.New("forbidden")
 	ErrInvalidID       = errors.New("invalid identifier")
 	ErrCSRF            = errors.New("csrf validation failed")
+	ErrNotFound        = errors.New("not found")
 )
