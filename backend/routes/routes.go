@@ -47,7 +47,7 @@ func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
 	
 	if platform, err := databaseapi.OpenPlatform(); err != nil {
 		log.Printf("database API disabled: %v", err)
-	} else if err := databaseapi.Register(app, platform, authService, authorizer, connectionPools); err != nil {
+	} else if err := databaseapi.Register(protected, platform, authorizer, connectionPools); err != nil {
 		_ = platform.Close()
 		log.Printf("database API disabled: %v", err)
 	} else {

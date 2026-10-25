@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/drafts"
-	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/auth"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/viewer"
@@ -22,18 +21,14 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
-func Register(app *fiber.App, platform *sql.DB, sessionService auth.Service, authorizer authz.Authorizer, pools *connections.PoolManager) error {
-	if platform == nil || sessionService == nil || authorizer == nil || pools == nil {
+func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer, pools *connections.PoolManager) error {
+	if platform == nil || authorizer == nil || pools == nil {
 		return errors.New("database API dependencies are required")
 	}
 	actor := func(r *http.Request) (viewer.Actor, error) {
-		session, err := sessionService.Authenticate(r.Context(), cookieValue(r, auth.SessionCookieName))
-		if err != nil {
-			return viewer.Actor{}, err
-		}
-		resolved, err := authorizer.ResolveActor(r.Context(), session.Session.UserID)
-		if err != nil {
-			return viewer.Actor{}, err
+		resolved, ok := authz.ActorFromRequest(r)
+		if !ok {
+			return viewer.Actor{}, httpError{status: http.StatusUnauthorized, err: authz.ErrUnauthenticated}
 		}
 		return viewer.Actor{ID: resolved.ID.String()}, nil
 	}
@@ -93,8 +88,8 @@ func Register(app *fiber.App, platform *sql.DB, sessionService auth.Service, aut
 	}
 	viewerAPI := jsonFallback(viewerMux)
 	draftAPI := jsonFallback(draftMux)
-	app.All("/api/databases", adaptor.HTTPHandler(viewerAPI))
-	app.All("/api/databases/*", adaptor.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	router.All("/databases", adaptor.HTTPHandler(viewerAPI))
+	router.All("/databases/*", adaptor.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/drafts") {
 			draftAPI.ServeHTTP(w, r)
 			return
@@ -102,14 +97,6 @@ func Register(app *fiber.App, platform *sql.DB, sessionService auth.Service, aut
 		viewerAPI.ServeHTTP(w, r)
 	})))
 	return nil
-}
-
-func cookieValue(r *http.Request, name string) string {
-	cookie, err := r.Cookie(name)
-	if err != nil {
-		return ""
-	}
-	return cookie.Value
 }
 
 type httpError struct {
