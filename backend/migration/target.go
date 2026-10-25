@@ -116,7 +116,7 @@ pg_catalog.set_config('standard_conforming_strings','on',true),pg_catalog.set_co
 	return nil
 }
 
-func (s *targetSession) run(ctx context.Context, a attempt) outcome {
+func (s *targetSession) run(ctx context.Context, a attempt, statements []string) outcome {
 	var xid string
 	if err := s.tx.QueryRowContext(ctx, `SELECT pg_catalog.pg_current_xact_id()::text`).Scan(&xid); err != nil {
 		return s.abort("TARGET_PREPARATION_FAILED", "Target transaction could not be prepared")
@@ -137,7 +137,7 @@ VALUES($1::uuid,$2::uuid,$3::uuid,$4::xid8,$5,$6,$7::uuid,$8)`, a.ID, a.TargetID
 	if err != nil {
 		return s.abort("TARGET_PREPARATION_FAILED", "Execution authorization could not be recorded")
 	}
-	if _, err := s.tx.ExecContext(ctx, a.SQL); err != nil {
+	if err := execStatements(ctx, s.tx, statements); err != nil {
 		return s.abort("SQL_FAILED", "SQL execution failed")
 	}
 	if _, err := s.tx.ExecContext(ctx, `SELECT wbd_auth.record_receipt($1::uuid,$2::bytea)`, a.ID, capability); err != nil {
@@ -206,4 +206,33 @@ func (s *targetSession) close(timeout time.Duration) {
 	}
 	_ = s.lease.Executor.Close()
 	s.lease.Release()
+}
+
+// execStatements menjalankan setiap statement secara berurutan pada transaksi
+// yang sama dan berhenti pada kegagalan pertama. Setiap statement dikirim
+// sendiri karena protokol extended pgx menolak banyak perintah dalam satu teks.
+func execStatements(ctx context.Context, tx *sql.Tx, statements []string) error {
+	if len(statements) == 0 {
+		return errors.New("no statements")
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// slicesOf memastikan statements berurutan, tidak tumpang tindih, dan setiap
+// elemen adalah potongan persis dari teks SQL yang di-hash.
+func slicesOf(whole string, statements []string) bool {
+	pos := 0
+	for _, s := range statements {
+		i := strings.Index(whole[pos:], s)
+		if s == "" || i < 0 {
+			return false
+		}
+		pos += i + len(s)
+	}
+	return len(statements) > 0
 }

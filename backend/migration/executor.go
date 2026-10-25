@@ -162,7 +162,12 @@ func (h *Handler) Execute(ctx context.Context, actor Actor, databaseID, draftID 
 	if err := h.d.Authorize(ctx, actor, databaseID); err != nil {
 		result = session.abort("ACCESS_REVOKED", "Execution permission is no longer available")
 	} else {
-		result = session.run(ctx, a)
+		statements, serr := h.policy.Statements(a.SQL)
+		if serr != nil || !slicesOf(a.SQL, statements) {
+			result = session.abort("TARGET_PREPARATION_FAILED", "Execution statements could not be prepared")
+		} else {
+			result = session.run(ctx, a, statements)
+		}
 	}
 	finishCtx, finishCancel := context.WithTimeout(context.WithoutCancel(ctx), h.d.Timeout)
 	defer finishCancel()
