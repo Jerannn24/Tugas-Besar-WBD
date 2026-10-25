@@ -112,8 +112,7 @@ export function GrantEditor({ group, connections, onDirtyChange }: Props) {
           <MutationAlert failure={failure} />
           {notice && <Alert variant="success">{notice}</Alert>}
           <p className="text-secondary">
-            Setiap anggota group mendapat level ini pada database terkait. Jika user ada di beberapa group, level
-            tertinggi yang berlaku. Simpan mengganti <strong>seluruh</strong> grant group ini.
+            Jika user ada di beberapa group, level tertinggi yang berlaku. 
           </p>
           {rows.length === 0 ? (
             <p className="text-secondary">
@@ -159,7 +158,6 @@ export function GrantEditor({ group, connections, onDirtyChange }: Props) {
             <Button onClick={() => void save()} pending={pending} disabled={!dirty}>
               Simpan grant
             </Button>
-            {dirty && !pending && <span className="text-secondary">Ada perubahan belum disimpan.</span>}
           </div>
         </>
       )}

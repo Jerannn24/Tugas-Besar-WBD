@@ -43,8 +43,7 @@ function AccessExplainer() {
   return (
     <Alert variant="info" title="Cara akses database diberikan">
       <ul className="mb-0">
-        <li>Akses diberikan <strong>per database</strong> melalui group: View Only atau View + Edit. Tidak ada grant langsung ke user.</li>
-        <li>User di beberapa group memperoleh level tertinggi untuk tiap database.</li>
+        <li>Akses diberikan <strong>per database</strong> melalui group: View Only atau View + Edit.</li>
         <li>
           Status <strong>Platform Admin bukan level akses database</strong>. Admin tetap perlu menjadi anggota group yang
           punya grant untuk membuka atau mengubah database.

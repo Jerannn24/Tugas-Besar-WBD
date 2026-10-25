@@ -52,7 +52,6 @@ export function CreateDraft({ database }: { database: DatabaseSummary }) {
           <Button type="submit" pending={pending}>
             Simpan draft
           </Button>
-          <a href={pageUrl('/migrations/', { database: database.id })}>Batal, kembali ke riwayat</a>
         </div>
       </form>
     </Panel>

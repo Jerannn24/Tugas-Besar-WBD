@@ -103,7 +103,7 @@ function validateRoleNames(form: Form): Record<string, string> {
   }
   if (preparer !== '' && executor !== '') {
     if (prefix !== '' && preparer !== prefix + PREPARER_SUFFIX) {
-      errors.preparer_username = `Username preparer harus ${prefix}${PREPARER_SUFFIX} (prefiks yang sama dengan executor).`
+      errors.preparer_username = `Username preparer harus ${prefix}${PREPARER_SUFFIX}.`
     } else if (preparer === viewer) {
       errors.preparer_username = 'Username preparer harus berbeda dari username PostgreSQL (viewer).'
     }
@@ -374,10 +374,8 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
             {configured
               ? 'Kredensial tersimpan tetap dipakai saat menyimpan perubahan lain.'
               : 'Isi keempatnya agar migration bisa dijalankan, atau kosongkan semuanya untuk connection view-only.'}{' '}
-            Username executor wajib berakhiran <code>{EXECUTOR_SUFFIX}</code>, username preparer memakai prefiks yang
-            sama dengan akhiran <code>{PREPARER_SUFFIX}</code> (mis. <code>wbd_target_a_executor</code> dan{' '}
-            <code>wbd_target_a_preparer</code>), dan keduanya harus berbeda dari username PostgreSQL di atas. Server
-            memverifikasi kredensial ke database target sebelum menyimpan.
+            Username executor wajib berakhiran <code>{EXECUTOR_SUFFIX}</code>, username preparer wajib berakhiran <code>{PREPARER_SUFFIX}</code> (mis. <code>wbd_target_a_executor</code> dan{' '}
+            <code>wbd_target_a_preparer</code>), dan keduanya harus berbeda dari username PostgreSQL di atas.
           </p>
           <div className="row">{ROLES.map(credentialInputs)}</div>
           {configured && (

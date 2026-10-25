@@ -33,7 +33,7 @@ function TestStatus({ result }: { result: TestResult | undefined }) {
 
 function ExecutionStatus({ connection: c }: { connection: ConnectionSummary }) {
   if (c.execution_ready === undefined) return <span className="text-secondary">—</span>
-  if (!c.execution_ready) return <span className="badge bg-secondary-lt">View only</span>
+  if (!c.execution_ready) return <span className="badge bg-secondary-lt">Eksekusi belum dikonfigurasi</span>
   const roles = [c.executor_username && `executor: ${c.executor_username}`, c.preparer_username && `preparer: ${c.preparer_username}`]
   return (
     <>
@@ -137,7 +137,7 @@ function ConnectionsPage() {
           <DataTable columns={columns} rows={connections} rowKey={(c) => c.id} caption="Daftar connection database target" />
         )}
         <p className="text-secondary mt-3 mb-0">
-          Password (termasuk kredensial eksekusi) tidak pernah dikirim server ke browser. Akses user ke database diatur lewat grant di{' '}
+          Akses user ke database diatur lewat grant di{' '}
           <a href="/admin/groups/">Admin: Groups</a>.
         </p>
       </Panel>

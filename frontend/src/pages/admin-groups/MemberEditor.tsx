@@ -86,10 +86,6 @@ export function MemberEditor({ group, users, onDirtyChange }: Props) {
         <>
           <MutationAlert failure={failure} />
           {notice && <Alert variant="success">{notice}</Alert>}
-          <p className="text-secondary">
-            Simpan mengganti <strong>seluruh</strong> daftar anggota. Tidak mencentang siapa pun lalu menyimpan berarti
-            mengosongkan group.
-          </p>
           {users.length === 0 && unknownIds.length === 0 ? (
             <p className="text-secondary">Belum ada user.</p>
           ) : (
@@ -127,7 +123,6 @@ export function MemberEditor({ group, users, onDirtyChange }: Props) {
             <Button onClick={() => void save()} pending={pending} disabled={!dirty}>
               Simpan anggota
             </Button>
-            {dirty && !pending && <span className="text-secondary">Ada perubahan belum disimpan.</span>}
           </div>
         </>
       )}

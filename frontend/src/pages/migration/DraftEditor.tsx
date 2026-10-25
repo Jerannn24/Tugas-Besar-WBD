@@ -201,7 +201,7 @@ export function DraftEditor({ database, draftId }: Props) {
               )}
             </Alert>
             <dl className="detail-list">
-              <dt>Title</dt>
+              <dt>Title:</dt>
               <dd>{draft.title}</dd>
             </dl>
             <pre className="sql-block">{draft.sql}</pre>
@@ -238,7 +238,7 @@ export function DraftEditor({ database, draftId }: Props) {
               : saving
                 ? 'Sedang menyimpan.'
                 : dirty
-                  ? 'Simpan perubahan dulu; Execute selalu memakai revision tersimpan.'
+                  ? 'Simpan perubahan dulu.'
                   : null
         }
       />

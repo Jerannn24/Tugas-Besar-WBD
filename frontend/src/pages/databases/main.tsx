@@ -29,7 +29,7 @@ const COLUMNS: DataColumn<DatabaseSummary>[] = [
     render: (d) => (
       <div className="d-flex gap-3">
         <a href={pageUrl('/database/', { id: d.id })}>Schema &amp; data</a>
-        <a href={pageUrl('/migrations/', { database: d.id })}>Riwayat migration</a>
+        <a href={pageUrl('/migrations/', { database: d.id })}>Migration</a>
       </div>
     ),
   },
