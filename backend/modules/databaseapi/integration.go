@@ -7,10 +7,10 @@ import (
 	"errors"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/drafts"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/history"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/viewer"
@@ -78,24 +78,33 @@ func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer
 	if err != nil {
 		return err
 	}
-	viewerMux := http.NewServeMux()
-	if err := viewerHandler.Register(viewerMux); err != nil {
+	historyHandler, err := history.New(history.Dependencies{
+		Platform: platform,
+		Actor: func(r *http.Request) (history.Actor, error) {
+			a, err := actor(r)
+			return history.Actor{ID: a.ID}, err
+		},
+		Authorize: func(ctx context.Context, a history.Actor, id string) error {
+			return authorizeView(ctx, viewer.Actor{ID: a.ID}, id, viewer.View)
+		},
+		Timeout: 10 * time.Second,
+	})
+	if err != nil {
 		return err
 	}
-	draftMux := http.NewServeMux()
-	if err := draftHandler.Register(draftMux); err != nil {
+	mux := http.NewServeMux()
+	if err := viewerHandler.Register(mux); err != nil {
 		return err
 	}
-	viewerAPI := jsonFallback(viewerMux)
-	draftAPI := jsonFallback(draftMux)
-	router.All("/databases", adaptor.HTTPHandler(viewerAPI))
-	router.All("/databases/*", adaptor.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/drafts") {
-			draftAPI.ServeHTTP(w, r)
-			return
-		}
-		viewerAPI.ServeHTTP(w, r)
-	})))
+	if err := draftHandler.Register(mux); err != nil {
+		return err
+	}
+	if err := historyHandler.Register(mux); err != nil {
+		return err
+	}
+	api := adaptor.HTTPHandler(jsonFallback(mux))
+	router.All("/databases", api)
+	router.All("/databases/*", api)
 	return nil
 }
 
