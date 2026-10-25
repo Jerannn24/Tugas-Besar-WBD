@@ -459,3 +459,54 @@ func TestValidatePassword(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionRotationRequiredFlag(t *testing.T) {
+	db := openAuthTestDB(t)
+	defer db.Close()
+
+	user := createAuthTestUser(t, db)
+	config := testSessionConfig()
+	config.GracePeriod = time.Minute
+	service := newTestService(db, config)
+	oldID := loginUser(t, service, user)
+	familyID := familyOf(t, db, user)
+
+	same, err := service.Authenticate(context.Background(), oldID)
+	if err != nil || same.SessionID != oldID {
+		t.Fatalf("session rotated without flag or interval: %v", err)
+	}
+
+	var absoluteBefore time.Time
+	if err := db.QueryRow(context.Background(),
+		`SELECT absolute_expires_at FROM app.session_families WHERE id = $1`, familyID).Scan(&absoluteBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(context.Background(),
+		`UPDATE app.session_families SET rotation_required = true WHERE id = $1`, familyID); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := service.Authenticate(context.Background(), oldID)
+	if err != nil {
+		t.Fatalf("rotate flagged session: %v", err)
+	}
+	if rotated.SessionID == oldID {
+		t.Fatal("expected rotation for rotation_required session")
+	}
+	var required bool
+	var absoluteAfter time.Time
+	if err := db.QueryRow(context.Background(),
+		`SELECT rotation_required, absolute_expires_at FROM app.session_families WHERE id = $1`, familyID).Scan(&required, &absoluteAfter); err != nil {
+		t.Fatal(err)
+	}
+	if required {
+		t.Fatal("rotation_required not cleared")
+	}
+	if !absoluteAfter.Equal(absoluteBefore) {
+		t.Fatalf("absolute_expires_at changed: %v -> %v", absoluteBefore, absoluteAfter)
+	}
+	var state string
+	if err := db.QueryRow(context.Background(),
+		`SELECT state FROM app.session_tokens WHERE token_hash = $1`, mustHash(t, oldID)).Scan(&state); err != nil || state != "grace" {
+		t.Fatalf("old token state=%q err=%v, want grace", state, err)
+	}
+}

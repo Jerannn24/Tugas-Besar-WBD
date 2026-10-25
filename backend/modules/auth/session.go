@@ -77,6 +77,7 @@ type Session struct {
 	LastSeenAt         time.Time
 	AbsoluteExpiresAt  time.Time
 	RotatedAt          time.Time
+	RotationRequired   bool
 }
 
 type SessionRepository struct {
@@ -131,7 +132,7 @@ func (r *SessionRepository) Find(ctx context.Context, tokenHash []byte, now time
 	var validUntil time.Time
 	err := r.db.QueryRow(ctx, `
 		SELECT f.id, f.user_id, f.auth_version, u.auth_version, f.created_at, f.last_seen_at,
-		       f.absolute_expires_at, f.rotated_at, t.state, t.valid_until
+		       f.absolute_expires_at, f.rotated_at, f.rotation_required, t.state, t.valid_until
 		FROM app.session_tokens t
 		JOIN app.session_families f ON f.id = t.family_id
 		JOIN app.users u ON u.id = f.user_id
@@ -142,7 +143,7 @@ func (r *SessionRepository) Find(ctx context.Context, tokenHash []byte, now time
 	`, tokenHash).Scan(
 		&session.FamilyID, &session.UserID, &session.AuthVersion, &session.CurrentAuthVersion,
 		&session.CreatedAt, &session.LastSeenAt, &session.AbsoluteExpiresAt,
-		&session.RotatedAt, &state, &validUntil,
+		&session.RotatedAt, &session.RotationRequired, &state, &validUntil,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -279,6 +280,7 @@ func (r *SessionRepository) Rotate(ctx context.Context, familyID uuid.UUID, oldH
 	if _, err := tx.Exec(ctx, `
 		UPDATE app.session_families
 		SET rotated_at = LEAST($2, absolute_expires_at),
+		    rotation_required = false,
 		    last_seen_at = GREATEST(last_seen_at, LEAST($2, absolute_expires_at))
 		WHERE id = $1
 	`, familyID, now); err != nil {
@@ -424,7 +426,7 @@ func (s *service) authenticate(ctx context.Context, sessionID string) (*Authenti
 		if err != nil {
 			return nil, err
 		}
-	case now.Sub(session.RotatedAt) >= s.sessionConfig.RotationInterval:
+	case now.Sub(session.RotatedAt) >= s.sessionConfig.RotationInterval || session.RotationRequired:
 		newID, err := newSessionID()
 		if err != nil {
 			return nil, err

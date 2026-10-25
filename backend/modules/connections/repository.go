@@ -528,6 +528,13 @@ func (r *Repository) Delete(ctx context.Context, id uuid.UUID, lc lifecycle) err
 	if result.RowsAffected() != 1 {
 		return ErrNotFound
 	}
+	if _, err := tx.Exec(ctx, `UPDATE app.session_families SET revoked_at=clock_timestamp()
+		WHERE revoked_at IS NULL AND user_id IN (
+			SELECT m.user_id FROM app.group_memberships m
+			JOIN app.group_database_grants g ON g.group_id=m.group_id
+			WHERE g.database_id=$1)`, id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM app.group_database_grants WHERE database_id=$1`, id); err != nil {
 		return err
 	}
