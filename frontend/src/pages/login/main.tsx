@@ -1,16 +1,19 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { errorMessage, isErrorCode, refreshCsrfToken, type ApiFailure } from '../../api/client'
+import { errorMessage, isCsrfError, refreshCsrfToken, type ApiFailure } from '../../api/client'
 import { login } from '../../api/endpoints'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { FormField } from '../../components/FormField'
 import { Panel } from '../../components/Panel'
-import { APP_NAME } from '../../lib/app'
+import { APP_NAME, SESSION_ENDED_PARAM } from '../../lib/app'
 import { mountPage } from '../../lib/mount'
+import { getQueryParam } from '../../lib/query'
 
 type Feedback =
   | { variant: 'danger' | 'warning'; title: string; message: string }
   | null
+
+const sessionEnded = getQueryParam(SESSION_ENDED_PARAM) !== null
 
 type CsrfState = { status: 'loading' } | { status: 'ready' } | { status: 'error'; failure: ApiFailure }
 
@@ -49,7 +52,7 @@ function LoginPage() {
     if (res.kind === 'http' && res.status === 401) {
       setPassword('')
       setFeedback({ variant: 'danger', title: 'Login gagal', message: 'Username atau password salah.' })
-    } else if (isErrorCode(res, 'CSRF_INVALID')) {
+    } else if (isCsrfError(res)) {
       setFeedback({ variant: 'warning', title: 'Kirim ulang', message: errorMessage(res) })
     } else if (res.kind === 'http' && res.error.code === 'VALIDATION_FAILED') {
       setFieldErrors(res.error.field_errors)
@@ -70,6 +73,11 @@ function LoginPage() {
               <Button variant="outline-secondary" onClick={() => void loadCsrf()}>
                 Coba lagi
               </Button>
+            </Alert>
+          )}
+          {sessionEnded && !feedback && (
+            <Alert variant="info" title="Sesi diakhiri">
+              Akun Anda baru saja diubah sehingga sesi diakhiri. Silakan login kembali.
             </Alert>
           )}
           {feedback && (

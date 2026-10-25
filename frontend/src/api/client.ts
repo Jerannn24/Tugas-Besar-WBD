@@ -44,11 +44,33 @@ async function transport(req: TransportRequest): Promise<Response> {
   })
 }
 
+type CsrfSource = 'unknown' | 'body' | 'cookie'
+
+const CSRF_COOKIE = 'csrf_token'
+
+let csrfSource: CsrfSource = 'unknown'
 let csrfToken: string | null = null
 let csrfInFlight: Promise<ApiResult<string>> | null = null
 
-export function getCsrfToken(): Promise<ApiResult<string>> {
-  if (csrfToken !== null) return Promise.resolve({ ok: true, status: 200, data: csrfToken })
+function readCsrfCookie(): string | null {
+  for (const part of document.cookie.split(';')) {
+    const [name, ...rest] = part.trim().split('=')
+    if (name === CSRF_COOKIE) {
+      const value = rest.join('=')
+      return value === '' ? null : decodeURIComponent(value)
+    }
+  }
+  return null
+}
+
+const MISSING_TOKEN: ApiResult<string> = { ok: false, kind: 'invalid_response', status: 200 }
+
+export async function getCsrfToken(): Promise<ApiResult<string>> {
+  if (csrfSource === 'body' && csrfToken !== null) return { ok: true, status: 200, data: csrfToken }
+  if (csrfSource === 'cookie') {
+    const cookie = readCsrfCookie()
+    if (cookie !== null) return { ok: true, status: 200, data: cookie }
+  }
   return refreshCsrfToken()
 }
 
@@ -56,11 +78,18 @@ export function refreshCsrfToken(): Promise<ApiResult<string>> {
   csrfToken = null
   if (csrfInFlight) return csrfInFlight
 
-  csrfInFlight = send<{ csrf_token: string }>('GET', '/api/csrf', { redirectOn401: false })
+  csrfInFlight = send<{ csrf_token?: unknown }>('GET', '/api/csrf', { redirectOn401: false })
     .then((res): ApiResult<string> => {
       if (!res.ok) return res
-      csrfToken = res.data.csrf_token
-      return { ok: true, status: res.status, data: csrfToken }
+      const fromBody = isObject(res.data) ? res.data.csrf_token : undefined
+      if (typeof fromBody === 'string' && fromBody !== '') {
+        csrfSource = 'body'
+        csrfToken = fromBody
+        return { ok: true, status: res.status, data: fromBody }
+      }
+      csrfSource = 'cookie'
+      const cookie = readCsrfCookie()
+      return cookie === null ? MISSING_TOKEN : { ok: true, status: res.status, data: cookie }
     })
     .finally(() => {
       csrfInFlight = null
@@ -89,7 +118,7 @@ export async function request<T>(
   const res = await send<T>(method, path, options, extraHeaders)
 
   if (!res.ok && res.kind === 'http') {
-    if (res.status === 403 && res.error.code === 'CSRF_INVALID') {
+    if (res.status === 403 && isCsrfError(res)) {
       void refreshCsrfToken()
     }
   }
@@ -136,11 +165,12 @@ async function send<T>(
     return { ok: true, status: response.status, data: payload.data as T }
   }
 
-  if (!response.ok && isObject(payload) && isErrorBody(payload.error)) {
+  const error = !response.ok && isObject(payload) ? toErrorBody(payload.error) : null
+  if (error) {
     if (response.status === 401 && options.redirectOn401 !== false) {
       window.location.assign(LOGIN_PAGE)
     }
-    return { ok: false, kind: 'http', status: response.status, error: payload.error }
+    return { ok: false, kind: 'http', status: response.status, error }
   }
 
   return { ok: false, kind: 'invalid_response', status: response.status }
@@ -150,14 +180,20 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null
 }
 
-function isErrorBody(v: unknown): v is ApiErrorBody {
-  return (
-    isObject(v) &&
-    typeof v.code === 'string' &&
-    typeof v.message === 'string' &&
-    isObject(v.field_errors) &&
-    typeof v.retryable === 'boolean'
-  )
+function toErrorBody(v: unknown): ApiErrorBody | null {
+  if (!isObject(v) || typeof v.code !== 'string' || typeof v.message !== 'string') return null
+  const fieldErrors: Record<string, string> = {}
+  if (isObject(v.field_errors)) {
+    for (const [key, value] of Object.entries(v.field_errors)) {
+      if (typeof value === 'string') fieldErrors[key] = value
+    }
+  }
+  return {
+    code: v.code,
+    message: v.message,
+    field_errors: fieldErrors,
+    retryable: typeof v.retryable === 'boolean' ? v.retryable : false,
+  }
 }
 
 const GENERIC_MESSAGES: Record<string, string> = {
@@ -180,7 +216,8 @@ export function errorMessage(failure: ApiFailure): string {
       return 'Respons server tidak dikenali.'
     case 'http': {
       const { code, message } = failure.error
-      if (code === 'INVALID_CREDENTIALS' || code === 'CSRF_INVALID' || code === 'INTERNAL_ERROR') {
+      if (isCsrfError(failure)) return GENERIC_MESSAGES.CSRF_INVALID
+      if (code === 'INVALID_CREDENTIALS' || code === 'INTERNAL_ERROR') {
         return GENERIC_MESSAGES[code]
       }
 
@@ -191,4 +228,10 @@ export function errorMessage(failure: ApiFailure): string {
 
 export function isErrorCode(result: ApiResult<unknown>, code: string): boolean {
   return !result.ok && result.kind === 'http' && result.error.code === code
+}
+
+const CSRF_CODES: ReadonlySet<string> = new Set(['CSRF_INVALID', 'CSRF_FAILED'])
+
+export function isCsrfError(result: ApiResult<unknown>): boolean {
+  return !result.ok && result.kind === 'http' && CSRF_CODES.has(result.error.code)
 }

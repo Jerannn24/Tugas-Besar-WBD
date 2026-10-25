@@ -1,4 +1,4 @@
-import { errorMessage, type ApiFailure } from '../api/client'
+import { errorMessage, isCsrfError, type ApiFailure } from '../api/client'
 
 export type MutationFailure = { title: string; text: string; fieldErrors: Record<string, string> }
 
@@ -8,11 +8,14 @@ export function describeFailure(failure: ApiFailure, fallbackTitle: string): Mut
 
   const { code, field_errors } = failure.error
   const text = errorMessage(failure)
+  if (isCsrfError(failure)) return { title: 'Sesi keamanan diperbarui', text, fieldErrors: {} }
   switch (code) {
     case 'FORBIDDEN':
       return { title: 'Akses ditolak', text, fieldErrors: {} }
-    case 'CSRF_INVALID':
-      return { title: 'Sesi keamanan diperbarui', text, fieldErrors: {} }
+    case 'CONFLICT':
+      return { title: 'Data bentrok dengan data yang sudah ada', text, fieldErrors: {} }
+    case 'LAST_ACTIVE_ADMIN':
+      return { title: 'Admin aktif terakhir', text, fieldErrors: {} }
     case 'NOT_FOUND':
       return { title: 'Data tidak ditemukan', text: `${text} Data mungkin sudah dihapus di tempat lain; muat ulang halaman.`, fieldErrors: {} }
     case 'DATABASE_BUSY':

@@ -1,4 +1,4 @@
-import { errorMessage, type ApiFailure } from '../../api/client'
+import { errorMessage, isCsrfError, type ApiFailure } from '../../api/client'
 import type { DatabaseSummary, Draft, Execution } from '../../api/types'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
@@ -166,7 +166,7 @@ function CheckFailure({ failure }: { failure: ApiFailure }) {
 }
 
 function Rejected({ failure, historyUrl }: { failure: ApiFailure; historyUrl: string }) {
-  const code = failure.kind === 'http' ? failure.error.code : ''
+  const code = isCsrfError(failure) ? 'CSRF_INVALID' : failure.kind === 'http' ? failure.error.code : ''
   const message = errorMessage(failure)
 
   switch (code) {

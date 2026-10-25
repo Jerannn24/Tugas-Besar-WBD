@@ -45,9 +45,22 @@ const COLUMN_COLUMNS: DataColumn<Column>[] = [
   },
 ]
 
+const CONSTRAINT_KIND_LABELS: Record<string, string> = {
+  primary: 'PRIMARY KEY',
+  foreign: 'FOREIGN KEY',
+  unique: 'UNIQUE',
+  check: 'CHECK',
+  exclusion: 'EXCLUDE',
+  other: 'Lainnya',
+}
+
+function constraintKindLabel(kind: string): string {
+  return Object.hasOwn(CONSTRAINT_KIND_LABELS, kind) ? CONSTRAINT_KIND_LABELS[kind] : kind
+}
+
 const CONSTRAINT_COLUMNS: DataColumn<Constraint>[] = [
   { key: 'name', header: 'Nama', render: (c) => <strong>{c.name}</strong> },
-  { key: 'kind', header: 'Jenis', render: (c) => c.kind },
+  { key: 'kind', header: 'Jenis', render: (c) => constraintKindLabel(c.kind) },
   { key: 'definition', header: 'Definisi', wrap: true, render: (c) => <span className="mono">{c.definition}</span> },
 ]
 

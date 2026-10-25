@@ -44,7 +44,8 @@ export async function login(input: LoginInput) {
 }
 
 export const getSession = () => request<SessionView>('GET', '/api/session')
-export const logout = () => request<LogoutResult>('POST', '/api/logout', { body: {} })
+export const logout = (options: { redirectOn401?: boolean } = {}) =>
+  request<LogoutResult>('POST', '/api/logout', { body: {}, ...options })
 
 export const listUsers = () => request<List<User>>('GET', '/api/admin/users')
 export const createUser = (input: UserCreateInput) =>

@@ -76,19 +76,20 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
 
     let res
     if (connection) {
-      const patch: ConnectionPatchInput = {}
-      for (const k of changed) {
-        if (k === 'password') continue
-        if (k === 'port') patch.port = values.port
-        else if (k === 'ssl_mode') patch.ssl_mode = values.ssl_mode
-        else patch[k as TextField] = values[k as TextField]
-      }
-      if (form.password !== '') patch.password = form.password
-      if (patch.port === connection.port) delete patch.port
-      if (Object.keys(patch).length === 0) {
+      const { password, ...rest } = values
+      const unchanged =
+        password === '' &&
+        rest.name === connection.name &&
+        rest.host === connection.host &&
+        rest.port === connection.port &&
+        rest.database_name === connection.database_name &&
+        rest.username === connection.username &&
+        rest.ssl_mode === connection.ssl_mode
+      if (unchanged) {
         setNotice('Tidak ada perubahan untuk disimpan.')
         return
       }
+      const patch: ConnectionPatchInput = password === '' ? rest : { ...rest, password }
       setPending(true)
       res = await updateConnection(connection.id, patch)
     } else {

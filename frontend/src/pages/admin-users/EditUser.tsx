@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { updateUser } from '../../api/endpoints'
+import { logout, updateUser } from '../../api/endpoints'
 import type { User, UserPatchInput } from '../../api/types'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
@@ -7,6 +7,7 @@ import { CheckField } from '../../components/CheckField'
 import { FormField } from '../../components/FormField'
 import { MutationAlert } from '../../components/MutationAlert'
 import { Panel } from '../../components/Panel'
+import { SESSION_ENDED_URL } from '../../lib/app'
 import { describeFailure, type MutationFailure } from '../../lib/mutation'
 import { useBeforeUnload } from '../../lib/unload'
 import { USERNAME_MAX, passwordError, usernameError } from './rules'
@@ -56,7 +57,8 @@ export function EditUser({ user, isSelf, onSaved, onClose }: Props) {
     const res = await updateUser(user.id, patch)
     if (res.ok) {
       if (isSelf) {
-        window.location.assign('/admin/users/')
+        await logout({ redirectOn401: false })
+        window.location.assign(SESSION_ENDED_URL)
         return
       }
       setPending(false)
@@ -86,7 +88,7 @@ export function EditUser({ user, isSelf, onSaved, onClose }: Props) {
         {notice && <Alert variant="info">{notice}</Alert>}
         {isSelf && (
           <Alert variant="warning">
-            Ini akun Anda sendiri. Setelah disimpan halaman dimuat ulang; Anda mungkin perlu login lagi.
+            Ini akun Anda sendiri. Setelah disimpan, sesi Anda diakhiri dan Anda perlu login lagi.
           </Alert>
         )}
         <FormField label="Username" required error={errors.username}>
