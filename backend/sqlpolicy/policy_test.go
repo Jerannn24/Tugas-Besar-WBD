@@ -92,3 +92,42 @@ func TestValidateInputAndBatchBoundaries(t *testing.T) {
 		t.Fatal("unconfigured policy accepted SQL")
 	}
 }
+
+func TestValidateRenameBoundaries(t *testing.T) {
+	p := newPolicy(t)
+	for _, sql := range []string{
+		`ALTER TABLE managed.t RENAME TO renamed`,
+		`ALTER TABLE IF EXISTS managed.t RENAME TO renamed`,
+		`ALTER TABLE managed.t RENAME COLUMN name TO label`,
+		`ALTER TABLE managed."quoted table" RENAME TO "renamed table"`,
+		`ALTER TABLE managed."quoted table" RENAME COLUMN "quoted column" TO "renamed column"`,
+	} {
+		t.Run(sql, func(t *testing.T) {
+			if err := p.Validate(sql); err != nil {
+				t.Fatalf("rejected supported rename: %v", err)
+			}
+		})
+	}
+	for _, sql := range []string{
+		`ALTER TABLE t RENAME TO renamed`,
+		`ALTER TABLE public.t RENAME TO renamed`,
+		`ALTER TABLE wbd_auth.t RENAME TO renamed`,
+		`ALTER TABLE pg_catalog.t RENAME TO renamed`,
+		`ALTER TABLE pg_temp.t RENAME TO renamed`,
+		`ALTER TABLE t RENAME COLUMN name TO label`,
+		`ALTER TABLE public.t RENAME COLUMN name TO label`,
+		`ALTER TABLE wbd_auth.t RENAME COLUMN name TO label`,
+		`ALTER TABLE pg_catalog.t RENAME COLUMN name TO label`,
+		`ALTER VIEW managed.t RENAME TO renamed`,
+		`ALTER VIEW managed.t RENAME COLUMN name TO label`,
+		`ALTER MATERIALIZED VIEW managed.t RENAME TO renamed`,
+		`ALTER INDEX managed.idx RENAME TO renamed`,
+		`ALTER TABLE managed.t RENAME CONSTRAINT fk TO renamed`,
+	} {
+		t.Run(sql, func(t *testing.T) {
+			if err := p.Validate(sql); err == nil {
+				t.Fatal("accepted unsupported rename")
+			}
+		})
+	}
+}
