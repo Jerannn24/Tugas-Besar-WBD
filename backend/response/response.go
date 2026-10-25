@@ -9,8 +9,10 @@ type APIResponse struct {
 }
 
 type APIError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code        string            `json:"code"`
+	Message     string            `json:"message"`
+	FieldErrors map[string]string `json:"field_errors"`
+	Retryable   bool              `json:"retryable"`
 }
 
 func JSON(c *fiber.Ctx, status int, data interface{}) error {
@@ -26,8 +28,9 @@ func Fail(c *fiber.Ctx, status int, code, message string) error {
 		Success: false,
 		Data:    nil,
 		Error: &APIError{
-			Code:    code,
-			Message: message,
+			Code:        code,
+			Message:     message,
+			FieldErrors: map[string]string{},
 		},
 	})
 }
