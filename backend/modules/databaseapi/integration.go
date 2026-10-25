@@ -11,8 +11,10 @@ import (
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/drafts"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/history"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/migration"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/sqlpolicy"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/viewer"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
@@ -21,9 +23,11 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
-func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer, pools *connections.PoolManager) error {
+// Register memasang database API dan menjalankan reconciler execution.
+// Fungsi stop yang dikembalikan wajib dipanggil saat shutdown sebelum pool ditutup.
+func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer, pools *connections.PoolManager) (func(), error) {
 	if platform == nil || authorizer == nil || pools == nil {
-		return errors.New("database API dependencies are required")
+		return nil, errors.New("database API dependencies are required")
 	}
 	actor := func(r *http.Request) (viewer.Actor, error) {
 		resolved, ok := authz.ActorFromRequest(r)
@@ -61,7 +65,7 @@ func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer
 		Timeout: 10 * time.Second,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	draftHandler, err := drafts.New(drafts.Dependencies{
 		Platform: platform,
@@ -76,7 +80,7 @@ func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer
 		Timeout:   10 * time.Second,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	historyHandler, err := history.New(history.Dependencies{
 		Platform: platform,
@@ -90,22 +94,61 @@ func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer
 		Timeout: 10 * time.Second,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mux := http.NewServeMux()
 	if err := viewerHandler.Register(mux); err != nil {
-		return err
+		return nil, err
 	}
 	if err := draftHandler.Register(mux); err != nil {
-		return err
+		return nil, err
 	}
 	if err := historyHandler.Register(mux); err != nil {
-		return err
+		return nil, err
+	}
+	policy, err := sqlpolicy.New("managed")
+	if err != nil {
+		return nil, err
+	}
+	migrationHandler, err := migration.New(migration.Dependencies{
+		Platform: platform,
+		Actor: func(r *http.Request) (migration.Actor, error) {
+			a, err := actor(r)
+			return migration.Actor{ID: a.ID}, err
+		},
+		Authorize: func(ctx context.Context, a migration.Actor, id string) error {
+			return authorizeView(ctx, viewer.Actor{ID: a.ID}, id, viewer.Edit)
+		},
+		CheckCSRF: authz.CheckCSRF,
+		Acquire:   acquireLease(pools),
+		Preflight: migration.NewPreflight(policy),
+		Timeout:   30 * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := migrationHandler.Register(mux); err != nil {
+		return nil, err
 	}
 	api := adaptor.HTTPHandler(jsonFallback(mux))
 	router.All("/databases", api)
 	router.All("/databases/*", api)
-	return nil
+	stop := startReconciler(scanUnresolved(platform, 50), migrationHandler.Reconcile, 30*time.Second)
+	return stop, nil
+}
+
+func acquireLease(pools *connections.PoolManager) func(context.Context, string) (*migration.TargetLease, error) {
+	return func(ctx context.Context, id string) (*migration.TargetLease, error) {
+		databaseID, err := uuid.Parse(id)
+		if err != nil {
+			return nil, err
+		}
+		lease, err := pools.Acquire(ctx, databaseID)
+		if err != nil {
+			return nil, err
+		}
+		return &migration.TargetLease{Executor: lease.Executor, Preparer: lease.Preparer, Release: lease.Release}, nil
+	}
 }
 
 type httpError struct {

@@ -19,7 +19,7 @@ import (
 )
 
 func TestRegisterRejectsMissingDependencies(t *testing.T) {
-	err := Register(fiber.New(), nil, nil, nil)
+	_, err := Register(fiber.New(), nil, nil, nil)
 	if err == nil {
 		t.Fatal("Register() error = nil, want dependency error")
 	}
@@ -148,9 +148,11 @@ func routedApp(t *testing.T, authorizer authz.Authorizer) *fiber.App {
 		c.Locals("authz.actor", authz.Actor{ID: uuid.MustParse("c0000000-0000-4000-8000-0000000000c1")})
 		return c.Next()
 	})
-	if err := Register(api, db, authorizer, connections.NewPoolManager(nil)); err != nil {
+	stop, err := Register(api, db, authorizer, connections.NewPoolManager(nil))
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(stop)
 	return app
 }
 
@@ -238,7 +240,8 @@ func TestRoutingFallbacks(t *testing.T) {
 	}{
 		{"GET", base + "/nope", 404, "NOT_FOUND"},
 		{"DELETE", base + "/migrations", 405, "METHOD_NOT_ALLOWED"},
-		{"POST", base + "/drafts/" + testDraft + "/execute", 404, "NOT_FOUND"},
+		{"GET", base + "/drafts/" + testDraft + "/execute", 405, "METHOD_NOT_ALLOWED"},
+		{"POST", base + "/drafts/" + testDraft + "/execute", 400, "INVALID_REQUEST"},
 		{"POST", base + "/migrations", 405, "METHOD_NOT_ALLOWED"},
 	}
 	for _, tt := range tests {
