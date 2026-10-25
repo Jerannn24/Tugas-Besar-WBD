@@ -1,6 +1,10 @@
 package auth
 
 import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"strings"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -91,5 +95,40 @@ func TestCSRFMiddlewareSkipsSafeMethods(t *testing.T) {
 		if resp.StatusCode != 200 {
 			t.Fatalf("%s status = %d, want 200", method, resp.StatusCode)
 		}
+	}
+}
+
+func TestParseSessionID(t *testing.T) {
+	valid, err := newSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := parseSessionID(valid)
+	if err != nil || len(raw) != 32 {
+		t.Fatalf("valid ID rejected: %v", err)
+	}
+	for name, id := range map[string]string{
+		"empty":     "",
+		"bad b64":   "!!!not-base64!!!",
+		"31 bytes":  base64.RawURLEncoding.EncodeToString(make([]byte, 31)),
+		"33 bytes":  base64.RawURLEncoding.EncodeToString(make([]byte, 33)),
+		"padded":    base64.URLEncoding.EncodeToString(make([]byte, 32)),
+		"std chars": strings.Repeat("+", 43),
+	} {
+		if _, err := parseSessionID(id); !errors.Is(err, ErrUnauthenticated) {
+			t.Fatalf("%s: err = %v, want ErrUnauthenticated", name, err)
+		}
+	}
+}
+
+func TestAuthenticateInvalidTokenSkipsRepository(t *testing.T) {
+	svc := NewService(nil, nil, SessionConfig{})
+	for _, id := range []string{"", "garbage", strings.Repeat("A", 42)} {
+		if _, err := svc.Authenticate(context.Background(), id); !errors.Is(err, ErrUnauthenticated) {
+			t.Fatalf("Authenticate(%q) err = %v, want ErrUnauthenticated", id, err)
+		}
+	}
+	if err := svc.Logout(context.Background(), "garbage"); err != nil {
+		t.Fatalf("Logout(garbage) = %v, want nil", err)
 	}
 }

@@ -68,7 +68,7 @@ func (h *Handler) Login(c *fiber.Ctx) error {
 		}
 	}
 
-	h.setSessionCookie(c, result.SessionID, result.ExpiresAt)
+	setSessionCookie(c, h.service.SessionConfig(), result.SessionID, result.ExpiresAt)
 	if err := h.setCSRFCookie(c); err != nil {
 		return response.Fail(c, fiber.StatusInternalServerError, "INTERNAL_ERROR", "Terjadi kesalahan internal")
 	}
@@ -105,20 +105,6 @@ func (h *Handler) Logout(c *fiber.Ctx) error {
 		return response.Fail(c, fiber.StatusInternalServerError, "INTERNAL_ERROR", "Terjadi kesalahan internal")
 	}
 	return response.JSON(c, fiber.StatusOK, fiber.Map{"message": "Logout berhasil"})
-}
-
-func (h *Handler) setSessionCookie(c *fiber.Ctx, sessionID string, expiresAt time.Time) {
-	config := h.service.SessionConfig()
-	c.Cookie(&fiber.Cookie{
-		Name:     SessionCookieName,
-		Value:    sessionID,
-		Expires:  expiresAt,
-		HTTPOnly: true,
-		Secure:   config.CookieSecure,
-		SameSite: "Lax",
-		Domain:   config.CookieDomain,
-		Path:     "/",
-	})
 }
 
 func (h *Handler) setCSRFCookie(c *fiber.Ctx) error {

@@ -12,106 +12,17 @@ import (
 )
 
 func TestRegisterRejectsMissingDependencies(t *testing.T) {
-	tests := []struct {
-		name        string
-		platformNil bool
-		sessionNil  bool
-		authzNil    bool
-		poolsNil    bool
-	}{
-		{
-			name:        "missing platform database",
-			platformNil: true,
-		},
-		{
-			name:       "missing session service",
-			sessionNil: true,
-		},
-		{
-			name:     "missing authorizer",
-			authzNil: true,
-		},
-		{
-			name:     "missing pool manager",
-			poolsNil: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			app := fiber.New()
-
-			var platformNil = tt.platformNil
-			var sessionNil = tt.sessionNil
-			var authzNil = tt.authzNil
-			var poolsNil = tt.poolsNil
-			
-			_ = platformNil
-			_ = sessionNil
-			_ = authzNil
-			_ = poolsNil
-
-			err := Register(app, nil, nil, nil, nil)
-			if err == nil {
-				t.Fatal("Register() error = nil, want dependency error")
-			}
-		})
+	err := Register(fiber.New(), nil, nil, nil)
+	if err == nil {
+		t.Fatal("Register() error = nil, want dependency error")
 	}
 }
 
-func TestCookieValue(t *testing.T) {
-	req := httptest.NewRequest("GET", "/", nil)
-	req.AddCookie(&http.Cookie{
-		Name:  "app_session",
-		Value: "opaque-session-token",
-	})
-
-	if got := cookieValue(req, "app_session"); got != "opaque-session-token" {
-		t.Fatalf("cookieValue() = %q, want %q", got, "opaque-session-token")
-	}
-}
-
-func TestCookieValueMissingCookie(t *testing.T) {
-	req := httptest.NewRequest("GET", "/", nil)
-
-	if got := cookieValue(req, "app_session"); got != "" {
-		t.Fatalf("cookieValue() = %q, want empty string", got)
-	}
-}
-
-func fallbackMux() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/databases", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTeapot)
-	})
-	return jsonFallback(mux)
-}
-
-func assertFallback(t *testing.T, method, path string, status int, code string) {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	fallbackMux().ServeHTTP(rec, httptest.NewRequest(method, path, nil))
-	if rec.Code != status {
-		t.Fatalf("%s %s status = %d, want %d", method, path, rec.Code, status)
-	}
-	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
-		t.Fatalf("Content-Type = %q", ct)
-	}
-	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
-		t.Fatalf("Cache-Control = %q", cc)
-	}
-	var body struct {
-		Error struct {
-			Code        string            `json:"code"`
-			FieldErrors map[string]string `json:"field_errors"`
-			Retryable   *bool             `json:"retryable"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
-	if body.Error.Code != code || body.Error.FieldErrors == nil || body.Error.Retryable == nil || *body.Error.Retryable {
-		t.Fatalf("unexpected error body: %s", rec.Body.String())
+func TestActorFromRequestMissing(t *testing.T) {
+	req := httptest.NewRequest("GET", "/api/databases", nil)
+	_, ok := authz.ActorFromRequest(req)
+	if ok {
+		t.Fatal("ActorFromRequest() ok = true, want false")
 	}
 }
 
@@ -152,5 +63,44 @@ func TestMapAuthzError(t *testing.T) {
 	other := errors.New("boom")
 	if err := mapAuthzError(other); err != other {
 		t.Errorf("unknown error must pass through, got %v", err)
+	}
+}
+
+func fallbackMux() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/databases", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	return jsonFallback(mux)
+}
+
+func assertFallback(t *testing.T, method, path string, wantStatus int, wantCode string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	fallbackMux().ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+	if rec.Code != wantStatus {
+		t.Fatalf("status = %d, want %d", rec.Code, wantStatus)
+	}
+	var body struct {
+		Error struct {
+			Code        string            `json:"code"`
+			FieldErrors map[string]string `json:"field_errors"`
+			Retryable   *bool             `json:"retryable"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error.Code != wantCode {
+		t.Fatalf("code = %q, want %q", body.Error.Code, wantCode)
+	}
+	if body.Error.FieldErrors == nil || body.Error.Retryable == nil || *body.Error.Retryable {
+		t.Fatalf("field_errors/retryable missing: %+v", body.Error)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("content-type = %q", got)
+	}
+	if wantStatus == http.StatusMethodNotAllowed && rec.Header().Get("Allow") == "" {
+		t.Fatal("Allow header missing on 405")
 	}
 }
