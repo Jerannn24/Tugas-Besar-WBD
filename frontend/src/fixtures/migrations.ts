@@ -16,7 +16,7 @@ type State = {
   seq: number
 }
 
-const STORAGE_KEY = 'fixture_c06'
+const STORAGE_KEY = 'fixture_c06_v2'
 const RUNNING_MS = 6_000
 const UNKNOWN_MS = 90_000
 const SQL_MAX_BYTES = 256 * 1024
@@ -24,6 +24,7 @@ const UNSUPPORTED = /^\s*(BEGIN|COMMIT|ROLLBACK|START\s+TRANSACTION|GRANT|REVOKE
 
 const MAIN = TARGETS.demo_main.id
 const SECOND = TARGETS.demo_second.id
+const READONLY = TARGETS.demo_readonly.id
 const editor = USERS.demo_editor
 const admin = USERS.demo_admin
 
@@ -93,6 +94,9 @@ function seed(): State {
     seedDraft(8, 'Contoh DATABASE_BUSY', '-- fixture:busy\nALTER TABLE public.orders ADD COLUMN note text;'),
     seedDraft(9, 'Contoh jaringan putus', '-- fixture:network\nCREATE INDEX events_kind_idx ON public.events (kind);'),
     seedDraft(10, 'Contoh SQL_UNSUPPORTED', 'BEGIN;\nALTER TABLE public.orders DROP COLUMN currency;\nCOMMIT;'),
+    seedDraft(20, 'Contoh database view-only (Execute nonaktif)', 'ALTER TABLE public.notes ADD COLUMN tag text;', {
+      database_id: READONLY,
+    }),
   ]
 
   const executions: StoredExecution[] = [
@@ -109,7 +113,7 @@ function seed(): State {
     },
   ]
 
-  return { drafts, executions, requests: {}, next_version: { [MAIN]: 4, [SECOND]: 3 }, seq: 100 }
+  return { drafts, executions, requests: {}, next_version: { [MAIN]: 4, [SECOND]: 3, [READONLY]: 1 }, seq: 100 }
 }
 
 let memory: State | null = null
@@ -190,7 +194,7 @@ export function handleMigrationRequest(
   const [resource, id, action] = rest
   if (resource !== 'drafts' && resource !== 'migrations') return null
 
-  if (databaseId !== MAIN && databaseId !== SECOND) return fail(404, 'NOT_FOUND', 'Database tidak ditemukan.')
+  if (databaseId !== MAIN && databaseId !== SECOND && databaseId !== READONLY) return fail(404, 'NOT_FOUND', 'Database tidak ditemukan.')
   const access = (DATABASES_BY_USER[username] ?? []).find((d) => d.id === databaseId)?.access
   if (!access) return fail(403, 'FORBIDDEN', 'Anda tidak memiliki akses ke database ini.')
   if (resource === 'drafts' && access !== 'edit') {

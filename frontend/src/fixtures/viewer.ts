@@ -265,10 +265,25 @@ const products = table(
   ],
 )
 
+// ---------- demo_readonly ----------
+
+const notes = table(
+  'public',
+  'notes',
+  [col('id', 'bigint', false), col('body', 'text')],
+  [{ name: 'notes_pkey', kind: 'PRIMARY KEY', definition: 'PRIMARY KEY (id)' }],
+  [{ name: 'notes_pkey', definition: 'CREATE UNIQUE INDEX notes_pkey ON public.notes USING btree (id)', is_unique: true, is_primary: true }],
+  [
+    ['1', 'Connection ini view-only: kredensial executor/preparer belum dikonfigurasi.'],
+    ['2', null],
+  ],
+)
+
 export const VIEWER: Record<ID, FixtureDatabase> = {
   [TARGETS.demo_main.id]: buildDatabase([customers, orders, events, auditLog, orderItems]),
   [TARGETS.demo_second.id]: buildDatabase([products], ['staging'], {
     unavailable: [['inventory', 'remote_snapshot']],
     failFirstSchemas: true,
   }),
+  [TARGETS.demo_readonly.id]: buildDatabase([notes]),
 }

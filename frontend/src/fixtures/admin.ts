@@ -14,7 +14,7 @@ type State = {
   seq: number
 }
 
-const STORAGE_KEY = 'fixture_admin'
+const STORAGE_KEY = 'fixture_admin_v2'
 const SSL_MODES: readonly string[] = ['disable', 'require', 'verify-full']
 
 const READERS = '20000000-0000-4000-8000-000000000001'
@@ -22,6 +22,7 @@ const EDITORS = '20000000-0000-4000-8000-000000000002'
 const STALE = '20000000-0000-4000-8000-000000000099'
 const UNKNOWN_USER = '10000000-0000-4000-8000-000000000099'
 const OFFLINE = '30000000-0000-4000-8000-000000000003'
+const VIEW_ONLY = { executor_username: null, preparer_username: null, execution_ready: false }
 
 function seed(): State {
   const u = USERS
@@ -42,13 +43,25 @@ function seed(): State {
       [EDITORS]: [
         { database_id: TARGETS.demo_main.id, access: 'edit' },
         { database_id: TARGETS.demo_second.id, access: 'view' },
+        { database_id: TARGETS.demo_readonly.id, access: 'edit' },
       ],
       [STALE]: [],
     },
     connections: [
-      { ...TARGETS.demo_main, host: 'target-db', port: 5432, database_name: 'demo_main', username: 'demo_main_app', ssl_mode: 'disable' },
-      { ...TARGETS.demo_second, host: 'target-db', port: 5432, database_name: 'demo_second', username: 'demo_second_app', ssl_mode: 'disable' },
-      { id: OFFLINE, name: 'demo_offline', host: 'offline.invalid', port: 5432, database_name: 'demo_offline', username: 'demo_offline_app', ssl_mode: 'require' },
+      {
+        ...TARGETS.demo_main,
+        host: 'target-db',
+        port: 5432,
+        database_name: 'demo_main',
+        username: 'demo_main_app',
+        ssl_mode: 'disable',
+        executor_username: 'demo_main_executor',
+        preparer_username: 'demo_main_preparer',
+        execution_ready: true,
+      },
+      { ...TARGETS.demo_second, host: 'target-db', port: 5432, database_name: 'demo_second', username: 'demo_second_app', ssl_mode: 'disable', ...VIEW_ONLY },
+      { ...TARGETS.demo_readonly, host: 'target-db', port: 5432, database_name: 'demo_readonly', username: 'demo_readonly_app', ssl_mode: 'disable', ...VIEW_ONLY },
+      { id: OFFLINE, name: 'demo_offline', host: 'offline.invalid', port: 5432, database_name: 'demo_offline', username: 'demo_offline_app', ssl_mode: 'require', ...VIEW_ONLY },
     ],
     seq: 100,
   }
@@ -274,6 +287,32 @@ function putGrants(state: State, id: ID, body: unknown): Response {
 }
 
 const TEXT_FIELDS = ['name', 'host', 'database_name', 'username'] as const
+const ROLES = ['executor', 'preparer'] as const
+
+function validateCredentials(input: Record<string, unknown>, self: ConnectionSummary | null, errors: Record<string, string>) {
+  const sent = ROLES.filter((r) => r in input)
+  const configured = (r: (typeof ROLES)[number]) => Boolean(self?.[`${r}_username`])
+  const missing = ROLES.find((r) => !sent.includes(r))
+  if (sent.length === 1 && missing && !configured(missing)) errors[missing] = 'Executor dan preparer harus dikirim bersama.'
+  for (const r of sent) {
+    const v = input[r]
+    if (!isObject(v)) {
+      errors[r] = 'Harus berupa objek {username, password}.'
+      continue
+    }
+    if (typeof v.username !== 'string' || v.username.trim() === '') errors[`${r}.username`] = 'Username tidak boleh kosong.'
+    const needsPassword = self === null || !configured(r)
+    if ('password' in v || needsPassword) {
+      if (typeof v.password !== 'string' || v.password === '') {
+        errors[`${r}.password`] = needsPassword ? 'Password wajib diisi.' : 'Password tidak boleh kosong.'
+      }
+    }
+  }
+}
+const sendsCredentials = (input: Record<string, unknown>) => ROLES.some((r) => r in input)
+const unreachable = (host: string) => host.toLowerCase().endsWith('.invalid')
+const unverified = () => fail(502, 'TARGET_UNAVAILABLE', 'Kredensial tidak dapat diverifikasi ke database target.', {}, true)
+
 const targetKey = (c: Pick<ConnectionInput, 'host' | 'port' | 'database_name'>) =>
   JSON.stringify([c.host.trim().toLowerCase(), c.port, c.database_name.trim()])
 
@@ -298,6 +337,7 @@ function validateConnection(state: State, input: Record<string, unknown>, self: 
       errors.ssl_mode = 'SSL mode harus disable, require, atau verify-full.'
     }
   }
+  validateCredentials(input, self, errors)
   if (Object.keys(errors).length === 0) {
     const merged = { ...self, ...input } as ConnectionInput
     const key = targetKey(merged)
@@ -310,6 +350,12 @@ function validateConnection(state: State, input: Record<string, unknown>, self: 
 
 function summary(input: Record<string, unknown>, base: ConnectionSummary): ConnectionSummary {
   const s = (f: (typeof TEXT_FIELDS)[number]) => (typeof input[f] === 'string' ? (input[f] as string).trim() : base[f])
+  const role = (r: (typeof ROLES)[number]) => {
+    const v = input[r]
+    return isObject(v) && typeof v.username === 'string' ? v.username.trim() : (base[`${r}_username`] ?? null)
+  }
+  const executor_username = role('executor')
+  const preparer_username = role('preparer')
   return {
     id: base.id,
     name: s('name'),
@@ -318,6 +364,9 @@ function summary(input: Record<string, unknown>, base: ConnectionSummary): Conne
     database_name: s('database_name'),
     username: s('username'),
     ssl_mode: (typeof input.ssl_mode === 'string' ? input.ssl_mode : base.ssl_mode) as ConnectionSummary['ssl_mode'],
+    executor_username,
+    preparer_username,
+    execution_ready: Boolean(executor_username && preparer_username),
   }
 }
 
@@ -325,7 +374,8 @@ function createConnection(state: State, body: unknown): Response {
   if (!isObject(body)) return badRequest()
   const errors = validateConnection(state, body, null)
   if (Object.keys(errors).length > 0) return invalid(errors)
-  const empty: ConnectionSummary = { id: nextId(state, '30000000'), name: '', host: '', port: 0, database_name: '', username: '', ssl_mode: 'require' }
+  if (sendsCredentials(body) && unreachable(String(body.host))) return unverified()
+  const empty: ConnectionSummary = { id: nextId(state, '30000000'), name: '', host: '', port: 0, database_name: '', username: '', ssl_mode: 'require', ...VIEW_ONLY }
   const created = summary(body, empty) // password tidak disimpan di fixture
   state.connections.push(created)
   return ok(created, 201)
@@ -338,6 +388,7 @@ function patchConnection(state: State, id: ID, body: unknown): Response {
   const errors = validateConnection(state, body, current)
   if (Object.keys(errors).length > 0) return invalid(errors)
   const next = summary(body, current)
+  if (sendsCredentials(body) && unreachable(next.host)) return unverified()
   const identityChanged = targetKey(next) !== targetKey(current)
   if (identityChanged && hasUnresolvedExecution(id)) {
     return fail(409, 'DATABASE_BUSY', 'Target sedang menjalankan migration; host, port, dan database tidak dapat diubah.', {}, true)
@@ -361,7 +412,7 @@ function removeConnection(state: State, id: ID): Response {
 function testConnection(state: State, id: ID): Response {
   const c = state.connections.find((x) => x.id === id)
   if (!c) return notFound('Connection')
-  if (c.host.toLowerCase().endsWith('.invalid')) {
+  if (unreachable(c.host)) {
     return fail(502, 'TARGET_UNAVAILABLE', 'Database target tidak dapat dihubungi.', {}, true)
   }
   return ok({ reachable: true })
