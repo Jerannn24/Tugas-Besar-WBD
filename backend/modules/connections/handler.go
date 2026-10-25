@@ -91,6 +91,10 @@ func mapError(c *fiber.Ctx, err error) error {
 		return response.Fail(c, http.StatusNotFound, "NOT_FOUND", "Resource tidak ditemukan")
 	case errors.Is(err, ErrConflict):
 		return response.Fail(c, http.StatusConflict, "CONFLICT", "Target database sudah terdaftar")
+	case errors.Is(err, ErrBusy):
+		return response.Fail(c, http.StatusConflict, "DATABASE_BUSY", "Database sedang digunakan")
+	case errors.Is(err, ErrTargetUnavailable):
+		return response.Fail(c, http.StatusBadGateway, "TARGET_UNAVAILABLE", "Target database is unavailable")
 	default:
 		return internal(c)
 	}

@@ -7,15 +7,6 @@ import (
 	"github.com/google/uuid"
 )
 
-type serviceRepository interface {
-	List(context.Context) ([]Summary, error)
-	Create(context.Context, Input) (Summary, error)
-	Update(context.Context, uuid.UUID, Input) (Summary, error)
-	Delete(context.Context, uuid.UUID) error
-	Test(context.Context, uuid.UUID) error
-	OpenTarget(context.Context, uuid.UUID) (*sql.DB, error)
-}
-
 type Service struct {
 	repository *Repository
 	pools      *PoolManager
@@ -33,20 +24,19 @@ func (s *Service) Create(ctx context.Context, input Input) (Summary, error) {
 	return s.repository.Create(ctx, input)
 }
 
+// Update and Delete invalidate pools only after the platform transaction has
+// committed (the lifecycle hook does it), never before.
 func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Summary, error) {
-	item, err := s.repository.Update(ctx, id, input)
+	item, err := s.repository.Update(ctx, id, input, s.pools)
 	if err == nil {
+		// Non-identity edits (e.g. rename) skip quiesce; viewer pool is still refreshed.
 		s.pools.Invalidate(id)
 	}
 	return item, err
 }
 
 func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
-	err := s.repository.Delete(ctx, id)
-	if err == nil {
-		s.pools.Invalidate(id)
-	}
-	return err
+	return s.repository.Delete(ctx, id, s.pools)
 }
 
 func (s *Service) Test(ctx context.Context, id uuid.UUID) error {
