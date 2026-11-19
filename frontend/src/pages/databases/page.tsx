@@ -8,11 +8,11 @@ import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { DataTable, type DataColumn } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
-import { Loading } from '../../components/Loading'
 import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
 import { paths } from '../../lib/paths'
 import { useSession } from '../../lib/session'
+import { TableSkeleton } from '../../components/Skeleton'
 
 type ListState =
   | { status: 'loading' }
@@ -28,7 +28,7 @@ const COLUMNS: DataColumn<DatabaseSummary>[] = [
     key: 'actions',
     header: 'Aksi',
     render: (d) => (
-      <div className="d-flex gap-3">
+      <div className="d-flex flex-wrap gap-3">
         <Link to={paths.database(d.id)}>Schema &amp; data</Link>
         <Link to={paths.migrations(d.id)}>Migration</Link>
       </div>
@@ -70,7 +70,11 @@ function DatabaseList({ isAdmin }: { isAdmin: boolean }) {
 
   switch (state.status) {
     case 'loading':
-      return <Loading label="Memuat daftar database…" />
+      return (
+        <Panel title="Database yang dapat diakses">
+          <TableSkeleton label="Memuat daftar database…" columns={['Nama', 'Akses', 'Aksi']} rows={3} />
+        </Panel>
+      )
     case 'expired':
       return (
         <Alert variant="warning" title="Sesi berakhir">

@@ -8,12 +8,12 @@ import { DatabaseGate } from '../../components/DatabaseGate'
 import { DataTable, type DataColumn } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { FailureAlert } from '../../components/FailureAlert'
-import { Loading } from '../../components/Loading'
 import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
 import { StatusBadge } from '../../components/StatusBadge'
 import { formatDateTime } from '../../lib/format'
 import { paths } from '../../lib/paths'
+import { TableSkeleton } from '../../components/Skeleton'
 
 type ListState<T> =
   | { status: 'loading' }
@@ -96,7 +96,12 @@ function History({ databaseId }: { databaseId: ID }) {
 
   return (
     <Panel title="Riwayat migration">
-      {state.status === 'loading' && <Loading label="Memuat riwayat migration…" />}
+      {state.status === 'loading' && (
+        <TableSkeleton
+          label="Memuat riwayat migration…"
+          columns={['Version', 'Title', 'Dijalankan oleh', 'Mulai', 'Selesai', 'Status']}
+        />
+      )}
       {state.status === 'failed' && <FailureAlert failure={state.failure} onRetry={() => void reload()} />}
       {state.status === 'ready' &&
         (state.items.length === 0 ? (
@@ -119,7 +124,9 @@ function Drafts({ databaseId }: { databaseId: ID }) {
 
   return (
     <Panel title="Draft migration">
-      {state.status === 'loading' && <Loading label="Memuat draft…" />}
+      {state.status === 'loading' && (
+        <TableSkeleton label="Memuat draft…" columns={['Title', 'Revision', 'Diubah', 'Keadaan']} rows={3} />
+      )}
       {state.status === 'failed' && <FailureAlert failure={state.failure} onRetry={() => void reload()} />}
       {state.status === 'ready' &&
         (state.items.length === 0 ? (

@@ -6,13 +6,13 @@ import type { DatabaseSummary, SchemaSummary } from '../../api/types'
 import { AccessBadge } from '../../components/AccessBadge'
 import { DatabaseGate } from '../../components/DatabaseGate'
 import { EmptyState } from '../../components/EmptyState'
-import { Loading } from '../../components/Loading'
 import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
 import { paths } from '../../lib/paths'
 import { FailureAlert } from '../../components/FailureAlert'
 import { SchemaSidebar, type Selection } from './SchemaSidebar'
 import { TableView, type Tab } from './TableView'
+import { ListSkeleton } from '../../components/Skeleton'
 
 type SchemasState =
   | { status: 'loading' }
@@ -67,7 +67,7 @@ function Viewer({ database }: { database: DatabaseSummary }) {
       <div className="d-flex flex-wrap align-items-center gap-2 mb-3">
         <h2 className="h2 mb-0 me-1 text-break">{database.name}</h2>
         <AccessBadge access={database.access} />
-        <span className="ms-auto d-flex gap-3">
+        <span className="ms-auto d-flex flex-wrap gap-3">
           <Link to={paths.migrations(database.id)}>Riwayat migration</Link>
           <BackLink />
         </span>
@@ -75,7 +75,7 @@ function Viewer({ database }: { database: DatabaseSummary }) {
 
       <div className="viewer-layout">
         <Panel title="Schema" className="mb-0">
-          {schemas.status === 'loading' && <Loading label="Memuat schema…" />}
+          {schemas.status === 'loading' && <ListSkeleton label="Memuat schema…" items={6} heading />}
           {schemas.status === 'failed' && (
             <FailureAlert failure={schemas.failure} onRetry={() => void loadSchemas()} />
           )}
@@ -84,7 +84,7 @@ function Viewer({ database }: { database: DatabaseSummary }) {
           )}
         </Panel>
 
-        <div style={{ minWidth: 0 }}>
+        <div className="viewer-main">
           {selection ? (
             <TableView
               key={`${selection.schema}\u0000${selection.table}`}

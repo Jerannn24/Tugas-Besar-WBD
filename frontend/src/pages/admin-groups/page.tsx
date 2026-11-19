@@ -7,7 +7,6 @@ import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { EmptyState } from '../../components/EmptyState'
 import { FailureAlert } from '../../components/FailureAlert'
 import { LeaveGuard } from '../../components/LeaveGuard'
-import { Loading } from '../../components/Loading'
 import { MutationAlert } from '../../components/MutationAlert'
 import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
@@ -16,6 +15,7 @@ import { describeFailure, type MutationFailure } from '../../lib/mutation'
 import { GrantEditor } from './GrantEditor'
 import { GroupName } from './GroupName'
 import { MemberEditor } from './MemberEditor'
+import { ListSkeleton } from '../../components/Skeleton'
 
 type SectionProps<T> = {
   state: LoadState<T>
@@ -30,7 +30,7 @@ function Section<T>({ state, title, loadingLabel, onRetry, children }: SectionPr
   return (
     <Panel title={title}>
       {state.status === 'loading' ? (
-        <Loading label={loadingLabel} />
+        <ListSkeleton label={loadingLabel} items={4} />
       ) : (
         <FailureAlert failure={state.failure} forbiddenText={ADMIN_FORBIDDEN} onRetry={onRetry} />
       )}
@@ -112,7 +112,7 @@ function Groups() {
       <LeaveGuard when={dirty} message="Anggota atau grant group yang belum disimpan akan hilang." />
       <AccessExplainer />
       {notice && <Alert variant="success">{notice}</Alert>}
-      <div className="admin-layout">
+      <div className="admin-layout admin-layout--list-first">
         <div>
           {selected ? (
             <>

@@ -6,7 +6,6 @@ import { Button } from '../../components/Button'
 import { DataTable, type DataColumn } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { FailureAlert } from '../../components/FailureAlert'
-import { Loading } from '../../components/Loading'
 import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
 import { ADMIN_FORBIDDEN, useLoad } from '../../lib/load'
@@ -14,13 +13,25 @@ import { paths } from '../../lib/paths'
 import { useSession } from '../../lib/session'
 import { CreateUser } from './CreateUser'
 import { EditUser } from './EditUser'
+import { FormSkeleton, TableSkeleton } from '../../components/Skeleton'
 
 function Users() {
   const session = useSession()
   const { state, reload, update } = useLoad(listUsers)
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
-  if (state.status === 'loading') return <Loading label="Memuat daftar user…" />
+  if (state.status === 'loading') {
+    return (
+      <div className="admin-layout">
+        <Panel title="Daftar user">
+          <TableSkeleton label="Memuat daftar user…" columns={['Username', 'Admin', 'Status', 'Aksi']} />
+        </Panel>
+        <Panel title="Buat user">
+          <FormSkeleton label="Memuat form user…" fields={3} />
+        </Panel>
+      </div>
+    )
+  }
   if (state.status === 'failed') {
     return <FailureAlert failure={state.failure} forbiddenText={ADMIN_FORBIDDEN} onRetry={() => void reload()} />
   }

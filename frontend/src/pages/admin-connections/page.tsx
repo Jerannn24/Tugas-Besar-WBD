@@ -9,7 +9,6 @@ import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { DataTable, type DataColumn } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { FailureAlert } from '../../components/FailureAlert'
-import { Loading } from '../../components/Loading'
 import { MutationAlert } from '../../components/MutationAlert'
 import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
@@ -17,6 +16,7 @@ import { ADMIN_FORBIDDEN, useLoad } from '../../lib/load'
 import { paths } from '../../lib/paths'
 import { describeFailure, type MutationFailure } from '../../lib/mutation'
 import { ConnectionForm } from './ConnectionForm'
+import { TableSkeleton } from '../../components/Skeleton'
 
 type TestResult = { status: 'pending' } | { status: 'reachable' } | { status: 'failed'; text: string }
 
@@ -53,7 +53,17 @@ function Connections() {
   const [failure, setFailure] = useState<MutationFailure | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
 
-  if (state.status === 'loading') return <Loading label="Memuat daftar connection…" />
+  if (state.status === 'loading') {
+    return (
+      <Panel title="Connection database target">
+        <TableSkeleton
+          label="Memuat daftar connection…"
+          columns={['Nama', 'Host:port', 'Database', 'Username', 'SSL', 'Eksekusi', 'Test', 'Aksi']}
+          rows={3}
+        />
+      </Panel>
+    )
+  }
   if (state.status === 'failed') {
     return <FailureAlert failure={state.failure} forbiddenText={ADMIN_FORBIDDEN} onRetry={() => void reload()} />
   }
