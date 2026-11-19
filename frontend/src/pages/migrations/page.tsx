@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router'
 import type { ApiFailure, ApiResult } from '../../api/client'
-import { listDrafts, listMigrations } from '../../api/endpoints'
-import type { DatabaseSummary, Draft, Execution, ID, List } from '../../api/types'
+import { listDrafts } from '../../api/endpoints'
+import type { DatabaseSummary, Draft, ID, List } from '../../api/types'
 import { AccessBadge } from '../../components/AccessBadge'
 import { DatabaseGate } from '../../components/DatabaseGate'
 import { DataTable, type DataColumn } from '../../components/DataTable'
@@ -10,10 +10,10 @@ import { EmptyState } from '../../components/EmptyState'
 import { FailureAlert } from '../../components/FailureAlert'
 import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
-import { StatusBadge } from '../../components/StatusBadge'
 import { formatDateTime } from '../../lib/format'
 import { paths } from '../../lib/paths'
 import { TableSkeleton } from '../../components/Skeleton'
+import { History } from './History'
 
 type ListState<T> =
   | { status: 'loading' }
@@ -48,25 +48,6 @@ function useList<T>(load: () => Promise<ApiResult<List<T>>>) {
   return { state, reload }
 }
 
-function historyColumns(databaseId: ID): DataColumn<Execution>[] {
-  return [
-    {
-      key: 'version',
-      header: 'Version',
-      render: (x) => (
-        <Link to={paths.execution(databaseId, x.id)}>
-          <span className="mono">v{x.version}</span>
-        </Link>
-      ),
-    },
-    { key: 'title', header: 'Title', wrap: true, render: (x) => x.title },
-    { key: 'by', header: 'Dijalankan oleh', render: (x) => x.executed_by.username },
-    { key: 'started', header: 'Mulai', render: (x) => formatDateTime(x.started_at) },
-    { key: 'finished', header: 'Selesai', render: (x) => formatDateTime(x.finished_at) },
-    { key: 'status', header: 'Status', render: (x) => <StatusBadge status={x.status} /> },
-  ]
-}
-
 function draftColumns(databaseId: ID): DataColumn<Draft>[] {
   return [
     {
@@ -88,34 +69,6 @@ function draftColumns(databaseId: ID): DataColumn<Draft>[] {
         ),
     },
   ]
-}
-
-function History({ databaseId }: { databaseId: ID }) {
-  const load = useCallback(() => listMigrations(databaseId), [databaseId])
-  const { state, reload } = useList(load)
-
-  return (
-    <Panel title="Riwayat migration">
-      {state.status === 'loading' && (
-        <TableSkeleton
-          label="Memuat riwayat migration…"
-          columns={['Version', 'Title', 'Dijalankan oleh', 'Mulai', 'Selesai', 'Status']}
-        />
-      )}
-      {state.status === 'failed' && <FailureAlert failure={state.failure} onRetry={() => void reload()} />}
-      {state.status === 'ready' &&
-        (state.items.length === 0 ? (
-          <EmptyState title="Belum ada migration">Belum ada migration yang dijalankan pada database ini.</EmptyState>
-        ) : (
-          <DataTable
-            columns={historyColumns(databaseId)}
-            rows={state.items}
-            rowKey={(x) => x.id}
-            caption="Riwayat migration"
-          />
-        ))}
-    </Panel>
-  )
 }
 
 function Drafts({ databaseId }: { databaseId: ID }) {

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router'
 import type { ApiFailure } from '../../api/client'
 import { getMigration } from '../../api/endpoints'
-import type { DatabaseSummary, Execution, ID } from '../../api/types'
+import type { DatabaseSummary, Execution, HistoryEntry, ID } from '../../api/types'
 import { Button } from '../../components/Button'
 import { FailureAlert } from '../../components/FailureAlert'
 import { Loading } from '../../components/Loading'
@@ -12,7 +12,7 @@ import { ExecutionDetail } from './ExecutionDetail'
 
 type State =
   | { status: 'loading' }
-  | { status: 'ready'; execution: Execution; refreshing: boolean }
+  | { status: 'ready'; execution: Execution | HistoryEntry; refreshing: boolean }
   | { status: 'failed'; failure: ApiFailure }
 
 export function ExecutionView({ database, executionId }: { database: DatabaseSummary; executionId: ID }) {
