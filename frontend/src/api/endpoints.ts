@@ -12,6 +12,7 @@ import type {
   DraftPatchInput,
   ExecuteInput,
   Execution,
+  HistoryEntry,
   Group,
   GroupGrants,
   GroupGrantsInput,
@@ -106,7 +107,7 @@ export const updateDraft = (databaseId: ID, draftId: ID, input: DraftPatchInput)
 export const listMigrations = (databaseId: ID) =>
   request<List<Execution>>('GET', `${db(databaseId)}/migrations`)
 export const getMigration = (databaseId: ID, executionId: ID) =>
-  request<Execution>('GET', `${db(databaseId)}/migrations/${e(executionId)}`)
+  request<Execution | HistoryEntry>('GET', `${db(databaseId)}/migrations/${e(executionId)}`)
 export const executeDraft = (databaseId: ID, draftId: ID, input: ExecuteInput) =>
   request<Execution>('POST', `${db(databaseId)}/drafts/${e(draftId)}/execute`, {
     body: input,

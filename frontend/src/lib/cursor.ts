@@ -9,7 +9,17 @@ export type CursorState<T> =
 
 type Loader<T> = (cursor: string | null) => Promise<ApiResult<CursorPage<T>>>
 
-export function useCursorList<T>(loader: Loader<T>) {
+function appendUnique<T>(items: T[], page: T[], keyOf?: (item: T) => string): T[] {
+  if (!keyOf) return [...items, ...page]
+  const seen = new Set(items.map(keyOf))
+  const fresh = page.filter((x) => !seen.has(keyOf(x)))
+  if (import.meta.env.DEV && fresh.length < page.length) {
+    console.warn('Cursor: item duplikat dibuang', page.filter((x) => seen.has(keyOf(x))).map(keyOf))
+  }
+  return [...items, ...fresh]
+}
+
+export function useCursorList<T>(loader: Loader<T>, keyOf?: (item: T) => string) {
   const [state, setState] = useState<CursorState<T>>({ status: 'loading' })
   const seq = useRef(0)
 
@@ -47,7 +57,7 @@ export function useCursorList<T>(loader: Loader<T>) {
     if (res.ok) {
       setState({
         status: 'ready',
-        items: [...current.items, ...res.data.items],
+        items: appendUnique(current.items, res.data.items, keyOf),
         next: res.data.next_cursor,
         more: false,
         moreFailure: null,
@@ -57,7 +67,7 @@ export function useCursorList<T>(loader: Loader<T>) {
     } else {
       setState({ ...current, more: false, moreFailure: res })
     }
-  }, [state, loader, reload])
+  }, [state, loader, reload, keyOf])
 
   return { state, reload, loadMore }
 }
