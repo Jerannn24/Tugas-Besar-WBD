@@ -1,4 +1,4 @@
-import type { ApiErrorBody } from '../api/types'
+import type { ApiErrorBody, Failure, Success } from '../api/types'
 import type { TransportRequest } from '../api/client'
 
 export function ok(data: unknown, status = 200): Response {
@@ -14,6 +14,22 @@ export function fail(
 ): Response {
   const error: ApiErrorBody = { code, message, field_errors, retryable }
   return json(status, { error })
+}
+
+export function okM2<T>(data: T, status = 200): Response {
+  const body: Success<T> = { success: true, data, error: null }
+  return json(status, body)
+}
+
+export function failM2(
+  status: number,
+  code: string,
+  message: string,
+  field_errors: Record<string, string> = {},
+  retryable = false,
+): Response {
+  const body: Failure = { success: false, data: null, error: { code, message, field_errors, retryable } }
+  return json(status, body)
 }
 
 export function json(status: number, body: unknown): Response {

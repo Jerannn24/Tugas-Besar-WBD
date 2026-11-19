@@ -279,6 +279,15 @@ const notes = table(
   ],
 )
 
+const batchItems = table(
+  'managed',
+  'batch_items',
+  [col('id', 'bigint', false), col('processed', 'boolean', false, 'false'), col('note', 'text')],
+  [{ name: 'batch_items_pkey', kind: 'primary', definition: 'PRIMARY KEY (id)' }],
+  [{ name: 'batch_items_pkey', definition: 'CREATE UNIQUE INDEX batch_items_pkey ON managed.batch_items USING btree (id)', is_unique: true, is_primary: true }],
+  Array.from({ length: 60 }, (_, i) => [String(i + 1), i < 42 ? 'true' : 'false', i === 0 ? 'NULL' : null]),
+)
+
 export const VIEWER: Record<ID, FixtureDatabase> = {
   [TARGETS.demo_main.id]: buildDatabase([customers, orders, events, auditLog, orderItems]),
   [TARGETS.demo_second.id]: buildDatabase([products], ['staging'], {
@@ -286,4 +295,5 @@ export const VIEWER: Record<ID, FixtureDatabase> = {
     failFirstSchemas: true,
   }),
   [TARGETS.demo_readonly.id]: buildDatabase([notes]),
+  [TARGETS.demo_m2.id]: buildDatabase([batchItems]),
 }
