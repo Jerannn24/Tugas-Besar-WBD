@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router'
 import { errorMessage, type ApiFailure, type ApiResult } from '../../api/client'
 import { listDatabases } from '../../api/endpoints'
 import type { DatabaseSummary, List } from '../../api/types'
@@ -7,11 +8,11 @@ import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { DataTable, type DataColumn } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
-import { Layout } from '../../components/Layout'
 import { Loading } from '../../components/Loading'
+import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
-import { mountPage } from '../../lib/mount'
-import { pageUrl } from '../../lib/query'
+import { paths } from '../../lib/paths'
+import { useSession } from '../../lib/session'
 
 type ListState =
   | { status: 'loading' }
@@ -28,8 +29,8 @@ const COLUMNS: DataColumn<DatabaseSummary>[] = [
     header: 'Aksi',
     render: (d) => (
       <div className="d-flex gap-3">
-        <a href={pageUrl('/database/', { id: d.id })}>Schema &amp; data</a>
-        <a href={pageUrl('/migrations/', { database: d.id })}>Migration</a>
+        <Link to={paths.database(d.id)}>Schema &amp; data</Link>
+        <Link to={paths.migrations(d.id)}>Migration</Link>
       </div>
     ),
   },
@@ -73,7 +74,7 @@ function DatabaseList({ isAdmin }: { isAdmin: boolean }) {
     case 'expired':
       return (
         <Alert variant="warning" title="Sesi berakhir">
-          Mengalihkan ke <a href="/login/">halaman login</a>…
+          Mengalihkan ke <Link to={paths.login}>halaman login</Link>…
         </Alert>
       )
     case 'forbidden':
@@ -98,7 +99,7 @@ function DatabaseList({ isAdmin }: { isAdmin: boolean }) {
             isAdmin ? (
               <EmptyState title="Belum ada database untuk akun ini">
                 Admin platform tidak otomatis punya akses database; berikan grant lewat group di{' '}
-                <a href="/admin/groups/">Admin: Groups</a>.
+                <Link to={paths.adminGroups}>Admin: Groups</Link>.
               </EmptyState>
             ) : (
               <EmptyState title="Belum ada database">
@@ -118,8 +119,11 @@ function DatabaseList({ isAdmin }: { isAdmin: boolean }) {
   }
 }
 
-mountPage(
-  <Layout activePage="databases" title="Databases">
-    {(session) => <DatabaseList isAdmin={session.user.is_admin} />}
-  </Layout>,
-)
+export function DatabasesPage() {
+  const session = useSession()
+  return (
+    <Page title="Databases">
+      <DatabaseList isAdmin={session.user.is_admin} />
+    </Page>
+  )
+}

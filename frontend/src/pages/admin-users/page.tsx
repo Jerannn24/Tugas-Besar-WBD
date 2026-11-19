@@ -1,19 +1,22 @@
 import { useState } from 'react'
+import { Link } from 'react-router'
 import { listUsers } from '../../api/endpoints'
-import type { SessionView, User } from '../../api/types'
+import type { User } from '../../api/types'
 import { Button } from '../../components/Button'
 import { DataTable, type DataColumn } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { FailureAlert } from '../../components/FailureAlert'
-import { Layout } from '../../components/Layout'
 import { Loading } from '../../components/Loading'
+import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
 import { ADMIN_FORBIDDEN, useLoad } from '../../lib/load'
-import { mountPage } from '../../lib/mount'
+import { paths } from '../../lib/paths'
+import { useSession } from '../../lib/session'
 import { CreateUser } from './CreateUser'
 import { EditUser } from './EditUser'
 
-function UsersPage({ session }: { session: SessionView }) {
+function Users() {
+  const session = useSession()
   const { state, reload, update } = useLoad(listUsers)
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
@@ -73,7 +76,7 @@ function UsersPage({ session }: { session: SessionView }) {
         )}
         <p className="text-secondary mt-3 mb-0">
           User tidak dapat dihapus; nonaktifkan lewat Edit. Akses database diatur lewat{' '}
-          <a href="/admin/groups/">group</a>.
+          <Link to={paths.adminGroups}>group</Link>.
         </p>
       </Panel>
       <div>
@@ -93,8 +96,10 @@ function UsersPage({ session }: { session: SessionView }) {
   )
 }
 
-mountPage(
-  <Layout activePage="admin-users" title="Admin: Users">
-    {(session) => <UsersPage session={session} />}
-  </Layout>,
-)
+export function UsersPage() {
+  return (
+    <Page title="Admin: Users">
+      <Users />
+    </Page>
+  )
+}

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
+import { Link } from 'react-router'
 import { errorMessage, isErrorCode, type ApiFailure, type ApiResult } from '../../api/client'
 import { getDraft, updateDraft } from '../../api/endpoints'
 import type { DatabaseSummary, Draft, Execution, ID } from '../../api/types'
@@ -6,11 +7,11 @@ import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { FailureAlert } from '../../components/FailureAlert'
+import { LeaveGuard } from '../../components/LeaveGuard'
 import { Loading } from '../../components/Loading'
 import { Panel } from '../../components/Panel'
 import { formatDateTime } from '../../lib/format'
-import { pageUrl } from '../../lib/query'
-import { useBeforeUnload } from '../../lib/unload'
+import { paths } from '../../lib/paths'
 import { validateDraft, type DraftForm } from './draft'
 import { DraftFields } from './DraftFields'
 import { ExecutePanel } from './ExecutePanel'
@@ -98,7 +99,7 @@ export function DraftEditor({ database, draftId }: Props) {
 
   const saved = load.status === 'ready' ? load.saved : null
   const dirty = saved !== null && (form.title !== saved.title || form.sql !== saved.sql)
-  useBeforeUnload(dirty || exec.state.phase === 'posting')
+  const guardLeave = dirty || exec.state.phase === 'posting'
 
   async function handleSave(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -158,10 +159,11 @@ export function DraftEditor({ database, draftId }: Props) {
 
   const draft = load.saved
   const applied = draft.applied_execution_id !== null
-  const historyUrl = pageUrl('/migrations/', { database: database.id })
+  const historyUrl = paths.migrations(database.id)
 
   return (
     <>
+      <LeaveGuard when={guardLeave} />
       <Panel
         title={applied ? 'Draft (applied, read-only)' : 'Edit draft'}
         actions={
@@ -195,9 +197,7 @@ export function DraftEditor({ database, draftId }: Props) {
             <Alert variant="info" title="Draft sudah applied">
               Draft ini sudah berhasil dijalankan dan tidak dapat diubah.{' '}
               {draft.applied_execution_id && (
-                <a href={pageUrl('/migration/', { database: database.id, execution: draft.applied_execution_id })}>
-                  Lihat execution
-                </a>
+                <Link to={paths.execution(database.id, draft.applied_execution_id)}>Lihat execution</Link>
               )}
             </Alert>
             <dl className="detail-list">
@@ -222,7 +222,7 @@ export function DraftEditor({ database, draftId }: Props) {
           </form>
         )}
         <p className="mt-3 mb-0">
-          <a href={historyUrl}>Kembali ke riwayat migration</a>
+          <Link to={historyUrl}>Kembali ke riwayat migration</Link>
         </p>
       </Panel>
 

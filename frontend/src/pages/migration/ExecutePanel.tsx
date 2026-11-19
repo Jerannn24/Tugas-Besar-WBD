@@ -1,10 +1,11 @@
+import { Link } from 'react-router'
 import { errorMessage, isCsrfError, type ApiFailure } from '../../api/client'
 import type { DatabaseSummary, Draft, Execution } from '../../api/types'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { Loading } from '../../components/Loading'
-import { pageUrl } from '../../lib/query'
+import { paths } from '../../lib/paths'
 import type { useExecute } from './execute'
 import { ExecutionDetail } from './ExecutionDetail'
 
@@ -18,8 +19,8 @@ type Props = {
 export function ExecutePanel({ database, draft, exec, blockedReason }: Props) {
   const { state } = exec
   const applied = draft.applied_execution_id !== null
-  const historyUrl = pageUrl('/migrations/', { database: database.id })
-  const detailUrl = (x: Execution) => pageUrl('/migration/', { database: database.id, execution: x.id })
+  const historyUrl = paths.migrations(database.id)
+  const detailUrl = (x: Execution) => paths.execution(database.id, x.id)
 
   const inFlight = state.phase === 'posting' || state.phase === 'polling'
   const unresolved = state.phase === 'waiting' || state.phase === 'uncertain'
@@ -119,7 +120,7 @@ function Result({ state, historyUrl, detailUrl, onRecheck, onCheckStatus }: Resu
             <Button variant="outline-secondary" pending={state.checking} onClick={onCheckStatus}>
               Cek status
             </Button>
-            <a href={detailUrl(state.execution)}>Lihat detail execution</a>
+            <Link to={detailUrl(state.execution)}>Lihat detail execution</Link>
           </div>
         </>
       )
@@ -136,7 +137,7 @@ function Result({ state, historyUrl, detailUrl, onRecheck, onCheckStatus }: Resu
             </Alert>
           )}
           <ExecutionDetail execution={state.execution} showSql={false} />
-          <a href={detailUrl(state.execution)}>Lihat detail execution</a>
+          <Link to={detailUrl(state.execution)}>Lihat detail execution</Link>
         </>
       )
     case 'uncertain':
@@ -189,7 +190,7 @@ function Rejected({ failure, historyUrl }: { failure: ApiFailure; historyUrl: st
       return (
         <Alert variant="warning" title={code === 'ALREADY_APPLIED' ? 'Draft sudah applied' : 'Permintaan bentrok'}>
           <p className="mb-2">{message}</p>
-          <a href={historyUrl}>Lihat riwayat migration</a>
+          <Link to={historyUrl}>Lihat riwayat migration</Link>
         </Alert>
       )
     case 'VERSION_CONFLICT':

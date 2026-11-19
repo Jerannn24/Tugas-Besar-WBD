@@ -1,20 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link, useParams } from 'react-router'
 import type { ApiFailure, ApiResult } from '../../api/client'
 import { listDrafts, listMigrations } from '../../api/endpoints'
 import type { DatabaseSummary, Draft, Execution, ID, List } from '../../api/types'
 import { AccessBadge } from '../../components/AccessBadge'
-import { Alert } from '../../components/Alert'
 import { DatabaseGate } from '../../components/DatabaseGate'
 import { DataTable, type DataColumn } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { FailureAlert } from '../../components/FailureAlert'
-import { Layout } from '../../components/Layout'
 import { Loading } from '../../components/Loading'
+import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
 import { StatusBadge } from '../../components/StatusBadge'
 import { formatDateTime } from '../../lib/format'
-import { mountPage } from '../../lib/mount'
-import { getQueryParam, pageUrl } from '../../lib/query'
+import { paths } from '../../lib/paths'
 
 type ListState<T> =
   | { status: 'loading' }
@@ -55,9 +54,9 @@ function historyColumns(databaseId: ID): DataColumn<Execution>[] {
       key: 'version',
       header: 'Version',
       render: (x) => (
-        <a href={pageUrl('/migration/', { database: databaseId, execution: x.id })}>
+        <Link to={paths.execution(databaseId, x.id)}>
           <span className="mono">v{x.version}</span>
-        </a>
+        </Link>
       ),
     },
     { key: 'title', header: 'Title', wrap: true, render: (x) => x.title },
@@ -74,7 +73,7 @@ function draftColumns(databaseId: ID): DataColumn<Draft>[] {
       key: 'title',
       header: 'Title',
       wrap: true,
-      render: (d) => <a href={pageUrl('/migration/', { database: databaseId, draft: d.id })}>{d.title}</a>,
+      render: (d) => <Link to={paths.draft(databaseId, d.id)}>{d.title}</Link>,
     },
     { key: 'revision', header: 'Revision', render: (d) => d.revision },
     { key: 'updated', header: 'Diubah', render: (d) => formatDateTime(d.updated_at) },
@@ -132,7 +131,7 @@ function Drafts({ databaseId }: { databaseId: ID }) {
   )
 }
 
-function MigrationsPage({ database }: { database: DatabaseSummary }) {
+function DatabaseMigrations({ database }: { database: DatabaseSummary }) {
   const canEdit = database.access === 'edit'
   return (
     <>
@@ -140,12 +139,12 @@ function MigrationsPage({ database }: { database: DatabaseSummary }) {
         <h2 className="h2 mb-0 me-1 text-break">{database.name}</h2>
         <AccessBadge access={database.access} />
         <span className="ms-auto d-flex flex-wrap align-items-center gap-3">
-          <a href={pageUrl('/database/', { id: database.id })}>Schema &amp; data</a>
-          <a href="/databases/">Kembali ke daftar database</a>
+          <Link to={paths.database(database.id)}>Schema &amp; data</Link>
+          <Link to={paths.databases}>Kembali ke daftar database</Link>
           {canEdit && (
-            <a className="btn btn-primary" href={pageUrl('/migration/', { database: database.id })}>
+            <Link className="btn btn-primary" to={paths.newDraft(database.id)}>
               Migration baru
-            </a>
+            </Link>
           )}
         </span>
       </div>
@@ -155,23 +154,13 @@ function MigrationsPage({ database }: { database: DatabaseSummary }) {
   )
 }
 
-function MigrationsRoute() {
-  const databaseId = getQueryParam('database')
-  if (databaseId === null) {
-    return (
-      <Alert variant="warning" title="Database belum dipilih">
-        <p className="mb-2">
-          Parameter <code>database</code> tidak ada di alamat halaman.
-        </p>
-        <a href="/databases/">Kembali ke daftar database</a>
-      </Alert>
-    )
-  }
-  return <DatabaseGate databaseId={databaseId}>{(database) => <MigrationsPage database={database} />}</DatabaseGate>
+export function MigrationsPage() {
+  const { databaseId = '' } = useParams()
+  return (
+    <Page title="Migrations">
+      <DatabaseGate key={databaseId} databaseId={databaseId}>
+        {(database) => <DatabaseMigrations database={database} />}
+      </DatabaseGate>
+    </Page>
+  )
 }
-
-mountPage(
-  <Layout activePage="migrations" title="Migrations">
-    <MigrationsRoute />
-  </Layout>,
-)

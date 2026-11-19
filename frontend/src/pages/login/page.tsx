@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
+import { useNavigate, useSearchParams } from 'react-router'
 import { errorMessage, isCsrfError, refreshCsrfToken, type ApiFailure } from '../../api/client'
 import { getSession, login } from '../../api/endpoints'
 import { Alert } from '../../components/Alert'
@@ -7,18 +8,18 @@ import { FormField } from '../../components/FormField'
 import { Loading } from '../../components/Loading'
 import { Panel } from '../../components/Panel'
 import { APP_NAME, SESSION_ENDED_PARAM, SESSION_ENDED_VALUE } from '../../lib/app'
-import { mountPage } from '../../lib/mount'
-import { getQueryParam } from '../../lib/query'
+import { paths } from '../../lib/paths'
 
 type Feedback =
   | { variant: 'danger' | 'warning'; title: string; message: string }
   | null
 
-const sessionEnded = getQueryParam(SESSION_ENDED_PARAM) === SESSION_ENDED_VALUE
-
 type CsrfState = { status: 'loading' } | { status: 'ready' } | { status: 'error'; failure: ApiFailure }
 
-function LoginPage() {
+export function LoginPage() {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const sessionEnded = searchParams.get(SESSION_ENDED_PARAM) === SESSION_ENDED_VALUE
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [pending, setPending] = useState(false)
@@ -38,7 +39,7 @@ function LoginPage() {
     getSession({ redirectOn401: false }).then((res) => {
       if (!active) return
       if (res.ok) {
-        window.location.assign('/databases/')
+        navigate(paths.databases, { replace: true })
         return
       }
       setCheckingSession(false)
@@ -47,6 +48,10 @@ function LoginPage() {
     return () => {
       active = false
     }
+  }, [navigate])
+
+  useEffect(() => {
+    document.title = `Login - ${APP_NAME}`
   }, [])
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -58,7 +63,8 @@ function LoginPage() {
 
     const res = await login({ username, password })
     if (res.ok) {
-      window.location.assign('/databases/')
+      setPassword('')
+      navigate(paths.databases, { replace: true })
       return
     }
 
@@ -151,5 +157,3 @@ function LoginPage() {
     </main>
   )
 }
-
-mountPage(<LoginPage />)

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from 'react-router'
 import { errorMessage } from '../../api/client'
 import { deleteConnection, listConnections, testConnection } from '../../api/endpoints'
 import type { ConnectionSummary, ID } from '../../api/types'
@@ -8,12 +9,12 @@ import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { DataTable, type DataColumn } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { FailureAlert } from '../../components/FailureAlert'
-import { Layout } from '../../components/Layout'
 import { Loading } from '../../components/Loading'
 import { MutationAlert } from '../../components/MutationAlert'
+import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
 import { ADMIN_FORBIDDEN, useLoad } from '../../lib/load'
-import { mountPage } from '../../lib/mount'
+import { paths } from '../../lib/paths'
 import { describeFailure, type MutationFailure } from '../../lib/mutation'
 import { ConnectionForm } from './ConnectionForm'
 
@@ -43,7 +44,7 @@ function ExecutionStatus({ connection: c }: { connection: ConnectionSummary }) {
   )
 }
 
-function ConnectionsPage() {
+function Connections() {
   const { state, reload, update } = useLoad(listConnections)
   const [editingId, setEditingId] = useState<ID | null>(null)
   const [tests, setTests] = useState<Record<ID, TestResult>>({})
@@ -138,7 +139,7 @@ function ConnectionsPage() {
         )}
         <p className="text-secondary mt-3 mb-0">
           Akses user ke database diatur lewat grant di{' '}
-          <a href="/admin/groups/">Admin: Groups</a>.
+          <Link to={paths.adminGroups}>Admin: Groups</Link>.
         </p>
       </Panel>
       {editing ? (
@@ -173,8 +174,10 @@ function ConnectionsPage() {
   )
 }
 
-mountPage(
-  <Layout activePage="admin-connections" title="Admin: Connections">
-    <ConnectionsPage />
-  </Layout>,
-)
+export function ConnectionsPage() {
+  return (
+    <Page title="Admin: Connections">
+      <Connections />
+    </Page>
+  )
+}

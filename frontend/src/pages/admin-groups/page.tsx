@@ -6,14 +6,13 @@ import { Button } from '../../components/Button'
 import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { EmptyState } from '../../components/EmptyState'
 import { FailureAlert } from '../../components/FailureAlert'
-import { Layout } from '../../components/Layout'
+import { LeaveGuard } from '../../components/LeaveGuard'
 import { Loading } from '../../components/Loading'
 import { MutationAlert } from '../../components/MutationAlert'
+import { Page } from '../../components/Page'
 import { Panel } from '../../components/Panel'
 import { ADMIN_FORBIDDEN, useLoad, type LoadState } from '../../lib/load'
-import { mountPage } from '../../lib/mount'
 import { describeFailure, type MutationFailure } from '../../lib/mutation'
-import { useBeforeUnload } from '../../lib/unload'
 import { GrantEditor } from './GrantEditor'
 import { GroupName } from './GroupName'
 import { MemberEditor } from './MemberEditor'
@@ -53,7 +52,7 @@ function AccessExplainer() {
   )
 }
 
-function GroupsPage() {
+function Groups() {
   const groupsLoad = useLoad(listGroups)
   const usersLoad = useLoad(listUsers)
   const connectionsLoad = useLoad(listConnections)
@@ -68,7 +67,6 @@ function GroupsPage() {
   const [notice, setNotice] = useState<string | null>(null)
 
   const dirty = memberDirty || grantDirty
-  useBeforeUnload(dirty)
   const onMemberDirty = useCallback((d: boolean) => setMemberDirty(d), [])
   const onGrantDirty = useCallback((d: boolean) => setGrantDirty(d), [])
 
@@ -111,6 +109,7 @@ function GroupsPage() {
 
   return (
     <>
+      <LeaveGuard when={dirty} message="Anggota atau grant group yang belum disimpan akan hilang." />
       <AccessExplainer />
       {notice && <Alert variant="success">{notice}</Alert>}
       <div className="admin-layout">
@@ -250,8 +249,10 @@ function GroupsPage() {
   )
 }
 
-mountPage(
-  <Layout activePage="admin-groups" title="Admin: Groups">
-    <GroupsPage />
-  </Layout>,
-)
+export function GroupsPage() {
+  return (
+    <Page title="Admin: Groups">
+      <Groups />
+    </Page>
+  )
+}

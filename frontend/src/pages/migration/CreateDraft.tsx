@@ -1,12 +1,13 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
+import { useNavigate } from 'react-router'
 import { errorMessage } from '../../api/client'
 import { createDraft } from '../../api/endpoints'
 import type { DatabaseSummary } from '../../api/types'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
+import { LeaveGuard } from '../../components/LeaveGuard'
 import { Panel } from '../../components/Panel'
-import { pageUrl } from '../../lib/query'
-import { assignWithoutWarning, useBeforeUnload } from '../../lib/unload'
+import { paths } from '../../lib/paths'
 import { validateDraft, type DraftForm } from './draft'
 import { DraftFields } from './DraftFields'
 
@@ -15,9 +16,14 @@ export function CreateDraft({ database }: { database: DatabaseSummary }) {
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [message, setMessage] = useState<{ title: string; text: string } | null>(null)
   const [pending, setPending] = useState(false)
+  const [createdId, setCreatedId] = useState<string | null>(null)
+  const navigate = useNavigate()
 
   const dirty = form.title !== '' || form.sql !== ''
-  useBeforeUnload(dirty)
+
+  useEffect(() => {
+    if (createdId !== null) navigate(paths.draft(database.id, createdId), { replace: true })
+  }, [createdId, database.id, navigate])
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -30,17 +36,18 @@ export function CreateDraft({ database }: { database: DatabaseSummary }) {
     setPending(true)
     const res = await createDraft(database.id, { title: form.title.trim(), sql: form.sql })
     if (res.ok) {
-      assignWithoutWarning(pageUrl('/migration/', { database: database.id, draft: res.data.id }))
+      setCreatedId(res.data.id)
       return
     }
     setPending(false)
-    if (res.kind === 'http' && res.status === 401) return // client mengalihkan ke /login/
+    if (res.kind === 'http' && res.status === 401) return // client mengalihkan ke /login
     if (res.kind === 'http' && res.error.code === 'VALIDATION_FAILED') setErrors(res.error.field_errors)
     setMessage({ title: res.kind === 'http' && res.status === 403 ? 'Akses ditolak' : 'Draft gagal disimpan', text: errorMessage(res) })
   }
 
   return (
     <Panel title="Migration baru">
+      <LeaveGuard when={dirty && createdId === null} />
       <form method="post" noValidate onSubmit={handleSubmit}>
         {message && (
           <Alert variant="danger" title={message.title}>
