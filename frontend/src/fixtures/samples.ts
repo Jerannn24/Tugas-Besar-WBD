@@ -186,9 +186,13 @@ export const P = {
   multiLeader: '00000104-0000-4000-8000-000000000104',
   queueDown: '00000105-0000-4000-8000-000000000105',
   rejected: '00000106-0000-4000-8000-000000000106',
+  leaderChanged: '00000107-0000-4000-8000-000000000107',
+  dropOnce: '00000108-0000-4000-8000-000000000108',
 } as const
 
 export const QUEUE_DOWN_ONCE: ID[] = [P.queueDown]
+export const LEADER_SWAP_ONCE: ID[] = [P.leaderChanged]
+export const RESPONSE_DROP_ONCE: ID[] = [P.dropOnce]
 
 const statusUrl = (jobId: ID) => `/api/databases/${M2_DB}/jobs/${jobId}`
 
@@ -482,6 +486,14 @@ export function seedProposals(): Proposal[] {
       allowed_actions: ['enqueue'],
     }),
     proposal(P.rejected, MIG_REJECTED, 'draft', { validation: null, allowed_actions: ['submit_review'] }),
+    proposal(P.leaderChanged, MIG_A, 'pending_review', {
+      approvals: [pending(GROUP_MAIN, OPERATOR.id)],
+      allowed_actions: ['approve'],
+    }),
+    proposal(P.dropOnce, MIG_A, 'approved', {
+      approvals: [approved(GROUP_MAIN, OPERATOR.id)],
+      allowed_actions: ['enqueue'],
+    }),
   ]
 
   const fromJobs = seedJobs().map((j) =>

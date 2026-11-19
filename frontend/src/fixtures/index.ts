@@ -68,7 +68,12 @@ function databaseRequest(req: TransportRequest, databaseId: string, rest: string
 const DOMAIN_RESOURCES = new Set(['proposals', 'jobs', 'attempts'])
 const knownDatabases = () => new Set(Object.values(DATABASES_BY_USER).flat().map((d) => d.id))
 
-function domainRequest(req: TransportRequest, username: string, databaseId: ID, parts: string[]): Response | null {
+function domainRequest(
+  req: TransportRequest,
+  username: string,
+  databaseId: ID,
+  parts: string[],
+): Response | typeof NETWORK_DROP | null {
   const [resource, id, action, ...extra] = parts
   const ownsAll = databaseId === TARGETS.demo_m2.id
   if (!DOMAIN_RESOURCES.has(resource) && !(ownsAll && (resource === 'drafts' || resource === 'migrations'))) return null
@@ -95,7 +100,7 @@ function domainRequest(req: TransportRequest, username: string, databaseId: ID, 
     historyRoute(key, ctx) ??
     failM2(404, 'NOT_FOUND', `Fixture belum tersedia untuk ${req.method} ${req.path}.`)
   save(state)
-  return result
+  return ctx.dropResponse ? NETWORK_DROP : result
 }
 
 const VIEWER_ROUTE = /^\/api\/databases\/([^/]+)\/(schemas|table|rows)$/

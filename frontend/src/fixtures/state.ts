@@ -2,7 +2,9 @@ import type { TransportRequest } from '../api/client'
 import type { AccessLevel, Actor, Draft, ID, JobView, Proposal } from '../api/types'
 import { failM2 } from './http'
 import {
+  LEADER_SWAP_ONCE,
   QUEUE_DOWN_ONCE,
+  RESPONSE_DROP_ONCE,
   seedAttempts,
   seedDrafts,
   seedJobs,
@@ -19,6 +21,8 @@ export type State = {
   attempts: AttemptRecord[]
   requests: Record<string, RequestRecord>
   queue_down: ID[]
+  leader_swap: ID[]
+  response_drop: ID[]
   seq: number
   next_version: number
 }
@@ -30,11 +34,12 @@ export type Ctx = {
   access: AccessLevel
   databaseId: ID
   id: ID | undefined
+  dropResponse?: boolean
 }
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-const STORAGE_KEY = 'fixture_m2_v1'
+const STORAGE_KEY = 'fixture_m2_v2'
 
 let memory: State | null = null
 
@@ -46,6 +51,8 @@ function seed(): State {
     attempts: seedAttempts(),
     requests: {},
     queue_down: [...QUEUE_DOWN_ONCE],
+    leader_swap: [...LEADER_SWAP_ONCE],
+    response_drop: [...RESPONSE_DROP_ONCE],
     seq: 0,
     next_version: 8,
   }

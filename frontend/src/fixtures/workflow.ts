@@ -11,6 +11,7 @@ import type {
   Proposal,
   Validation,
 } from '../api/types'
+import { USERS } from './data'
 import { failM2, okM2, parseBody } from './http'
 import { acceptedView } from './jobs'
 import { listResponse } from './paging'
@@ -231,6 +232,11 @@ function approve(c: Ctx): Response {
   if (!anchor) {
     return failM2(422, 'VALIDATION_FAILED', 'Group bukan approver wajib proposal ini.', { group_id: 'Group tidak wajib.' })
   }
+  const swap = c.state.leader_swap.indexOf(p.proposal_id)
+  if (swap >= 0) {
+    c.state.leader_swap.splice(swap, 1)
+    anchor.leader_user_id = c.actor.id === USERS.demo_editor.id ? USERS.operator.id : USERS.demo_editor.id
+  }
   if (anchor.leader_user_id !== c.actor.id) {
     return failM2(403, 'LEADER_REQUIRED', 'Hanya leader group ini yang dapat menyetujui.')
   }
@@ -309,6 +315,11 @@ function enqueue(c: Ctx): Response {
   c.state.jobs.push(job)
   c.state.requests[requestId] = { proposal_id: p.proposal_id, revision, job_id: jobId }
   p.status = 'queued'
+  const drop = c.state.response_drop.indexOf(p.proposal_id)
+  if (drop >= 0) {
+    c.state.response_drop.splice(drop, 1)
+    c.dropResponse = true
+  }
   return okM2(acceptedView(job), 202)
 }
 
