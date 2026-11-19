@@ -28,3 +28,7 @@ function Badge({ entry, raw }: { entry: [string, Tone] | undefined; raw: string 
 
 export const ProposalBadge = ({ status }: { status: ProposalStatus }) => <Badge entry={PROPOSAL[status]} raw={status} />
 export const JobBadge = ({ status }: { status: JobStatus }) => <Badge entry={JOB[status]} raw={status} />
+
+export const AttemptBadge = ({ status }: { status: string }) => (
+  <Badge entry={(JOB as Record<string, [string, Tone]>)[status]} raw={status} />
+)
