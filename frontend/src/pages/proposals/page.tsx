@@ -20,6 +20,7 @@ function Frame({ title, children }: { title: string; children: (database: Databa
               <AccessBadge access={database.access} />
               <span className="ms-auto d-flex flex-wrap align-items-center gap-3">
                 <Link to={paths.proposals(database.id)}>Semua proposal</Link>
+                <Link to={paths.jobs(database.id)}>Job</Link>
                 <Link to={paths.migrations(database.id)}>Riwayat migration</Link>
               </span>
             </div>

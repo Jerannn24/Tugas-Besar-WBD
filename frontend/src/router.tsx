@@ -56,6 +56,14 @@ export const router = createBrowserRouter([
             lazy: () => page.proposals().then((m) => ({ Component: m.ProposalPage })),
           },
           {
+            path: 'databases/:databaseId/jobs',
+            lazy: () => page.jobs().then((m) => ({ Component: m.JobsPage })),
+          },
+          {
+            path: 'databases/:databaseId/attempts',
+            lazy: () => page.jobs().then((m) => ({ Component: m.AttemptsPage })),
+          },
+          {
             path: 'databases/:databaseId/jobs/:jobId',
             lazy: () => page.jobs().then((m) => ({ Component: m.JobPage })),
           },

@@ -148,6 +148,7 @@ function DatabaseMigrations({ database }: { database: DatabaseSummary }) {
         <span className="ms-auto d-flex flex-wrap align-items-center gap-3">
           <Link to={paths.database(database.id)}>Schema &amp; data</Link>
           <Link to={paths.proposals(database.id)}>Proposal</Link>
+          <Link to={paths.jobs(database.id)}>Job</Link>
           <Link to={paths.databases}>Kembali ke daftar database</Link>
           {canEdit && (
             <Link className="btn btn-primary" to={paths.newDraft(database.id)}>
