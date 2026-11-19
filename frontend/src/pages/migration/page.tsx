@@ -15,7 +15,8 @@ function Header({ database }: { database: DatabaseSummary }) {
     <div className="d-flex flex-wrap align-items-center gap-2 mb-3">
       <h2 className="h2 mb-0 me-1 text-break">{database.name}</h2>
       <AccessBadge access={database.access} />
-      <span className="ms-auto">
+      <span className="ms-auto d-flex flex-wrap align-items-center gap-3">
+        <Link to={paths.proposals(database.id)}>Proposal</Link>
         <Link to={paths.migrations(database.id)}>Riwayat migration</Link>
       </span>
     </div>

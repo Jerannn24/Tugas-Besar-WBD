@@ -1,74 +1,75 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { Link } from 'react-router'
 import { errorMessage, isErrorCode, type ApiFailure, type ApiResult } from '../../api/client'
-import { getDraft, updateDraft } from '../../api/endpoints'
-import type { DatabaseSummary, Draft, Execution, ID } from '../../api/types'
+import { getDraft } from '../../api/endpoints'
+import type { DatabaseSummary, Draft, ID } from '../../api/types'
+import { updateMigrationDraft } from '../../api/workflow'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { FailureAlert } from '../../components/FailureAlert'
 import { LeaveGuard } from '../../components/LeaveGuard'
-import { Loading } from '../../components/Loading'
+import { MigrationSpec } from '../../components/MigrationSpec'
 import { Panel } from '../../components/Panel'
+import { FormSkeleton } from '../../components/Skeleton'
+import { WorkflowAlert } from '../../components/WorkflowAlert'
 import { formatDateTime } from '../../lib/format'
 import { paths } from '../../lib/paths'
-import { validateDraft, type DraftForm } from './draft'
+import { EMPTY_FORM, formFromDraft, sameForm, toDraftInput, validateDraft, visibleFields, type DraftForm } from './draft'
 import { DraftFields } from './DraftFields'
-import { ExecutePanel } from './ExecutePanel'
-import { useExecute } from './execute'
+import { ProposePanel } from './ProposePanel'
 
 type LoadState =
   | { status: 'loading' }
   | { status: 'ready'; saved: Draft }
   | { status: 'failed'; failure: ApiFailure }
 
-type SaveMessage = { variant: 'success' | 'danger' | 'warning'; title: string; text: string }
+type Notice = { variant: 'success' | 'warning' | 'danger'; title: string; text: string }
 
 type Props = { database: DatabaseSummary; draftId: ID }
 
 export function DraftEditor({ database, draftId }: Props) {
   const [load, setLoad] = useState<LoadState>({ status: 'loading' })
-  const [form, setForm] = useState<DraftForm>({ title: '', sql: '' })
+  const [form, setForm] = useState<DraftForm>(EMPTY_FORM)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
-  const [saveMessage, setSaveMessage] = useState<SaveMessage | null>(null)
+  const [notice, setNotice] = useState<Notice | null>(null)
+  const [saveFailure, setSaveFailure] = useState<ApiFailure | null>(null)
   const [conflict, setConflict] = useState(false)
   const [confirmReload, setConfirmReload] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const seq = useRef(0)
 
-  const applyDraft = useCallback(
-    (mode: 'initial' | 'refresh', res: ApiResult<Draft>, notice: SaveMessage | null) => {
-      setRefreshing(false)
-      if (res.ok) {
-        setLoad({ status: 'ready', saved: res.data })
-        setForm({ title: res.data.title, sql: res.data.sql })
-        setErrors({})
-        setConflict(false)
-        setSaveMessage(notice)
-      } else if (mode === 'initial') {
-        setLoad({ status: 'failed', failure: res })
-      } else {
-        setSaveMessage({ variant: 'danger', title: 'Gagal memuat ulang draft', text: errorMessage(res) })
-      }
-    },
-    [],
-  )
+  const applyDraft = useCallback((mode: 'initial' | 'refresh', res: ApiResult<Draft>, next: Notice | null) => {
+    setRefreshing(false)
+    if (res.ok) {
+      setLoad({ status: 'ready', saved: res.data })
+      setForm(formFromDraft(res.data))
+      setErrors({})
+      setSaveFailure(null)
+      setConflict(false)
+      setNotice(next)
+    } else if (mode === 'initial') {
+      setLoad({ status: 'failed', failure: res })
+    } else {
+      setNotice({ variant: 'danger', title: 'Gagal memuat ulang draft', text: errorMessage(res) })
+    }
+  }, [])
 
   const requestDraft = useCallback(
-    async (mode: 'initial' | 'refresh', notice: SaveMessage | null) => {
+    async (mode: 'initial' | 'refresh', next: Notice | null) => {
       const mine = ++seq.current
       const res = await getDraft(database.id, draftId)
-      if (mine === seq.current) applyDraft(mode, res, notice)
+      if (mine === seq.current) applyDraft(mode, res, next)
     },
     [database.id, draftId, applyDraft],
   )
 
   const fetchDraft = useCallback(
-    (mode: 'initial' | 'refresh', notice: SaveMessage | null = null) => {
+    (mode: 'initial' | 'refresh', next: Notice | null = null) => {
       if (mode === 'initial') setLoad({ status: 'loading' })
       else setRefreshing(true)
-      return requestDraft(mode, notice)
+      return requestDraft(mode, next)
     },
     [requestDraft],
   )
@@ -81,63 +82,39 @@ export function DraftEditor({ database, draftId }: Props) {
     }
   }, [requestDraft])
 
-  const onFinal = useCallback(
-    (execution: Execution) => {
-      // Sukses → draft menjadi applied; ambil ulang supaya editor menjadi read-only.
-      if (execution.status === 'succeeded') void fetchDraft('refresh')
-    },
-    [fetchDraft],
-  )
-  const onRejected = useCallback(
-    (failure: ApiFailure) => {
-      if (isErrorCode(failure, 'VERSION_CONFLICT')) setConflict(true)
-      if (isErrorCode(failure, 'ALREADY_APPLIED')) void fetchDraft('refresh')
-    },
-    [fetchDraft],
-  )
-  const exec = useExecute({ databaseId: database.id, draftId, onFinal, onRejected })
-
   const saved = load.status === 'ready' ? load.saved : null
-  const dirty = saved !== null && (form.title !== saved.title || form.sql !== saved.sql)
-  const guardLeave = dirty || exec.state.phase === 'posting'
+  const dirty = saved !== null && !sameForm(form, formFromDraft(saved))
 
   async function handleSave(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!saved || saving || conflict) return
-    setSaveMessage(null)
+    setNotice(null)
+    setSaveFailure(null)
     const local = validateDraft(form)
     setErrors(local)
     if (Object.keys(local).length > 0) return
 
     setSaving(true)
-    const res = await updateDraft(database.id, draftId, {
-      title: form.title.trim(),
-      sql: form.sql,
-      revision: saved.revision,
-    })
+    const mine = ++seq.current
+    const res = await updateMigrationDraft(database.id, draftId, { ...toDraftInput(form), revision: saved.revision })
+    if (mine !== seq.current) return
     setSaving(false)
     if (res.ok) {
       setLoad({ status: 'ready', saved: res.data })
-      setForm({ title: res.data.title, sql: res.data.sql })
-      setSaveMessage({ variant: 'success', title: 'Tersimpan', text: `Draft tersimpan sebagai revision ${res.data.revision}.` })
+      setForm(formFromDraft(res.data))
+      setNotice({ variant: 'success', title: 'Tersimpan', text: `Draft tersimpan sebagai revision ${res.data.revision}.` })
       return
     }
-    if (res.kind === 'http' && res.status === 401) return
     if (isErrorCode(res, 'VERSION_CONFLICT')) {
-      setConflict(true) // teks lokal ga ditimpa
+      setConflict(true) 
       return
     }
     if (isErrorCode(res, 'ALREADY_APPLIED')) {
-      setSaveMessage(null)
       void fetchDraft('refresh', { variant: 'warning', title: 'Draft sudah applied', text: errorMessage(res) })
       return
     }
-    if (res.kind === 'http' && res.error.code === 'VALIDATION_FAILED') setErrors(res.error.field_errors)
-    setSaveMessage({
-      variant: 'danger',
-      title: res.kind === 'http' && res.status === 403 ? 'Akses ditolak' : 'Draft gagal disimpan',
-      text: errorMessage(res),
-    })
+    if (res.kind === 'http') setErrors(res.error.field_errors)
+    setSaveFailure(res)
   }
 
   function requestReload() {
@@ -145,7 +122,13 @@ export function DraftEditor({ database, draftId }: Props) {
     else void fetchDraft('refresh')
   }
 
-  if (load.status === 'loading') return <Loading label="Memuat draft…" />
+  if (load.status === 'loading') {
+    return (
+      <Panel title="Edit draft">
+        <FormSkeleton label="Memuat draft…" fields={4} />
+      </Panel>
+    )
+  }
   if (load.status === 'failed') {
     return (
       <FailureAlert
@@ -159,11 +142,10 @@ export function DraftEditor({ database, draftId }: Props) {
 
   const draft = load.saved
   const applied = draft.applied_execution_id !== null
-  const historyUrl = paths.migrations(database.id)
 
   return (
     <>
-      <LeaveGuard when={guardLeave} />
+      <LeaveGuard when={dirty || saving} />
       <Panel
         title={applied ? 'Draft (applied, read-only)' : 'Edit draft'}
         actions={
@@ -186,11 +168,12 @@ export function DraftEditor({ database, draftId }: Props) {
             </Button>
           </Alert>
         )}
-        {saveMessage && (
-          <Alert variant={saveMessage.variant} title={saveMessage.title}>
-            {saveMessage.text}
+        {notice && (
+          <Alert variant={notice.variant} title={notice.title}>
+            {notice.text}
           </Alert>
         )}
+        <WorkflowAlert failure={saveFailure} title="Draft gagal disimpan" shownFields={visibleFields(form)} />
 
         {applied ? (
           <>
@@ -200,11 +183,17 @@ export function DraftEditor({ database, draftId }: Props) {
                 <Link to={paths.execution(database.id, draft.applied_execution_id)}>Lihat execution</Link>
               )}
             </Alert>
-            <dl className="detail-list">
-              <dt>Title:</dt>
-              <dd>{draft.title}</dd>
-            </dl>
-            <pre className="sql-block">{draft.sql}</pre>
+            <MigrationSpec
+              spec={{
+                title: draft.title,
+                revision: draft.revision,
+                sql_up: draft.sql,
+                sql_down: draft.sql_down ?? null,
+                irreversible_reason: draft.irreversible_reason ?? null,
+                mode: draft.mode ?? 'standard',
+                batch: draft.batch ?? null,
+              }}
+            />
           </>
         ) : (
           <form method="post" noValidate onSubmit={handleSave}>
@@ -222,26 +211,26 @@ export function DraftEditor({ database, draftId }: Props) {
           </form>
         )}
         <p className="mt-3 mb-0">
-          <Link to={historyUrl}>Kembali ke riwayat migration</Link>
+          <Link to={paths.migrations(database.id)}>Kembali ke riwayat migration</Link>
         </p>
       </Panel>
 
-      <ExecutePanel
-        database={database}
-        draft={draft}
-        exec={exec}
-        blockedReason={
-          database.execution_ready === false
-            ? 'Database ini belum dikonfigurasi untuk eksekusi migration. Hubungi admin platform.'
-            : conflict
+      {!applied && (
+        <ProposePanel
+          database={database}
+          draft={draft}
+          onConflict={() => setConflict(true)}
+          blockedReason={
+            conflict
               ? 'Draft berubah di tempat lain; muat versi terbaru dulu.'
               : saving
                 ? 'Sedang menyimpan.'
                 : dirty
                   ? 'Simpan perubahan dulu.'
                   : null
-        }
-      />
+          }
+        />
+      )}
 
       <ConfirmDialog
         open={confirmReload}
