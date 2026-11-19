@@ -1,3 +1,57 @@
+:root {
+  --app-touch-target: 2.5rem;
+  --app-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+.page-title,
+.card-title,
+h1,
+h2 {
+  overflow-wrap: anywhere;
+}
+
+.btn,
+.navbar-toggler,
+.list-group-item-action,
+.navbar .nav-link,
+.nav-tabs .nav-link {
+  min-height: var(--app-touch-target);
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Focus */
+:focus-visible {
+  outline: 3px solid #1d4ed8 !important;
+  outline-offset: 2px !important;
+}
+
+.mono {
+  font-family: var(--app-mono);
+  font-size: 0.8125rem;
+}
+
+/* Navbar */
+
+.app-navbar .navbar-collapse {
+  flex-basis: 100%;
+}
+.app-navbar .navbar-nav .nav-link {
+  display: flex;
+  align-items: center;
+}
+.app-navbar .app-user {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+}
+
+/* Badge */
 
 .null-badge {
   display: inline-block;
@@ -10,7 +64,6 @@
   font-size: 0.85em;
 }
 
-/* Status execution */
 .status-badge {
   display: inline-block;
   padding: 0.2em 0.6em;
@@ -25,13 +78,13 @@
 .status-badge--failed { background: #ffe3e3; color: #a51111; border-color: #ff8787; }
 .status-badge--unknown { background: #fff3bf; color: #6b4e00; border-color: #fcc419; }
 
-/* Blok SQL */
 .sql-block {
   margin: 0;
   padding: 0.75rem;
+  max-width: 100%;
   max-height: 24rem;
   overflow: auto;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  font-family: var(--app-mono);
   font-size: 0.8125rem;
   white-space: pre;
   --tblr-scrollbar-color: var(--tblr-body-color);
@@ -41,10 +94,16 @@
   border-radius: 4px;
 }
 
-.table-scroll {
-  overflow-x: auto;
+.sql-editor {
   max-width: 100%;
+  min-height: 12rem;
+  resize: vertical;
+  font-family: var(--app-mono);
+  font-size: 0.8125rem;
+  white-space: pre;
+  overflow: auto;
 }
+
 .table-scroll td,
 .table-scroll th {
   white-space: nowrap;
@@ -52,68 +111,68 @@
 .table-scroll td.cell-wrap {
   white-space: pre-wrap;
   word-break: break-word;
+  min-width: 12rem;
 }
 
-/* Focus */
-:focus-visible {
-  outline: 3px solid #1d4ed8 !important;
-  outline-offset: 2px !important;
+.cell-value {
+  display: block;
+  max-width: min(28rem, 70vw);
+  max-height: 8rem;
+  overflow: auto;
+  white-space: pre;
+  font-family: var(--app-mono);
+  font-size: 0.8125rem;
 }
+
+.table-tabs.card-header-tabs {
+  flex-wrap: nowrap;
+  align-self: stretch;
+  max-width: 100%;
+  margin: 0 0 calc(-1 * var(--tblr-card-cap-padding-y, 1rem));
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.table-tabs .nav-link {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* Card */
+
+.card-header {
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.card-header .card-actions {
+  margin-left: auto;
+}
+
+/* Dialog */
 
 .confirm-dialog {
   border: 1px solid #dee2e6;
   border-radius: 6px;
   padding: 0;
-  width: min(36rem, 92vw);
+  width: calc(100vw - 2rem);
+  max-width: 36rem;
+  max-height: calc(100vh - 2rem);
+  max-height: calc(100dvh - 2rem);
+  overflow: auto;
 }
 .confirm-dialog::backdrop {
   background: rgba(0, 0, 0, 0.45);
 }
-
-/* Viewer database: sidebar schema/table + panel konten */
-.viewer-layout {
-  display: grid;
-  grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr);
-  gap: 1rem;
-  align-items: start;
-}
-@media (max-width: 768px) {
-  .viewer-layout {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-.viewer-sidebar .list-group-item {
-  overflow-wrap: anywhere;
-}
-.mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
-  font-size: 0.8125rem;
+.confirm-dialog .card-footer {
+  flex-wrap: wrap;
 }
 
-.cell-value {
-  display: block;
-  max-width: 28rem;
-  max-height: 8rem;
-  overflow: auto;
-  white-space: pre;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
-  font-size: 0.8125rem;
-}
-
-/* Editor SQL draft */
-.sql-editor {
-  min-height: 16rem;
-  resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
-  font-size: 0.8125rem;
-  white-space: pre;
-  overflow: auto;
-}
+/* Detail */
 
 .detail-list {
   display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  gap: 0.35rem 1rem;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.15rem 1rem;
   margin: 0 0 1rem;
 }
 .detail-list dt {
@@ -121,21 +180,98 @@
   color: #6c757d;
 }
 .detail-list dd {
-  margin: 0;
+  margin: 0 0 0.5rem;
   overflow-wrap: anywhere;
 }
 
-.admin-layout {
+/* Viewer database */
+
+.viewer-layout {
   display: grid;
-  grid-template-columns: minmax(0, 3fr) minmax(18rem, 2fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
   align-items: start;
 }
-@media (max-width: 992px) {
-  .admin-layout {
-    grid-template-columns: minmax(0, 1fr);
-  }
+.viewer-main {
+  min-width: 0;
+}
+.viewer-sidebar .list-group-item {
+  overflow-wrap: anywhere;
+}
+
+/* Admin */
+
+.admin-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+.admin-layout > * {
+  min-width: 0;
 }
 .admin-layout .list-group-item {
   overflow-wrap: anywhere;
+}
+.admin-layout--list-first > :last-child {
+  order: -1;
+}
+
+/* Skeleton */
+
+.skeleton-table td,
+.skeleton-table th {
+  min-width: 5rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .placeholder-glow .placeholder {
+    animation: none;
+  }
+}
+
+/* Layar ≥ 576px */
+
+@media (min-width: 576px) {
+  .detail-list {
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 0.35rem 1rem;
+  }
+  .detail-list dd {
+    margin: 0;
+  }
+  .sql-editor {
+    min-height: 16rem;
+  }
+}
+
+/* Layar ≥ 768px */
+
+@media (min-width: 768px) {
+  .viewer-layout {
+    grid-template-columns: minmax(12rem, 16rem) minmax(0, 1fr);
+  }
+}
+
+/* Layar ≥ 992px */
+
+@media (min-width: 992px) {
+  .viewer-layout {
+    grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr);
+  }
+  .admin-layout {
+    grid-template-columns: minmax(0, 3fr) minmax(18rem, 2fr);
+  }
+  .admin-layout--list-first > :last-child {
+    order: 0;
+  }
+  .btn-sm {
+    min-height: 0;
+  }
+  .app-navbar .navbar-collapse {
+    flex-basis: auto;
+  }
+  .app-navbar .app-user {
+    padding: 0;
+    margin-left: auto;
+  }
 }

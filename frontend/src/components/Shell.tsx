@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Link, NavLink, Outlet, useNavigate, useNavigation } from 'react-router'
+import { useEffect, useId, useState } from 'react'
+import { Link, NavLink, Outlet, useLocation, useNavigate, useNavigation } from 'react-router'
 import { clearCsrfToken, errorMessage, type ApiFailure } from '../api/client'
 import { getSession, logout } from '../api/endpoints'
 import type { SessionView } from '../api/types'
@@ -42,6 +42,10 @@ export function Shell() {
   const [state, setState] = useState<SessionState>({ status: 'loading' })
   const [logoutPending, setLogoutPending] = useState(false)
   const [logoutError, setLogoutError] = useState<string | null>(null)
+  const { pathname } = useLocation()
+  const [menuOpenAt, setMenuOpenAt] = useState<string | null>(null)
+  const menuOpen = menuOpenAt === pathname
+  const menuId = useId()
 
   useEffect(() => {
     let active = true
@@ -73,33 +77,45 @@ export function Shell() {
 
   return (
     <div className="page">
-      <header className="navbar navbar-expand d-print-none border-bottom">
-        <div className="container-xl flex-wrap gap-2">
+      <header className="navbar navbar-expand-lg d-print-none border-bottom app-navbar">
+        <div className="container-xl">
           <Link className="navbar-brand me-3" to={paths.databases}>
             {APP_NAME}
           </Link>
           {session && (
-            <nav aria-label="Menu utama" className="me-auto">
-              <ul className="navbar-nav flex-wrap">
-                {NAV.filter((n) => !n.admin || session.user.is_admin).map((n) => (
-                  <li key={n.to} className="nav-item">
-                    <NavLink className="nav-link" to={n.to}>
-                      {n.label}
-                    </NavLink>
-                  </li>
-                ))}
-              </ul>
-            </nav>
+            <button
+              type="button"
+              className="navbar-toggler"
+              aria-controls={menuId}
+              aria-expanded={menuOpen}
+              aria-label={menuOpen ? 'Tutup menu' : 'Buka menu'}
+              onClick={() => setMenuOpenAt(menuOpen ? null : pathname)}
+            >
+              <span className="navbar-toggler-icon" aria-hidden="true" />
+            </button>
           )}
           {session && (
-            <div className="d-flex align-items-center gap-2 ms-auto">
-              <span className="text-secondary">
-                Masuk sebagai <strong>{session.user.username}</strong>
-                {session.user.is_admin && <span className="badge bg-blue-lt ms-2">Platform Admin</span>}
-              </span>
-              <Button variant="outline-secondary" pending={logoutPending} onClick={handleLogout}>
-                Logout
-              </Button>
+            <div id={menuId} className={`collapse navbar-collapse${menuOpen ? ' show' : ''}`}>
+              <nav aria-label="Menu utama" className="me-lg-auto">
+                <ul className="navbar-nav">
+                  {NAV.filter((n) => !n.admin || session.user.is_admin).map((n) => (
+                    <li key={n.to} className="nav-item">
+                      <NavLink className="nav-link" to={n.to} onClick={() => setMenuOpenAt(null)}>
+                        {n.label}
+                      </NavLink>
+                    </li>
+                  ))}
+                </ul>
+              </nav>
+              <div className="app-user">
+                <span className="text-secondary">
+                  Masuk sebagai <strong className="text-break">{session.user.username}</strong>
+                  {session.user.is_admin && <span className="badge bg-blue-lt ms-2">Platform Admin</span>}
+                </span>
+                <Button variant="outline-secondary" pending={logoutPending} onClick={handleLogout}>
+                  Logout
+                </Button>
+              </div>
             </div>
           )}
         </div>

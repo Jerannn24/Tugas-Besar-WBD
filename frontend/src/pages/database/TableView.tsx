@@ -5,10 +5,10 @@ import type { Column, Constraint, ID, Index, TableMetadata, TableRows } from '..
 import { Button } from '../../components/Button'
 import { DataTable, type DataColumn } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
-import { Loading } from '../../components/Loading'
 import { NullValue } from '../../components/NullValue'
 import { FailureAlert } from '../../components/FailureAlert'
 import type { Selection } from './SchemaSidebar'
+import { TableSkeleton } from '../../components/Skeleton'
 
 export const PAGE_SIZE = 50
 
@@ -142,7 +142,7 @@ export function TableView({ databaseId, selection, tab, onTabChange }: Props) {
           <span className="text-secondary mx-1">.</span>
           {table}
         </h2>
-        <div className="nav nav-tabs card-header-tabs" role="tablist">
+        <div className="nav nav-tabs card-header-tabs table-tabs" role="tablist">
           {TABS.map((t) => (
             <button
               key={t.id}
@@ -193,7 +193,7 @@ function MetaPanel({
   tab: Exclude<Tab, 'data'>
   onRetry: () => void
 }) {
-  if (meta.status === 'loading') return <Loading label="Memuat metadata table…" />
+  if (meta.status === 'loading') return <TableSkeleton label="Memuat metadata table…" columns={4} />
   if (meta.status === 'failed') {
     return <FailureAlert failure={meta.failure} notFoundTitle="Table tidak ditemukan" onRetry={onRetry} />
   }
@@ -237,7 +237,7 @@ function RowsPanel({
   onPage: (offset: number) => void
   onRetry: () => void
 }) {
-  if (rows.status === 'loading') return <Loading label="Memuat data…" />
+  if (rows.status === 'loading') return <TableSkeleton label="Memuat data…" columns={4} rows={8} />
   if (rows.status === 'failed') {
     return <FailureAlert failure={rows.failure} notFoundTitle="Table tidak ditemukan" onRetry={onRetry} />
   }
