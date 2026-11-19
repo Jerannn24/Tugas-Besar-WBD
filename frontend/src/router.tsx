@@ -1,40 +1,58 @@
 import { Navigate, createBrowserRouter } from 'react-router'
+import { Loading } from './components/Loading'
 import { Shell } from './components/Shell'
-import { ConnectionsPage } from './pages/admin-connections/page'
-import { GroupsPage } from './pages/admin-groups/page'
-import { UsersPage } from './pages/admin-users/page'
-import { DatabasePage } from './pages/database/page'
-import { DatabasesPage } from './pages/databases/page'
-import { LegacyDatabase, LegacyMigration, LegacyMigrations } from './pages/legacy'
-import { LoginPage } from './pages/login/page'
-import { DraftPage, ExecutionPage, NewDraftPage } from './pages/migration/page'
-import { MigrationsPage } from './pages/migrations/page'
-import { MissingPage, RouteErrorPage } from './pages/missing'
 import { paths } from './lib/paths'
+import { RouteErrorPage } from './pages/error'
+
+const page = {
+  login: () => import('./pages/login/page'),
+  databases: () => import('./pages/databases/page'),
+  database: () => import('./pages/database/page'),
+  migrations: () => import('./pages/migrations/page'),
+  migration: () => import('./pages/migration/page'),
+  users: () => import('./pages/admin-users/page'),
+  groups: () => import('./pages/admin-groups/page'),
+  connections: () => import('./pages/admin-connections/page'),
+  legacy: () => import('./pages/legacy'),
+  missing: () => import('./pages/missing'),
+}
 
 export const router = createBrowserRouter([
   {
     errorElement: <RouteErrorPage />,
+    hydrateFallbackElement: <Loading label="Memuat halaman…" />,
     children: [
-      { path: 'login', element: <LoginPage /> },
+      { path: 'login', lazy: () => page.login().then((m) => ({ Component: m.LoginPage })) },
       {
         element: <Shell />,
         children: [
           { index: true, element: <Navigate to={paths.databases} replace /> },
-          { path: 'databases', element: <DatabasesPage /> },
-          { path: 'databases/:databaseId', element: <DatabasePage /> },
-          { path: 'databases/:databaseId/migrations', element: <MigrationsPage /> },
-          { path: 'databases/:databaseId/migrations/:executionId', element: <ExecutionPage /> },
-          { path: 'databases/:databaseId/drafts/new', element: <NewDraftPage /> },
-          { path: 'databases/:databaseId/drafts/:draftId', element: <DraftPage /> },
-          { path: 'admin/users', element: <UsersPage /> },
-          { path: 'admin/groups', element: <GroupsPage /> },
-          { path: 'admin/connections', element: <ConnectionsPage /> },
+          { path: 'databases', lazy: () => page.databases().then((m) => ({ Component: m.DatabasesPage })) },
+          { path: 'databases/:databaseId', lazy: () => page.database().then((m) => ({ Component: m.DatabasePage })) },
+          {
+            path: 'databases/:databaseId/migrations',
+            lazy: () => page.migrations().then((m) => ({ Component: m.MigrationsPage })),
+          },
+          {
+            path: 'databases/:databaseId/migrations/:executionId',
+            lazy: () => page.migration().then((m) => ({ Component: m.ExecutionPage })),
+          },
+          {
+            path: 'databases/:databaseId/drafts/new',
+            lazy: () => page.migration().then((m) => ({ Component: m.NewDraftPage })),
+          },
+          {
+            path: 'databases/:databaseId/drafts/:draftId',
+            lazy: () => page.migration().then((m) => ({ Component: m.DraftPage })),
+          },
+          { path: 'admin/users', lazy: () => page.users().then((m) => ({ Component: m.UsersPage })) },
+          { path: 'admin/groups', lazy: () => page.groups().then((m) => ({ Component: m.GroupsPage })) },
+          { path: 'admin/connections', lazy: () => page.connections().then((m) => ({ Component: m.ConnectionsPage })) },
           
-          { path: 'database', element: <LegacyDatabase /> },
-          { path: 'migrations', element: <LegacyMigrations /> },
-          { path: 'migration', element: <LegacyMigration /> },
-          { path: '*', element: <MissingPage /> },
+          { path: 'database', lazy: () => page.legacy().then((m) => ({ Component: m.LegacyDatabase })) },
+          { path: 'migrations', lazy: () => page.legacy().then((m) => ({ Component: m.LegacyMigrations })) },
+          { path: 'migration', lazy: () => page.legacy().then((m) => ({ Component: m.LegacyMigration })) },
+          { path: '*', lazy: () => page.missing().then((m) => ({ Component: m.MissingPage })) },
         ],
       },
     ],

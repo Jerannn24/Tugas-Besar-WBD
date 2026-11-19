@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, NavLink, Outlet, useNavigate } from 'react-router'
+import { Link, NavLink, Outlet, useNavigate, useNavigation } from 'react-router'
 import { clearCsrfToken, errorMessage, type ApiFailure } from '../api/client'
 import { getSession, logout } from '../api/endpoints'
 import type { SessionView } from '../api/types'
@@ -38,6 +38,7 @@ function hasUser(data: unknown): data is SessionView {
 
 export function Shell() {
   const navigate = useNavigate()
+  const pageLoading = useNavigation().state === 'loading'
   const [state, setState] = useState<SessionState>({ status: 'loading' })
   const [logoutPending, setLogoutPending] = useState(false)
   const [logoutError, setLogoutError] = useState<string | null>(null)
@@ -123,6 +124,7 @@ export function Shell() {
               Server tidak mengirim data user untuk sesi ini, sehingga halaman tidak dapat ditampilkan.
             </Alert>
           )}
+          {session && pageLoading && <Loading label="Memuat halaman…" />}
           {session && (
             <SessionContext.Provider value={session}>
               <Outlet />
