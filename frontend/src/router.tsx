@@ -10,6 +10,8 @@ const page = {
   database: () => import('./pages/database/page'),
   migrations: () => import('./pages/migrations/page'),
   migration: () => import('./pages/migration/page'),
+  proposals: () => import('./pages/proposals/page'),
+  jobs: () => import('./pages/jobs/page'),
   users: () => import('./pages/admin-users/page'),
   groups: () => import('./pages/admin-groups/page'),
   connections: () => import('./pages/admin-connections/page'),
@@ -45,10 +47,21 @@ export const router = createBrowserRouter([
             path: 'databases/:databaseId/drafts/:draftId',
             lazy: () => page.migration().then((m) => ({ Component: m.DraftPage })),
           },
+          {
+            path: 'databases/:databaseId/proposals',
+            lazy: () => page.proposals().then((m) => ({ Component: m.ProposalsPage })),
+          },
+          {
+            path: 'databases/:databaseId/proposals/:proposalId',
+            lazy: () => page.proposals().then((m) => ({ Component: m.ProposalPage })),
+          },
+          {
+            path: 'databases/:databaseId/jobs/:jobId',
+            lazy: () => page.jobs().then((m) => ({ Component: m.JobPage })),
+          },
           { path: 'admin/users', lazy: () => page.users().then((m) => ({ Component: m.UsersPage })) },
           { path: 'admin/groups', lazy: () => page.groups().then((m) => ({ Component: m.GroupsPage })) },
           { path: 'admin/connections', lazy: () => page.connections().then((m) => ({ Component: m.ConnectionsPage })) },
-          
           { path: 'database', lazy: () => page.legacy().then((m) => ({ Component: m.LegacyDatabase })) },
           { path: 'migrations', lazy: () => page.legacy().then((m) => ({ Component: m.LegacyMigrations })) },
           { path: 'migration', lazy: () => page.legacy().then((m) => ({ Component: m.LegacyMigration })) },
