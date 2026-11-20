@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -98,6 +99,51 @@ func createClaimFixture(t *testing.T, db *sql.DB, ownerDB *sql.DB) fixture {
 		proposalID: proposalID,
 		snapshot:   snapshot,
 		hash:       "hash_00000000000000000000000000000001",
+	}
+}
+
+func TestClaimJob_RevalidationRequest(t *testing.T) {
+	platformDB, ownerDB := testDBs(t)
+	svc := New(platformDB)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	source := uuid.NewString()
+	for _, sourceID := range []*string{nil, &source} {
+		f := createClaimFixture(t, platformDB, ownerDB)
+		req := executioncontract.EnqueueRequest{
+			DatabaseID: f.dbID, TargetID: f.targetID, RequestID: uuid.NewString(),
+			ProposalID: f.proposalID, MigrationID: f.draftID, Revision: 1,
+			ActorID: f.actorID, Action: executioncontract.Rollback, Direction: executioncontract.Down,
+			SourceExecutionID: sourceID, Snapshot: f.snapshot, SnapshotHash: f.hash,
+			ApprovalFingerprint: "nonempty-approval-fingerprint",
+		}
+		tx, err := platformDB.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted, err := svc.EnqueueTx(ctx, tx, req)
+		if err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-revalidation"})
+		if err != nil || claim == nil {
+			t.Fatalf("claim: result=%+v error=%v", claim, err)
+		}
+		want := executioncontract.RevalidationRequest{
+			JobID: accepted.JobID, ExecutionID: accepted.ExecutionID, ActorID: req.ActorID,
+			DatabaseID: req.DatabaseID, TargetID: req.TargetID, MigrationID: req.MigrationID,
+			ProposalID: req.ProposalID, Revision: req.Revision, Action: req.Action,
+			Direction: req.Direction, SourceExecutionID: sourceID,
+			SnapshotHash: req.SnapshotHash, ApprovalFingerprint: req.ApprovalFingerprint,
+		}
+		if got := claim.RevalidationRequest(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("revalidation request: got %+v, want %+v", got, want)
+		}
 	}
 }
 

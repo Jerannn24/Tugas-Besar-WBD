@@ -19,22 +19,35 @@ type ClaimRequest struct {
 }
 
 type Claim struct {
-	AttemptID      string                      `json:"attempt_id"`
-	JobID          string                      `json:"job_id"`
-	ExecutionID    string                      `json:"execution_id"`
-	DatabaseID     string                      `json:"database_id"`
-	TargetID       string                      `json:"target_id"`
-	ProposalID     string                      `json:"proposal_id"`
-	MigrationID    string                      `json:"migration_id"`
-	Revision       int                         `json:"revision"`
-	ActorID        string                      `json:"actor_id"`
-	Action         executioncontract.Action    `json:"action"`
-	Direction      executioncontract.Direction `json:"direction"`
-	Mode           executioncontract.Mode      `json:"mode"`
-	AttemptNo      int                         `json:"attempt_no"`
-	ClaimedBy      string                      `json:"claimed_by"`
-	LeaseToken     string                      `json:"lease_token"`
-	LeaseExpiresAt time.Time                   `json:"lease_expires_at"`
+	AttemptID           string                      `json:"attempt_id"`
+	JobID               string                      `json:"job_id"`
+	ExecutionID         string                      `json:"execution_id"`
+	DatabaseID          string                      `json:"database_id"`
+	TargetID            string                      `json:"target_id"`
+	ProposalID          string                      `json:"proposal_id"`
+	MigrationID         string                      `json:"migration_id"`
+	Revision            int                         `json:"revision"`
+	ActorID             string                      `json:"actor_id"`
+	Action              executioncontract.Action    `json:"action"`
+	Direction           executioncontract.Direction `json:"direction"`
+	Mode                executioncontract.Mode      `json:"mode"`
+	SourceExecutionID   *executioncontract.ID       `json:"source_execution_id"`
+	SnapshotHash        string                      `json:"snapshot_hash"`
+	ApprovalFingerprint string                      `json:"approval_fingerprint"`
+	AttemptNo           int                         `json:"attempt_no"`
+	ClaimedBy           string                      `json:"claimed_by"`
+	LeaseToken          string                      `json:"lease_token"`
+	LeaseExpiresAt      time.Time                   `json:"lease_expires_at"`
+}
+
+func (c Claim) RevalidationRequest() executioncontract.RevalidationRequest {
+	return executioncontract.RevalidationRequest{
+		JobID: c.JobID, ExecutionID: c.ExecutionID, ActorID: c.ActorID,
+		DatabaseID: c.DatabaseID, TargetID: c.TargetID, MigrationID: c.MigrationID,
+		ProposalID: c.ProposalID, Revision: c.Revision, Action: c.Action,
+		Direction: c.Direction, SourceExecutionID: c.SourceExecutionID,
+		SnapshotHash: c.SnapshotHash, ApprovalFingerprint: c.ApprovalFingerprint,
+	}
 }
 
 // ClaimJob claims the next available queued job using a short platform transaction
@@ -68,23 +81,27 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 
 	// shortcut: only claims queued jobs without takeover of expired leases, upgrade in recovery/takeover increment
 	var (
-		jobID       string
-		databaseID  string
-		targetID    string
-		proposalID  string
-		migrationID string
-		revision    int
-		executionID string
-		actorID     string
-		action      string
-		direction   string
-		mode        string
-		attemptNo   int
+		jobID               string
+		databaseID          string
+		targetID            string
+		proposalID          string
+		migrationID         string
+		revision            int
+		executionID         string
+		actorID             string
+		action              string
+		direction           string
+		mode                string
+		attemptNo           int
+		sourceExecutionID   *string
+		snapshotHash        string
+		approvalFingerprint sql.NullString
 	)
 
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, database_id, target_id, proposal_id, migration_id, revision,
-		       execution_id, actor_id, action, direction, mode, attempt_no
+		       execution_id, actor_id, action, direction, mode, attempt_no,
+		       source_execution_id::text, snapshot_hash, approval_fingerprint
 		FROM app.jobs
 		WHERE status = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= clock_timestamp())
 		ORDER BY created_at ASC
@@ -93,6 +110,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 	`).Scan(
 		&jobID, &databaseID, &targetID, &proposalID, &migrationID, &revision,
 		&executionID, &actorID, &action, &direction, &mode, &attemptNo,
+		&sourceExecutionID, &snapshotHash, &approvalFingerprint,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -147,21 +165,24 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 	}
 
 	return &Claim{
-		AttemptID:      attemptID,
-		JobID:          jobID,
-		ExecutionID:    executionID,
-		DatabaseID:     databaseID,
-		TargetID:       targetID,
-		ProposalID:     proposalID,
-		MigrationID:    migrationID,
-		Revision:       revision,
-		ActorID:        actorID,
-		Action:         executioncontract.Action(action),
-		Direction:      executioncontract.Direction(direction),
-		Mode:           executioncontract.Mode(mode),
-		AttemptNo:      attemptNo,
-		ClaimedBy:      in.WorkerID,
-		LeaseToken:     leaseToken,
-		LeaseExpiresAt: leaseExpiresAt,
+		AttemptID:           attemptID,
+		JobID:               jobID,
+		ExecutionID:         executionID,
+		DatabaseID:          databaseID,
+		TargetID:            targetID,
+		ProposalID:          proposalID,
+		MigrationID:         migrationID,
+		Revision:            revision,
+		ActorID:             actorID,
+		Action:              executioncontract.Action(action),
+		Direction:           executioncontract.Direction(direction),
+		Mode:                executioncontract.Mode(mode),
+		SourceExecutionID:   sourceExecutionID,
+		SnapshotHash:        snapshotHash,
+		ApprovalFingerprint: approvalFingerprint.String,
+		AttemptNo:           attemptNo,
+		ClaimedBy:           in.WorkerID,
+		LeaseToken:          leaseToken,
+		LeaseExpiresAt:      leaseExpiresAt,
 	}, nil
 }
