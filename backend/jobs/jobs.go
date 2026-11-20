@@ -75,6 +75,18 @@ func (s *Service) EnqueueTx(
 		}
 	}
 
+	// Lock the connection before looking up the request: a missing job row cannot be locked.
+	var boundTarget sql.NullString
+	bindingErr := tx.QueryRowContext(ctx, `
+		SELECT execution_target_id::text
+		FROM app.database_connections
+		WHERE id = $1 AND deleted_at IS NULL
+		FOR UPDATE
+	`, in.DatabaseID).Scan(&boundTarget)
+	if bindingErr != nil && !errors.Is(bindingErr, sql.ErrNoRows) {
+		return executioncontract.EnqueueResult{}, fmt.Errorf("query database binding: %w", bindingErr)
+	}
+
 	var (
 		oldID                  string
 		oldExecutionID         string
@@ -98,7 +110,6 @@ func (s *Service) EnqueueTx(
 		       snapshot_hash, approval_fingerprint, status
 		FROM app.jobs
 		WHERE database_id = $1 AND request_id = $2
-		FOR UPDATE
 	`, in.DatabaseID, in.RequestID).Scan(
 		&oldID, &oldExecutionID, &oldProposalID, &oldDatabaseID, &oldTargetID, &oldActorID,
 		&oldMigrationID, &oldRevision, &oldAction, &oldDirection, &oldSourceExecutionID,
@@ -140,21 +151,11 @@ func (s *Service) EnqueueTx(
 		return executioncontract.EnqueueResult{}, fmt.Errorf("query existing job: %w", err)
 	}
 
-	var boundTarget sql.NullString
-	err = tx.QueryRowContext(ctx, `
-		SELECT execution_target_id::text
-		FROM app.database_connections
-		WHERE id = $1 AND deleted_at IS NULL
-		FOR UPDATE
-	`, in.DatabaseID).Scan(&boundTarget)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(bindingErr, sql.ErrNoRows) {
 		return executioncontract.EnqueueResult{}, executioncontract.ContractError{
 			Code:    "NOT_FOUND",
 			Message: "database not found",
 		}
-	}
-	if err != nil {
-		return executioncontract.EnqueueResult{}, fmt.Errorf("query database binding: %w", err)
 	}
 	if !boundTarget.Valid || boundTarget.String != in.TargetID {
 		return executioncontract.EnqueueResult{}, executioncontract.ContractError{

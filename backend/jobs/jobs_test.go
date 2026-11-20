@@ -267,17 +267,16 @@ func TestEnqueueTx_PersistAndGetJob(t *testing.T) {
 	}
 }
 
-func TestEnqueueTx_IdempotentReplay(t *testing.T) {
+func TestEnqueueTx_ConcurrentRequest(t *testing.T) {
 	platformDB, ownerDB := testDBs(t)
 	f := createFixture(t, platformDB, ownerDB)
 	svc := New(platformDB)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	requestID := uuid.NewString()
 	req := executioncontract.EnqueueRequest{
 		DatabaseID:          f.dbID,
 		TargetID:            f.targetID,
-		RequestID:           requestID,
 		ProposalID:          f.proposalID,
 		MigrationID:         f.draftID,
 		Revision:            1,
@@ -289,38 +288,80 @@ func TestEnqueueTx_IdempotentReplay(t *testing.T) {
 		ApprovalFingerprint: "fingerprint_replay",
 	}
 
-	tx1, err := platformDB.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("begin tx1: %v", err)
-	}
-	res1, err := svc.EnqueueTx(ctx, tx1, req)
-	if err != nil {
-		tx1.Rollback()
-		t.Fatalf("EnqueueTx 1: %v", err)
-	}
-	if err := tx1.Commit(); err != nil {
-		t.Fatalf("commit tx1: %v", err)
-	}
+	for _, conflict := range []bool{false, true} {
+		name := "replay"
+		if conflict {
+			name = "conflict"
+		}
+		t.Run(name, func(t *testing.T) {
+			first := req
+			first.RequestID = uuid.NewString()
+			second := first
+			if conflict {
+				second.ApprovalFingerprint = "changed"
+			}
 
-	tx2, err := platformDB.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("begin tx2: %v", err)
-	}
-	defer tx2.Rollback()
+			tx1, err := platformDB.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx1.Rollback()
+			want, err := svc.EnqueueTx(ctx, tx1, first)
+			if err != nil {
+				t.Fatalf("first enqueue: %v", err)
+			}
+			tx2, err := platformDB.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx2.Rollback()
+			var pid int
+			if err := tx2.QueryRowContext(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
 
-	res2, err := svc.EnqueueTx(ctx, tx2, req)
-	if err != nil {
-		t.Fatalf("EnqueueTx 2 (replay): %v", err)
-	}
-
-	if !res2.Replayed {
-		t.Errorf("res2.Replayed = false, want true")
-	}
-	if res2.JobID != res1.JobID {
-		t.Errorf("res2.JobID = %s, want %s", res2.JobID, res1.JobID)
-	}
-	if res2.ExecutionID != res1.ExecutionID {
-		t.Errorf("res2.ExecutionID = %s, want %s", res2.ExecutionID, res1.ExecutionID)
+			type result struct {
+				job executioncontract.EnqueueResult
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				job, err := svc.EnqueueTx(ctx, tx2, second)
+				done <- result{job, err}
+			}()
+			tick := time.NewTicker(10 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				var blocked bool
+				if err := platformDB.QueryRowContext(ctx, "SELECT cardinality(pg_blocking_pids($1)) > 0", pid).Scan(&blocked); err != nil {
+					t.Fatalf("observe second enqueue waiting: %v", err)
+				}
+				if blocked {
+					break
+				}
+				select {
+				case got := <-done:
+					t.Fatalf("second enqueue finished before first committed: %+v", got)
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				case <-tick.C:
+				}
+			}
+			if err := tx1.Commit(); err != nil {
+				t.Fatalf("commit winner: %v", err)
+			}
+			got := <-done
+			if conflict {
+				if !errors.Is(got.err, executioncontract.ErrRequestConflict) {
+					t.Fatalf("second enqueue: got %v, want REQUEST_CONFLICT", got.err)
+				}
+			} else if got.err != nil || !got.job.Replayed || got.job.JobAccepted != want.JobAccepted {
+				t.Fatalf("second enqueue: got %+v, want replay of %+v", got, want.JobAccepted)
+			}
+			if err := tx2.Commit(); err != nil {
+				t.Fatalf("second enqueue aborted the caller transaction: %v", err)
+			}
+		})
 	}
 }
 
