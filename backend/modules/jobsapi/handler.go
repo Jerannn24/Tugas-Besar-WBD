@@ -3,6 +3,7 @@ package jobsapi
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strconv"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
@@ -36,19 +37,25 @@ type Dependencies struct {
 	Jobs       JobReader
 	Actions    ActionReader
 	Authorizer authz.Authorizer
+	Logger 	   *slog.Logger
 }
 
 type Handler struct {
 	jobs       JobReader
 	actions    ActionReader
 	authorizer authz.Authorizer
+	log        *slog.Logger
 }
 
 func New(deps Dependencies) (*Handler, error) {
 	if deps.Jobs == nil || deps.Actions == nil || deps.Authorizer == nil {
 		return nil, errors.New("jobs API dependencies are required")
 	}
-	return &Handler{jobs: deps.Jobs, actions: deps.Actions, authorizer: deps.Authorizer}, nil
+	logger := deps.Logger
+	if logger == nil {
+		logger = defaultLogger()
+	}
+	return &Handler{jobs: deps.Jobs, actions: deps.Actions, authorizer: deps.Authorizer, log: logger}, nil
 }
 
 // Register must run before the M1 /databases/* wildcard so these routes match first.
@@ -57,9 +64,9 @@ func Register(router fiber.Router, deps Dependencies) error {
 	if err != nil {
 		return err
 	}
-	router.Get("/databases/:database_id/jobs", h.ListJobs)
-	router.Get("/databases/:database_id/jobs/:job_id", h.GetJob)
-	router.Get("/databases/:database_id/attempts", h.ListAttempts)
+	router.Get("/databases/:database_id/jobs", h.observe("jobs.list", h.ListJobs))
+	router.Get("/databases/:database_id/jobs/:job_id", h.observe("jobs.get", h.GetJob))
+	router.Get("/databases/:database_id/attempts", h.observe("attempts.list", h.ListAttempts))
 	return nil
 }
 
@@ -125,7 +132,6 @@ type request struct {
 	resourceID string
 }
 
-// guard returns nil after writing the error response; resourceParam names an extra UUID path param.
 func (h *Handler) guard(c *fiber.Ctx, resourceParam string) (*request, error) {
 	actor, ok := authz.ActorFromContext(c)
 	if !ok || actor.ID == uuid.Nil {
