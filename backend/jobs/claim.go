@@ -79,7 +79,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 	}
 	defer tx.Rollback()
 
-	// shortcut: only claims queued jobs without takeover of expired leases, upgrade in recovery/takeover increment
+	// shortcut: claims queued and pre-dispatch expired running jobs excluding resume/source-linked jobs until source-aware reconciliation, upgrade in reconciliation increment
 	var (
 		jobID               string
 		databaseID          string
@@ -96,21 +96,52 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		sourceExecutionID   *string
 		snapshotHash        string
 		approvalFingerprint sql.NullString
+		currentStatus       string
 	)
 
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, database_id, target_id, proposal_id, migration_id, revision,
 		       execution_id, actor_id, action, direction, mode, attempt_no,
-		       source_execution_id::text, snapshot_hash, approval_fingerprint
-		FROM app.jobs
-		WHERE status = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= clock_timestamp())
-		ORDER BY created_at ASC
+		       source_execution_id::text, snapshot_hash, approval_fingerprint,
+		       status
+		FROM app.jobs j
+		WHERE (
+			(j.status = 'queued' AND (j.next_retry_at IS NULL OR j.next_retry_at <= clock_timestamp()))
+			OR
+			(
+				j.status = 'running'
+				AND j.execution_status = 'running'
+				AND j.action <> 'resume'
+				AND j.source_execution_id IS NULL
+				AND j.lease_expires_at <= clock_timestamp()
+				AND NOT EXISTS (
+					SELECT 1 FROM app.job_attempts a
+					WHERE a.job_id = j.id
+					  AND (
+					      a.sql_entered = true
+					      OR a.status IN ('succeeded', 'partial', 'partially_reverted', 'unknown')
+					      OR EXISTS (
+					          SELECT 1 FROM app.job_statement_evidence se
+					          WHERE se.attempt_id = a.id
+					      )
+					  )
+				)
+				AND EXISTS (
+					SELECT 1 FROM app.job_attempts a
+					WHERE a.job_id = j.id
+					  AND a.attempt_no = j.attempt_no
+					  AND a.status = 'running'
+					  AND a.sql_entered = false
+				)
+			)
+		)
+		ORDER BY j.created_at ASC
 		LIMIT 1
-		FOR UPDATE SKIP LOCKED
+		FOR UPDATE OF j SKIP LOCKED
 	`).Scan(
 		&jobID, &databaseID, &targetID, &proposalID, &migrationID, &revision,
 		&executionID, &actorID, &action, &direction, &mode, &attemptNo,
-		&sourceExecutionID, &snapshotHash, &approvalFingerprint,
+		&sourceExecutionID, &snapshotHash, &approvalFingerprint, &currentStatus,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -128,21 +159,65 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 	leaseToken := uuid.NewString()
 
 	var leaseExpiresAt time.Time
-	err = tx.QueryRowContext(ctx, `
-		UPDATE app.jobs
-		SET status = 'running',
-		    execution_status = 'running',
-		    claimed_by = $1,
-		    claimed_at = clock_timestamp(),
-		    lease_token = $2,
-		    lease_expires_at = clock_timestamp() + ($3 * interval '1 millisecond'),
-		    started_at = COALESCE(started_at, clock_timestamp()),
-		    updated_at = clock_timestamp()
-		WHERE id = $4
-		RETURNING lease_expires_at
-	`, in.WorkerID, leaseToken, in.LeaseDuration.Milliseconds(), jobID).Scan(&leaseExpiresAt)
-	if err != nil {
-		return nil, fmt.Errorf("update claimed job: %w", err)
+	if currentStatus == "running" {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE app.job_attempts
+			SET status = 'failed',
+			    finished_at = clock_timestamp(),
+			    error_code = 'LEASE_EXPIRED',
+			    error_message = 'lease expired before sql dispatch',
+			    error_retryable = true
+			WHERE job_id = $1 AND attempt_no = $2 AND status = 'running' AND sql_entered = false
+		`, jobID, attemptNo)
+		if err != nil {
+			return nil, fmt.Errorf("interrupt expired attempt: %w", err)
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("interrupt expired attempt rows: %w", err)
+		}
+		if rowsAffected == 0 {
+			return nil, errors.New("failed to interrupt prior running attempt")
+		}
+
+		attemptNo++
+
+		err = tx.QueryRowContext(ctx, `
+			UPDATE app.jobs
+			SET status = 'running',
+			    execution_status = 'running',
+			    claimed_by = $1,
+			    claimed_at = clock_timestamp(),
+			    lease_token = $2,
+			    lease_expires_at = clock_timestamp() + ($3 * interval '1 millisecond'),
+			    attempt_no = $4,
+			    error_code = NULL,
+			    error_message = NULL,
+			    error_retryable = NULL,
+			    updated_at = clock_timestamp()
+			WHERE id = $5
+			RETURNING lease_expires_at
+		`, in.WorkerID, leaseToken, in.LeaseDuration.Milliseconds(), attemptNo, jobID).Scan(&leaseExpiresAt)
+		if err != nil {
+			return nil, fmt.Errorf("takeover claimed job: %w", err)
+		}
+	} else {
+		err = tx.QueryRowContext(ctx, `
+			UPDATE app.jobs
+			SET status = 'running',
+			    execution_status = 'running',
+			    claimed_by = $1,
+			    claimed_at = clock_timestamp(),
+			    lease_token = $2,
+			    lease_expires_at = clock_timestamp() + ($3 * interval '1 millisecond'),
+			    started_at = COALESCE(started_at, clock_timestamp()),
+			    updated_at = clock_timestamp()
+			WHERE id = $4
+			RETURNING lease_expires_at
+		`, in.WorkerID, leaseToken, in.LeaseDuration.Milliseconds(), jobID).Scan(&leaseExpiresAt)
+		if err != nil {
+			return nil, fmt.Errorf("update claimed job: %w", err)
+		}
 	}
 
 	var attemptID string
