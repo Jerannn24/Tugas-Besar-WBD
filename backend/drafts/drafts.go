@@ -37,6 +37,10 @@ type Draft struct {
 	CreatedAt          time.Time `json:"-"`
 	UpdatedAt          time.Time `json:"updated_at"`
 	AppliedExecutionID *string   `json:"applied_execution_id"`
+	SQLDown            *string   `json:"sql_down,omitempty"`
+	IrreversibleReason *string   `json:"irreversible_reason,omitempty"`
+	Mode               string    `json:"mode,omitempty"`
+	Batch              any       `json:"batch,omitempty"`
 }
 type input struct {
 	Title    string `json:"title"`

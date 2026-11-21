@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 
 	"github.com/google/uuid"
@@ -58,7 +60,7 @@ func MayApprove(actorID uuid.UUID, requirement ApprovalRequirement) bool {
 }
 
 type queryer interface {
-	QueryjadRow(context.Context, string, ...any) pgx.Row
+	QueryRow(context.Context, string, ...any) pgx.Row
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }
 
@@ -97,9 +99,14 @@ func (p *Policy) EffectiveAccess(ctx context.Context, actorID, databaseID uuid.U
 
 func (p *Policy) MayEnqueue(ctx context.Context, actorID, proposalID uuid.UUID) error {
 	var databaseID uuid.UUID
+	var revision int
+	var storedFingerprint []byte
 	if err := p.db.QueryRow(ctx, `
-		SELECT database_id FROM app.migration_proposals
-		WHERE id=$1 AND status IN ('approved','queued')`, proposalID).Scan(&databaseID); err != nil {
+		SELECT p.database_id,p.revision,p.approval_fingerprint
+		FROM app.migration_proposals p
+		JOIN app.migration_drafts d ON d.id=p.migration_id
+		WHERE p.id=$1 AND p.status IN ('approved','queued') AND d.revision=p.revision`, proposalID).
+		Scan(&databaseID, &revision, &storedFingerprint); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrForbidden
 		}
@@ -119,7 +126,61 @@ func (p *Policy) MayEnqueue(ctx context.Context, actorID, proposalID uuid.UUID) 
 	if !summary.Complete() {
 		return ErrPendingApprovals
 	}
+	currentFingerprint, err := currentApprovalFingerprint(ctx, p.db, databaseID)
+	if err != nil {
+		return err
+	}
+	if string(storedFingerprint) != string(currentFingerprint[:]) {
+		return ErrPendingApprovals
+	}
 	return nil
+}
+
+func currentApprovalFingerprint(ctx context.Context, db queryer, databaseID uuid.UUID) ([32]byte, error) {
+	rows, err := db.Query(ctx, `
+		SELECT g.id,g.leader_user_id,m.user_id
+		FROM app.groups g
+		JOIN app.group_database_grants grant_row ON grant_row.group_id=g.id
+		LEFT JOIN app.group_memberships m ON m.group_id=g.id
+		WHERE grant_row.database_id=$1
+		ORDER BY g.id,m.user_id`, databaseID)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	defer rows.Close()
+	type roster struct {
+		Group   string   `json:"group"`
+		Leader  *string  `json:"leader"`
+		Members []string `json:"members"`
+	}
+	var all []roster
+	var current *roster
+	for rows.Next() {
+		var group uuid.UUID
+		var leader, member *uuid.UUID
+		if err := rows.Scan(&group, &leader, &member); err != nil {
+			return [32]byte{}, err
+		}
+		if current == nil || current.Group != group.String() {
+			all = append(all, roster{Group: group.String()})
+			current = &all[len(all)-1]
+		}
+		if leader != nil {
+			value := leader.String()
+			current.Leader = &value
+		}
+		if member != nil {
+			current.Members = append(current.Members, member.String())
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return [32]byte{}, err
+	}
+	raw, err := json.Marshal(all)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(raw), nil
 }
 
 func (p *Policy) MayApprove(ctx context.Context, actorID, proposalID uuid.UUID) (bool, error) {

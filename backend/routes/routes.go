@@ -6,6 +6,7 @@ import (
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/databaseapi"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/workflow"
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"log"
@@ -44,7 +45,13 @@ func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
 	connectionService := connections.NewService(connectionRepository, connectionPools)
 	connectionHandler := connections.NewHandler(connectionService)
 	connections.RegisterRoutes(protected, connectionHandler, authz.AdminMiddleware(authorizer), auth.CSRFMiddleware())
-	
+	workflowService, err := workflow.NewService(db, authorizer)
+	if err != nil {
+		log.Printf("workflow API disabled: %v", err)
+	} else {
+		workflow.RegisterRoutes(protected, workflow.NewHandler(workflowService), auth.CSRFMiddleware())
+	}
+
 	if platform, err := databaseapi.OpenPlatform(); err != nil {
 		log.Printf("database API disabled: %v", err)
 	} else if stopReconciler, err := databaseapi.Register(protected, platform, authorizer, connectionPools); err != nil {
