@@ -11,11 +11,21 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	// DefaultMaxAttempts is the maximum number of attempts allowed for pre-dispatch automatic retries.
+	// When an expired attempt reaches this bound, the job transitions to 'failed' rather than 'retry_wait'.
+	DefaultMaxAttempts = 3
+
+	// DefaultRetryDelay is the waiting duration before an expired job in 'retry_wait' becomes eligible for reclaim.
+	DefaultRetryDelay = 10 * time.Second
+)
+
 type ClaimRequest struct {
 	WorkerID      string
 	LeaseDuration time.Duration
-	// AfterLock is an optional test seam called while holding the row lock before commit.
-	AfterLock func(ctx context.Context) error
+	MaxAttempts   int
+	RetryDelay    time.Duration
+	afterLock     func(ctx context.Context) error
 }
 
 type Claim struct {
@@ -50,7 +60,218 @@ func (c Claim) RevalidationRequest() executioncontract.RevalidationRequest {
 	}
 }
 
-// ClaimJob claims the next available queued job using a short platform transaction
+func (s *Service) reclaimOneExpiredJob(ctx context.Context, maxAttempts int, retryDelay time.Duration) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin reclaim tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		jobID     string
+		attemptNo int
+	)
+
+	err = tx.QueryRowContext(ctx, `
+		SELECT j.id, j.attempt_no
+		FROM app.jobs j
+		WHERE j.status = 'running'
+		  AND j.execution_status = 'running'
+		  AND ((j.action = 'apply' AND j.source_execution_id IS NULL) OR
+		       (j.action IN ('rollback', 'forward') AND j.source_execution_id IS NOT NULL
+		        AND j.source_execution_id <> j.execution_id))
+		  AND NOT j.blocks_database
+		  AND j.lease_expires_at <= clock_timestamp()
+		  AND NOT EXISTS (
+		      SELECT 1 FROM app.job_attempts a
+		      WHERE a.job_id = j.id
+		        AND (
+		            a.sql_entered = true
+		            OR a.status IN ('succeeded', 'partial', 'partially_reverted', 'unknown')
+		            OR EXISTS (
+		                SELECT 1 FROM app.job_statement_evidence se
+		                WHERE se.attempt_id = a.id
+		            )
+		        )
+		  )
+		  AND (SELECT count(*) FROM app.job_attempts a WHERE a.job_id = j.id) = j.attempt_no
+		  AND (SELECT count(DISTINCT a.attempt_no) FROM app.job_attempts a WHERE a.job_id = j.id) = j.attempt_no
+		  AND NOT EXISTS (
+		      SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id AND (
+		          a.attempt_no > j.attempt_no OR
+		          (a.attempt_no = j.attempt_no AND (a.status <> 'running' OR a.finished_at IS NOT NULL)) OR
+		          (a.attempt_no < j.attempt_no AND (a.status <> 'failed' OR a.finished_at IS NULL))
+		      )
+		  )
+		ORDER BY j.created_at ASC
+		LIMIT 1
+		FOR UPDATE OF j SKIP LOCKED
+	`).Scan(&jobID, &attemptNo)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("query expired job: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id::text, attempt_no, status, sql_entered, finished_at IS NOT NULL
+		FROM app.job_attempts
+		WHERE job_id = $1
+		ORDER BY attempt_no ASC
+		FOR UPDATE
+	`, jobID)
+	if err != nil {
+		return false, fmt.Errorf("query attempts for reclaim: %w", err)
+	}
+	defer rows.Close()
+
+	type attRecord struct {
+		id          string
+		attemptNo   int
+		status      string
+		sqlEntered  bool
+		hasFinished bool
+	}
+
+	var attempts []attRecord
+	for rows.Next() {
+		var a attRecord
+		if err := rows.Scan(&a.id, &a.attemptNo, &a.status, &a.sqlEntered, &a.hasFinished); err != nil {
+			return false, fmt.Errorf("scan attempt for reclaim: %w", err)
+		}
+		attempts = append(attempts, a)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate attempts for reclaim: %w", err)
+	}
+
+	var runningAttempt *attRecord
+	runningCount := 0
+	ambiguous := false
+
+	for i := range attempts {
+		a := &attempts[i]
+		if a.sqlEntered {
+			ambiguous = true
+			break
+		}
+		if a.status == "running" {
+			runningCount++
+			runningAttempt = a
+		} else if a.attemptNo < attemptNo {
+			if a.status != "failed" || !a.hasFinished {
+				ambiguous = true
+				break
+			}
+		} else {
+			ambiguous = true
+			break
+		}
+	}
+
+	if ambiguous || runningCount != 1 || runningAttempt == nil || runningAttempt.attemptNo != attemptNo {
+		return false, nil
+	}
+
+	retryable := attemptNo < maxAttempts
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE app.job_attempts
+		SET status = 'failed',
+		    finished_at = clock_timestamp(),
+		    error_code = 'LEASE_EXPIRED',
+		    error_message = 'lease expired before sql dispatch',
+		    error_retryable = $1
+		WHERE id = $2 AND status = 'running' AND sql_entered = false
+	`, retryable, runningAttempt.id)
+	if err != nil {
+		return false, fmt.Errorf("interrupt expired attempt: %w", err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("check affected rows: %w", err)
+	}
+	if rowsAffected != 1 {
+		return false, errors.New("exact cardinality mismatch when interrupting expired attempt")
+	}
+
+	if retryable {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE app.jobs
+			SET status = 'retry_wait',
+			    execution_status = 'retry_wait',
+			    claimed_by = NULL,
+			    claimed_at = NULL,
+			    lease_token = NULL,
+			    lease_expires_at = NULL,
+			    next_retry_at = clock_timestamp() + ($1 * interval '1 millisecond'),
+			    error_code = 'LEASE_EXPIRED',
+			    error_message = 'lease expired before sql dispatch',
+			    error_retryable = true,
+			    updated_at = clock_timestamp()
+			WHERE id = $2
+		`, retryDelay.Milliseconds(), jobID)
+		if err != nil {
+			return false, fmt.Errorf("transition job to retry_wait: %w", err)
+		}
+	} else {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE app.jobs
+			SET status = 'failed',
+			    execution_status = 'failed',
+			    claimed_by = NULL,
+			    claimed_at = NULL,
+			    lease_token = NULL,
+			    lease_expires_at = NULL,
+			    next_retry_at = NULL,
+			    finished_at = clock_timestamp(),
+			    error_code = 'LEASE_EXPIRED',
+			    error_message = 'lease expired before sql dispatch',
+			    error_retryable = false,
+			    updated_at = clock_timestamp()
+			WHERE id = $1
+		`, jobID)
+		if err != nil {
+			return false, fmt.Errorf("transition job to failed at bound: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit reclaim tx: %w", err)
+	}
+	return true, nil
+}
+
+func (s *Service) reclaimExpiredJobs(ctx context.Context, maxAttempts int, retryDelay time.Duration) (int, error) {
+	count := 0
+	// shortcut: bounded batch limit of 20 to avoid monopolizing claim transaction, upgrade in worker loop
+	for i := 0; i < 20; i++ {
+		reclaimed, err := s.reclaimOneExpiredJob(ctx, maxAttempts, retryDelay)
+		if err != nil {
+			return count, err
+		}
+		if !reclaimed {
+			break
+		}
+		count++
+	}
+	return count, nil
+}
+
+// ReclaimExpiredJobs scans for and reclaims expired pre-dispatch jobs, transitioning them
+// to retry_wait (or failed at bound) with delayed retry scheduling and cleared ownership.
+func (s *Service) ReclaimExpiredJobs(ctx context.Context, maxAttempts int, retryDelay time.Duration) (int, error) {
+	if maxAttempts <= 0 || maxAttempts > DefaultMaxAttempts {
+		maxAttempts = DefaultMaxAttempts
+	}
+	if retryDelay < time.Millisecond {
+		retryDelay = DefaultRetryDelay
+	}
+	return s.reclaimExpiredJobs(ctx, maxAttempts, retryDelay)
+}
+
+// ClaimJob claims the next available queued or due retry job using a short platform transaction
 // with FOR UPDATE SKIP LOCKED.
 // If a job is claimed, atomic running state is set and a running attempt is durably created.
 // If no job is available, it returns (nil, nil) as a distinct no-work result.
@@ -72,6 +293,18 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 			Message: "lease_duration must be at least 1ms",
 		}
 	}
+	maxAttempts := in.MaxAttempts
+	if maxAttempts <= 0 || maxAttempts > DefaultMaxAttempts {
+		maxAttempts = DefaultMaxAttempts
+	}
+	retryDelay := in.RetryDelay
+	if retryDelay < time.Millisecond {
+		retryDelay = DefaultRetryDelay
+	}
+
+	if _, err := s.reclaimExpiredJobs(ctx, maxAttempts, retryDelay); err != nil {
+		return nil, fmt.Errorf("reclaim expired jobs: %w", err)
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -79,7 +312,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 	}
 	defer tx.Rollback()
 
-	// shortcut: claims queued and pre-dispatch expired running jobs excluding resume/source-linked jobs until source-aware reconciliation, upgrade in reconciliation increment
+	// Retry candidates must have a complete, unambiguous pre-dispatch attempt history.
 	var (
 		jobID               string
 		databaseID          string
@@ -105,40 +338,37 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		       source_execution_id::text, snapshot_hash, approval_fingerprint,
 		       status
 		FROM app.jobs j
-		WHERE (
-			(j.status = 'queued' AND (j.next_retry_at IS NULL OR j.next_retry_at <= clock_timestamp()))
-			OR
-			(
-				j.status = 'running'
-				AND j.execution_status = 'running'
-				AND j.action <> 'resume'
-				AND j.source_execution_id IS NULL
-				AND j.lease_expires_at <= clock_timestamp()
-				AND NOT EXISTS (
-					SELECT 1 FROM app.job_attempts a
-					WHERE a.job_id = j.id
-					  AND (
-					      a.sql_entered = true
-					      OR a.status IN ('succeeded', 'partial', 'partially_reverted', 'unknown')
-					      OR EXISTS (
-					          SELECT 1 FROM app.job_statement_evidence se
-					          WHERE se.attempt_id = a.id
-					      )
-					  )
-				)
-				AND EXISTS (
-					SELECT 1 FROM app.job_attempts a
-					WHERE a.job_id = j.id
-					  AND a.attempt_no = j.attempt_no
-					  AND a.status = 'running'
-					  AND a.sql_entered = false
-				)
-			)
-		)
+		WHERE ((j.status = 'queued' AND j.next_retry_at IS NULL AND NOT j.blocks_database) OR
+		       (j.status = 'retry_wait' AND j.next_retry_at IS NOT NULL
+		        AND j.next_retry_at <= clock_timestamp() AND j.attempt_no < $1
+		        AND NOT j.blocks_database
+		        AND ((j.action = 'apply' AND j.source_execution_id IS NULL) OR
+		             (j.action IN ('rollback', 'forward') AND j.source_execution_id IS NOT NULL
+		              AND j.source_execution_id <> j.execution_id))
+		        AND (SELECT count(*) FROM app.job_attempts a WHERE a.job_id = j.id) = j.attempt_no
+		        AND (SELECT count(DISTINCT a.attempt_no) FROM app.job_attempts a WHERE a.job_id = j.id) = j.attempt_no
+		        AND NOT EXISTS (
+		            SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id AND
+		                (a.attempt_no > j.attempt_no OR a.status <> 'failed' OR
+		                 a.finished_at IS NULL OR a.sql_entered OR
+		                 EXISTS (SELECT 1 FROM app.job_statement_evidence se WHERE se.attempt_id = a.id))
+		        )))
+		  AND NOT EXISTS (
+		      SELECT 1 FROM app.jobs blocked
+		      WHERE blocked.target_id = j.target_id AND blocked.id <> j.id
+		        AND (blocked.blocks_database OR blocked.status IN ('unknown', 'partial', 'partially_reverted')
+		             OR blocked.execution_status IN ('unknown', 'partial', 'partially_reverted')
+		             OR EXISTS (SELECT 1 FROM app.job_attempts a
+		                        WHERE a.job_id = blocked.id
+		                          AND (a.sql_entered OR EXISTS (
+		                              SELECT 1 FROM app.job_statement_evidence se WHERE se.attempt_id = a.id))
+		                          AND (a.status = 'running' OR NOT EXISTS (
+		                              SELECT 1 FROM app.job_dispatch_authorizations d WHERE d.attempt_id = a.id))))
+		  )
 		ORDER BY j.created_at ASC
 		LIMIT 1
 		FOR UPDATE OF j SKIP LOCKED
-	`).Scan(
+	`, maxAttempts).Scan(
 		&jobID, &databaseID, &targetID, &proposalID, &migrationID, &revision,
 		&executionID, &actorID, &action, &direction, &mode, &attemptNo,
 		&sourceExecutionID, &snapshotHash, &approvalFingerprint, &currentStatus,
@@ -150,38 +380,17 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		return nil, fmt.Errorf("query claimable job: %w", err)
 	}
 
-	if in.AfterLock != nil {
-		if err := in.AfterLock(ctx); err != nil {
+	if in.afterLock != nil {
+		if err := in.afterLock(ctx); err != nil {
 			return nil, err
 		}
 	}
 
 	leaseToken := uuid.NewString()
-
 	var leaseExpiresAt time.Time
-	if currentStatus == "running" {
-		res, err := tx.ExecContext(ctx, `
-			UPDATE app.job_attempts
-			SET status = 'failed',
-			    finished_at = clock_timestamp(),
-			    error_code = 'LEASE_EXPIRED',
-			    error_message = 'lease expired before sql dispatch',
-			    error_retryable = true
-			WHERE job_id = $1 AND attempt_no = $2 AND status = 'running' AND sql_entered = false
-		`, jobID, attemptNo)
-		if err != nil {
-			return nil, fmt.Errorf("interrupt expired attempt: %w", err)
-		}
-		rowsAffected, err := res.RowsAffected()
-		if err != nil {
-			return nil, fmt.Errorf("interrupt expired attempt rows: %w", err)
-		}
-		if rowsAffected == 0 {
-			return nil, errors.New("failed to interrupt prior running attempt")
-		}
 
+	if currentStatus == "retry_wait" {
 		attemptNo++
-
 		err = tx.QueryRowContext(ctx, `
 			UPDATE app.jobs
 			SET status = 'running',
@@ -191,6 +400,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 			    lease_token = $2,
 			    lease_expires_at = clock_timestamp() + ($3 * interval '1 millisecond'),
 			    attempt_no = $4,
+			    next_retry_at = NULL,
 			    error_code = NULL,
 			    error_message = NULL,
 			    error_retryable = NULL,
@@ -199,7 +409,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 			RETURNING lease_expires_at
 		`, in.WorkerID, leaseToken, in.LeaseDuration.Milliseconds(), attemptNo, jobID).Scan(&leaseExpiresAt)
 		if err != nil {
-			return nil, fmt.Errorf("takeover claimed job: %w", err)
+			return nil, fmt.Errorf("claim retry job: %w", err)
 		}
 	} else {
 		err = tx.QueryRowContext(ctx, `

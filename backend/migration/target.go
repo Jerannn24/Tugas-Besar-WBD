@@ -19,20 +19,24 @@ import (
 type TargetLease struct {
 	Executor *sql.Conn
 	Preparer *sql.DB
-	Release func()
+	Release  func()
 }
 
-type targetSession struct {
+type TargetSession struct {
 	lease           *TargetLease
 	key             int64
 	locked, tainted bool
 	tx              *sql.Tx
 }
 
-type receipt struct {
+type targetSession = TargetSession
+
+type TargetReceipt struct {
 	ID, TargetID, DatabaseID, Version, ActorID, XID string
 	Hash                                            []byte
 }
+
+type receipt = TargetReceipt
 
 type outcome struct {
 	status  string
@@ -44,9 +48,8 @@ func unknown(code, message string) outcome {
 	return outcome{status: "unknown", failure: &history.ExecutionError{Code: code, Message: message}}
 }
 
-func (h *Handler) openTarget(ctx context.Context, databaseID, targetID string) (*targetSession, error) {
-	lease, err := h.d.Acquire(ctx, databaseID)
-	if err != nil || lease == nil || lease.Executor == nil || lease.Preparer == nil || lease.Release == nil {
+func OpenTargetSession(ctx context.Context, lease *TargetLease, targetID string, timeout time.Duration) (*TargetSession, error) {
+	if lease == nil || lease.Executor == nil || lease.Preparer == nil || lease.Release == nil {
 		if lease != nil {
 			if lease.Executor != nil {
 				_ = lease.Executor.Raw(func(any) error { return driver.ErrBadConn })
@@ -58,17 +61,17 @@ func (h *Handler) openTarget(ctx context.Context, databaseID, targetID string) (
 		}
 		return nil, fault(502, "TARGET_UNAVAILABLE", "Target connection is unavailable")
 	}
-	s := &targetSession{lease: lease}
+	s := &TargetSession{lease: lease}
 	ok := false
 	defer func() {
 		if !ok {
 			s.tainted = true
-			s.close(h.d.Timeout)
+			s.close(timeout)
 		}
 	}()
 	var marker, role, preparerDB string
 	var recovery bool
-	err = lease.Preparer.QueryRowContext(ctx, `SELECT physical_target_id::text,executor_role::text,current_database(),pg_catalog.pg_is_in_recovery() FROM wbd_auth.target_marker WHERE singleton`).Scan(&marker, &role, &preparerDB, &recovery)
+	err := lease.Preparer.QueryRowContext(ctx, `SELECT physical_target_id::text,executor_role::text,current_database(),pg_catalog.pg_is_in_recovery() FROM wbd_auth.target_marker WHERE singleton`).Scan(&marker, &role, &preparerDB, &recovery)
 	if err != nil || recovery || marker != targetID {
 		return nil, fault(502, "TARGET_UNAVAILABLE", "Target identity could not be verified")
 	}
@@ -95,6 +98,23 @@ FROM pg_catalog.pg_roles r WHERE rolname=session_user`).Scan(&executorDB, &sessi
 	}
 	s.locked, ok = true, true
 	return s, nil
+}
+
+func (h *Handler) openTarget(ctx context.Context, databaseID, targetID string) (*TargetSession, error) {
+	lease, err := h.d.Acquire(ctx, databaseID)
+	if err != nil {
+		if lease != nil {
+			if lease.Executor != nil {
+				_ = lease.Executor.Raw(func(any) error { return driver.ErrBadConn })
+				_ = lease.Executor.Close()
+			}
+			if lease.Release != nil {
+				lease.Release()
+			}
+		}
+		return nil, fault(502, "TARGET_UNAVAILABLE", "Target connection is unavailable")
+	}
+	return OpenTargetSession(ctx, lease, targetID, h.d.Timeout)
 }
 
 func (s *targetSession) begin(ctx context.Context, timeout time.Duration) error {
@@ -160,13 +180,7 @@ VALUES($1::uuid,$2::uuid,$3::uuid,$4::xid8,$5,$6,$7::uuid,$8)`, a.ID, a.TargetID
 }
 
 func (s *targetSession) abort(code, message string) outcome {
-	if s.tx == nil {
-		return unknown("ROLLBACK_UNCONFIRMED", "Target rollback could not be confirmed")
-	}
-	err := s.tx.Rollback()
-	s.tx = nil
-	if err != nil {
-		s.tainted = true
+	if err := s.Rollback(); err != nil {
 		return unknown("ROLLBACK_UNCONFIRMED", "Target rollback could not be confirmed")
 	}
 	return outcome{status: "failed", failure: &history.ExecutionError{Code: code, Message: message}}
@@ -235,4 +249,113 @@ func slicesOf(whole string, statements []string) bool {
 		pos += i + len(s)
 	}
 	return len(statements) > 0
+}
+
+// VerifyExecutorTarget binds the executor to the marker read by a dedicated
+// preparer session using PostgreSQL's database-local advisory lock namespace.
+func (s *TargetSession) VerifyExecutorTarget(ctx context.Context, targetID string) (result error) {
+	unavailable := func() error {
+		return fault(502, "TARGET_UNAVAILABLE", "Executor target identity could not be verified")
+	}
+	if s == nil || s.lease == nil || s.lease.Executor == nil || s.lease.Preparer == nil || s.tainted || s.tx != nil {
+		return unavailable()
+	}
+	preparer, err := s.lease.Preparer.Conn(ctx)
+	if err != nil {
+		return unavailable()
+	}
+	defer preparer.Close()
+
+	var marker string
+	var recovery bool
+	err = preparer.QueryRowContext(ctx, `SELECT physical_target_id::text,pg_catalog.pg_is_in_recovery() FROM wbd_auth.target_marker WHERE singleton`).Scan(&marker, &recovery)
+	if err != nil || recovery || marker != targetID {
+		return unavailable()
+	}
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return unavailable()
+	}
+	key := int64(binary.BigEndian.Uint64(nonce[:]))
+	if key == s.key {
+		return unavailable()
+	}
+	var locked bool
+	err = s.lease.Executor.QueryRowContext(ctx, `SELECT pg_catalog.pg_try_advisory_lock($1)`, key).Scan(&locked)
+	if err != nil {
+		s.tainted = true
+		return unavailable()
+	}
+	if !locked {
+		return unavailable()
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var unlocked bool
+		err := s.lease.Executor.QueryRowContext(cleanupCtx, `SELECT pg_catalog.pg_advisory_unlock($1)`, key).Scan(&unlocked)
+		if err != nil || !unlocked {
+			s.tainted = true
+			result = unavailable()
+		}
+	}()
+
+	var acquired bool
+	err = preparer.QueryRowContext(ctx, `SELECT pg_catalog.pg_try_advisory_lock($1)`, key).Scan(&acquired)
+	if err != nil || acquired {
+		// An uncertain or acquired session lock must not return to the pool.
+		_ = preparer.Raw(func(any) error { return driver.ErrBadConn })
+		return unavailable()
+	}
+	return nil
+}
+
+func (s *TargetSession) Begin(ctx context.Context, timeout time.Duration) error {
+	return s.begin(ctx, timeout)
+}
+
+func (s *TargetSession) Tx() *sql.Tx {
+	return s.tx
+}
+
+func (s *TargetSession) Preparer() *sql.DB {
+	return s.lease.Preparer
+}
+
+func (s *TargetSession) ReadReceipt(ctx context.Context, executionID string) (TargetReceipt, bool, error) {
+	return s.readReceipt(ctx, executionID)
+}
+
+func (s *TargetSession) Abort(code, message string) {
+	_ = s.abort(code, message)
+}
+
+func (s *TargetSession) Close(timeout time.Duration) {
+	s.close(timeout)
+}
+
+// Rollback reports success only when the active target transaction confirms rollback.
+func (s *TargetSession) Rollback() error {
+	if s.tx == nil {
+		return errors.New("no active transaction")
+	}
+	err := s.tx.Rollback()
+	s.tx = nil
+	if err != nil {
+		s.tainted = true
+	}
+	return err
+}
+
+func (s *TargetSession) Commit() error {
+	if s.tx == nil {
+		return errors.New("no active transaction")
+	}
+	err := s.tx.Commit()
+	s.tx = nil
+	if err != nil {
+		s.tainted = true
+		return err
+	}
+	return nil
 }

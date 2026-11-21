@@ -73,12 +73,27 @@ func createFixture(t *testing.T, db *sql.DB, ownerDB *sql.DB) fixture {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.jobs WHERE database_id = $1", dbID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.migration_proposals WHERE database_id = $1", dbID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.migration_drafts WHERE database_id = $1", dbID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.database_connections WHERE id = $1", dbID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.migration_target_state WHERE id = $1", targetID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.users WHERE id = $1", actorID)
+		for _, query := range []string{
+			"DELETE FROM app.job_commit_proofs WHERE job_id IN (SELECT id FROM app.jobs WHERE database_id = $1)",
+			"DELETE FROM app.job_dispatch_authorizations WHERE job_id IN (SELECT id FROM app.jobs WHERE database_id = $1)",
+			"DELETE FROM app.job_statement_evidence WHERE attempt_id IN (SELECT id FROM app.job_attempts WHERE database_id = $1)",
+			"DELETE FROM app.job_attempts WHERE database_id = $1",
+			"DELETE FROM app.jobs WHERE database_id = $1",
+			"DELETE FROM app.migration_proposals WHERE database_id = $1",
+			"DELETE FROM app.migration_executions WHERE database_id = $1",
+			"DELETE FROM app.migration_drafts WHERE database_id = $1",
+			"DELETE FROM app.database_connections WHERE id = $1",
+		} {
+			if _, err := ownerDB.ExecContext(cleanupCtx, query, dbID); err != nil {
+				t.Errorf("cleanup %s: %v", query, err)
+			}
+		}
+		if _, err := ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.migration_target_state WHERE id = $1", targetID); err != nil {
+			t.Errorf("cleanup target state: %v", err)
+		}
+		if _, err := ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.users WHERE id = $1", actorID); err != nil {
+			t.Errorf("cleanup user: %v", err)
+		}
 	})
 
 	username := "u_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
@@ -145,6 +160,40 @@ func createFixture(t *testing.T, db *sql.DB, ownerDB *sql.DB) fixture {
 		snapshot:   snapshot,
 		hash:       "hash_00000000000000000000000000000001",
 	}
+}
+
+type fixtureExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func createFixtureSource(t *testing.T, ctx context.Context, db fixtureExecer, f fixture, source string) {
+	t.Helper()
+	if _, err := db.ExecContext(ctx, `UPDATE app.migration_target_state SET next_version = next_version + 1 WHERE id = $1`, f.targetID); err != nil {
+		t.Fatal(err)
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO app.migration_executions
+		(id, database_id, execution_target_id, draft_id, request_id, draft_revision, version,
+		 title, sql, sql_sha256, executed_by, executed_username, started_at, status)
+		SELECT $1, $2, $3, d.id, $5, d.revision, 1, d.title, d.sql,
+		       sha256(convert_to(d.sql, 'UTF8')), $6, u.username, clock_timestamp(), 'running'
+		FROM app.migration_drafts d JOIN app.users u ON u.id = $6 WHERE d.id = $4`,
+		source, f.dbID, f.targetID, f.draftID, uuid.NewString(), f.actorID)
+	if err != nil {
+		t.Fatalf("insert source execution: %v", err)
+	}
+}
+
+func createFixtureProposal(t *testing.T, ctx context.Context, db fixtureExecer, f fixture, action executioncontract.Action, source *string) string {
+	t.Helper()
+	id := uuid.NewString()
+	_, err := db.ExecContext(ctx, `INSERT INTO app.migration_proposals
+		(id, database_id, migration_id, revision, action, source_execution_id, snapshot, snapshot_hash, created_by)
+		VALUES ($1, $2, $3, 1, $4, $5, '{}'::jsonb, sha256('fixture'::bytea), $6)`,
+		id, f.dbID, f.draftID, action, source, f.actorID)
+	if err != nil {
+		t.Fatalf("insert matching proposal: %v", err)
+	}
+	return id
 }
 
 func TestEnqueueTx_PersistAndGetJob(t *testing.T) {
@@ -604,8 +653,10 @@ func TestEnqueueTx_ResumeRequiresSourceExecutionID(t *testing.T) {
 	}
 
 	sourceExec := uuid.NewString()
+	createFixtureSource(t, ctx, tx, f, sourceExec)
 	reqWithSource := reqNoSource
 	reqWithSource.SourceExecutionID = &sourceExec
+	reqWithSource.ProposalID = createFixtureProposal(t, ctx, tx, f, executioncontract.Resume, &sourceExec)
 
 	res, err := svc.EnqueueTx(ctx, tx, reqWithSource)
 	if err != nil {
@@ -651,5 +702,19 @@ func TestEnqueueTx_RejectsMismatchedBinding(t *testing.T) {
 	var ce executioncontract.ContractError
 	if !errors.As(err, &ce) || ce.Code != "DATABASE_BUSY" {
 		t.Fatalf("expected DATABASE_BUSY, got %v", err)
+	}
+}
+
+func TestIncompleteJobsPortsFailClosed(t *testing.T) {
+	svc := New(nil)
+	ctx := context.Background()
+	if _, err := svc.ListJobs(ctx, "", executioncontract.Page{}); err == nil {
+		t.Fatal("unimplemented ListJobs reported success")
+	}
+	if _, err := svc.ListAttempts(ctx, "", executioncontract.Page{}); err == nil {
+		t.Fatal("unimplemented ListAttempts reported success")
+	}
+	if err := svc.FinalizeJobTx(ctx, nil, executioncontract.JobUpdate{}); err == nil {
+		t.Fatal("unfenced FinalizeJobTx reported success")
 	}
 }

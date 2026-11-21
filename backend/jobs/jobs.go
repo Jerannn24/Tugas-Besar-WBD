@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,10 @@ type requestConflictError struct {
 
 func (e requestConflictError) Is(target error) bool {
 	return target == executioncontract.ErrRequestConflict
+}
+
+func (e requestConflictError) Unwrap() error {
+	return e.ContractError
 }
 
 func makeRequestConflict(msg string) error {
@@ -163,6 +168,35 @@ func (s *Service) EnqueueTx(
 			Message: "target binding has changed",
 		}
 	}
+	// Proposal identity is immutable, but lock the row against deletion until the
+	// job referencing it has been inserted. Snapshot encodings are owned by the
+	// proposal producer and are not interchangeable with the job's representation.
+	var proposalDatabaseID, proposalMigrationID, proposalAction string
+	var proposalRevision int
+	var proposalSourceExecutionID *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT database_id::text, migration_id::text, revision, action,
+		       source_execution_id::text
+		FROM app.migration_proposals
+		WHERE id = $1
+		FOR KEY SHARE
+	`, in.ProposalID).Scan(&proposalDatabaseID, &proposalMigrationID, &proposalRevision,
+		&proposalAction, &proposalSourceExecutionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return executioncontract.EnqueueResult{}, executioncontract.ContractError{
+			Code:    "NOT_FOUND",
+			Message: "proposal not found",
+		}
+	}
+	if err != nil {
+		return executioncontract.EnqueueResult{}, fmt.Errorf("query proposal: %w", err)
+	}
+	if proposalDatabaseID != in.DatabaseID || proposalMigrationID != in.MigrationID ||
+		proposalRevision != in.Revision || proposalAction != string(in.Action) ||
+		!sameID(proposalSourceExecutionID, in.SourceExecutionID) {
+		return executioncontract.EnqueueResult{}, makeRequestConflict("request intent differs from proposal")
+	}
+
 	jobID := uuid.NewString()
 	var executionID string
 	if in.Action == executioncontract.Resume {
@@ -363,22 +397,159 @@ func (s *Service) GetJob(
 	return view, nil
 }
 
-func (s *Service) ListJobs(
-	ctx context.Context,
-	databaseID string,
-	page executioncontract.Page,
-) (executioncontract.JobPage, error) {
-	// shortcut: stubbed for first P1 increment, implement pagination in subsequent P1 increment
-	return executioncontract.JobPage{Items: []executioncontract.JobView{}}, nil
+type listPosition struct {
+	DatabaseID string    `json:"d"`
+	Kind       string    `json:"k"`
+	Time       time.Time `json:"t"`
+	ID         string    `json:"i"`
 }
 
-func (s *Service) ListAttempts(
-	ctx context.Context,
-	databaseID string,
-	page executioncontract.Page,
-) (executioncontract.AttemptPage, error) {
-	// shortcut: stubbed for first P1 increment, implement attempt listing in subsequent P1 increment
-	return executioncontract.AttemptPage{Items: []executioncontract.Attempt{}}, nil
+func listCursor(databaseID, kind string, page executioncontract.Page) (int, *listPosition, error) {
+	invalid := func() (int, *listPosition, error) {
+		return 0, nil, executioncontract.ContractError{Code: "INVALID_REQUEST", Message: "invalid pagination"}
+	}
+	if _, err := uuid.Parse(databaseID); err != nil {
+		return invalid()
+	}
+	limit := page.Limit
+	if limit == 0 {
+		limit = 20
+	}
+	if limit < 1 || limit > 100 {
+		return invalid()
+	}
+	if page.Cursor == nil {
+		return limit, nil, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(*page.Cursor)
+	if err != nil {
+		return invalid()
+	}
+	var position listPosition
+	if err := json.Unmarshal(raw, &position); err != nil || position.DatabaseID != databaseID || position.Kind != kind || position.Time.IsZero() {
+		return invalid()
+	}
+	id, err := uuid.Parse(position.ID)
+	if err != nil || id.String() != position.ID {
+		return invalid()
+	}
+	return limit, &position, nil
+}
+
+func encodeListCursor(databaseID, kind string, at time.Time, id string) string {
+	raw, _ := json.Marshal(listPosition{DatabaseID: databaseID, Kind: kind, Time: at, ID: id})
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func (s *Service) ListJobs(ctx context.Context, databaseID string, page executioncontract.Page) (executioncontract.JobPage, error) {
+	if s.db == nil {
+		return executioncontract.JobPage{}, errors.New("db is required")
+	}
+	limit, after, err := listCursor(databaseID, "jobs", page)
+	if err != nil {
+		return executioncontract.JobPage{}, err
+	}
+	var afterTime, afterID any
+	if after != nil {
+		afterTime, afterID = after.Time, after.ID
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, created_at FROM app.jobs
+		WHERE database_id = $1 AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+		ORDER BY created_at DESC, id DESC LIMIT $4`, databaseID, afterTime, afterID, limit+1)
+	if err != nil {
+		return executioncontract.JobPage{}, fmt.Errorf("list jobs: %w", err)
+	}
+	type jobPosition struct {
+		id string
+		at time.Time
+	}
+	ids := make([]jobPosition, 0, limit+1)
+	for rows.Next() {
+		var position jobPosition
+		if err := rows.Scan(&position.id, &position.at); err != nil {
+			rows.Close()
+			return executioncontract.JobPage{}, fmt.Errorf("list jobs: %w", err)
+		}
+		ids = append(ids, position)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return executioncontract.JobPage{}, fmt.Errorf("list jobs: %w", err)
+	}
+	result := executioncontract.JobPage{Items: make([]executioncontract.JobView, 0, limit)}
+	if len(ids) > limit {
+		ids = ids[:limit]
+		last := ids[len(ids)-1]
+		cursor := encodeListCursor(databaseID, "jobs", last.at, last.id)
+		result.NextCursor = &cursor
+	}
+	for _, position := range ids {
+		view, err := s.GetJob(ctx, databaseID, position.id)
+		if err != nil {
+			return executioncontract.JobPage{}, fmt.Errorf("list jobs: %w", err)
+		}
+		result.Items = append(result.Items, view)
+	}
+	return result, nil
+}
+
+func (s *Service) ListAttempts(ctx context.Context, databaseID string, page executioncontract.Page) (executioncontract.AttemptPage, error) {
+	if s.db == nil {
+		return executioncontract.AttemptPage{}, errors.New("db is required")
+	}
+	limit, after, err := listCursor(databaseID, "attempts", page)
+	if err != nil {
+		return executioncontract.AttemptPage{}, err
+	}
+	var afterTime, afterID any
+	if after != nil {
+		afterTime, afterID = after.Time, after.ID
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, job_id, execution_id, database_id, migration_id, revision,
+		       actor_id, attempt_no, status, started_at, finished_at,
+		       error_code, error_message, error_retryable, legacy_execution_id
+		FROM app.job_attempts
+		WHERE database_id = $1 AND ($2::timestamptz IS NULL OR (started_at, id) < ($2::timestamptz, $3::uuid))
+		ORDER BY started_at DESC, id DESC LIMIT $4`, databaseID, afterTime, afterID, limit+1)
+	if err != nil {
+		return executioncontract.AttemptPage{}, fmt.Errorf("list attempts: %w", err)
+	}
+	defer rows.Close()
+	result := executioncontract.AttemptPage{Items: make([]executioncontract.Attempt, 0, limit)}
+	for rows.Next() {
+		var a executioncontract.Attempt
+		var code, message *string
+		var retryable *bool
+		if err := rows.Scan(&a.AttemptID, &a.JobID, &a.ExecutionID, &a.DatabaseID,
+			&a.MigrationID, &a.Revision, &a.ActorID, &a.AttemptNo, &a.Status,
+			&a.StartedAt, &a.FinishedAt, &code, &message, &retryable, &a.LegacyExecutionID); err != nil {
+			return executioncontract.AttemptPage{}, fmt.Errorf("list attempts: %w", err)
+		}
+		if len(result.Items) == limit {
+			last := result.Items[len(result.Items)-1]
+			cursor := encodeListCursor(databaseID, "attempts", last.StartedAt, last.AttemptID)
+			result.NextCursor = &cursor
+			break
+		}
+		a.StartedAt = a.StartedAt.UTC()
+		if code != nil && *code != "" {
+			a.Error = &executioncontract.JobError{Code: *code}
+			if message != nil {
+				a.Error.Message = *message
+			}
+			if retryable != nil {
+				a.Error.Retryable = *retryable
+			}
+		}
+		result.Items = append(result.Items, a)
+	}
+	if err := rows.Err(); err != nil {
+		return executioncontract.AttemptPage{}, fmt.Errorf("list attempts: %w", err)
+	}
+	return result, nil
 }
 
 func (s *Service) FinalizeJobTx(
@@ -386,6 +557,6 @@ func (s *Service) FinalizeJobTx(
 	tx *sql.Tx,
 	in executioncontract.JobUpdate,
 ) error {
-	// shortcut: stubbed for first P1 increment, implement job finalization in subsequent increment
-	return nil
+	// JobUpdate does not carry a lease token or a receipt-backed recovery identity.
+	return errors.New("job finalization requires fenced authority")
 }

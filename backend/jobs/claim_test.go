@@ -19,8 +19,7 @@ func createClaimFixture(t *testing.T, db *sql.DB, ownerDB *sql.DB) fixture {
 	ctx := context.Background()
 
 	dbID := uuid.NewString()
-	// Set targetID equal to dbID so both database_connections and migration_target_state FK are satisfied
-	targetID := dbID
+	targetID := uuid.NewString()
 	actorID := uuid.NewString()
 	draftID := uuid.NewString()
 	proposalID := uuid.NewString()
@@ -28,12 +27,27 @@ func createClaimFixture(t *testing.T, db *sql.DB, ownerDB *sql.DB) fixture {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.jobs WHERE database_id = $1", dbID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.migration_proposals WHERE database_id = $1", dbID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.migration_drafts WHERE database_id = $1", dbID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.database_connections WHERE id = $1", dbID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.migration_target_state WHERE id = $1", targetID)
-		_, _ = ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.users WHERE id = $1", actorID)
+		for _, query := range []string{
+			"DELETE FROM app.job_commit_proofs WHERE job_id IN (SELECT id FROM app.jobs WHERE database_id = $1)",
+			"DELETE FROM app.job_dispatch_authorizations WHERE job_id IN (SELECT id FROM app.jobs WHERE database_id = $1)",
+			"DELETE FROM app.job_statement_evidence WHERE attempt_id IN (SELECT id FROM app.job_attempts WHERE database_id = $1)",
+			"DELETE FROM app.job_attempts WHERE database_id = $1",
+			"DELETE FROM app.jobs WHERE database_id = $1",
+			"DELETE FROM app.migration_proposals WHERE database_id = $1",
+			"DELETE FROM app.migration_executions WHERE database_id = $1",
+			"DELETE FROM app.migration_drafts WHERE database_id = $1",
+			"DELETE FROM app.database_connections WHERE id = $1",
+		} {
+			if _, err := ownerDB.ExecContext(cleanupCtx, query, dbID); err != nil {
+				t.Errorf("cleanup %s: %v", query, err)
+			}
+		}
+		if _, err := ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.migration_target_state WHERE id = $1", targetID); err != nil {
+			t.Errorf("cleanup target state: %v", err)
+		}
+		if _, err := ownerDB.ExecContext(cleanupCtx, "DELETE FROM app.users WHERE id = $1", actorID); err != nil {
+			t.Errorf("cleanup user: %v", err)
+		}
 	})
 
 	username := "u_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
@@ -111,9 +125,13 @@ func TestClaimJob_RevalidationRequest(t *testing.T) {
 	source := uuid.NewString()
 	for _, sourceID := range []*string{nil, &source} {
 		f := createClaimFixture(t, platformDB, ownerDB)
+		if sourceID != nil {
+			createFixtureSource(t, ctx, platformDB, f, *sourceID)
+		}
+		proposalID := createFixtureProposal(t, ctx, platformDB, f, executioncontract.Rollback, sourceID)
 		req := executioncontract.EnqueueRequest{
 			DatabaseID: f.dbID, TargetID: f.targetID, RequestID: uuid.NewString(),
-			ProposalID: f.proposalID, MigrationID: f.draftID, Revision: 1,
+			ProposalID: proposalID, MigrationID: f.draftID, Revision: 1,
 			ActorID: f.actorID, Action: executioncontract.Rollback, Direction: executioncontract.Down,
 			SourceExecutionID: sourceID, Snapshot: f.snapshot, SnapshotHash: f.hash,
 			ApprovalFingerprint: "nonempty-approval-fingerprint",
@@ -207,7 +225,7 @@ func TestClaimJob_ConcurrentWorkersCompetition(t *testing.T) {
 		w1Claim, w1Err = svc.ClaimJob(ctx, ClaimRequest{
 			WorkerID:      "worker-1",
 			LeaseDuration: 30 * time.Second,
-			AfterLock: func(ctx context.Context) error {
+			afterLock: func(ctx context.Context) error {
 				close(w1HoldingLock)
 				select {
 				case <-w2Done:
@@ -596,16 +614,71 @@ func TestClaimJob_Takeover_ProvablyPreDispatchSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Worker 2 takes over the expired pre-dispatch job
+	// Worker 2 calls ClaimJob after Worker 1 lease expiry: job transitions to retry_wait and is not due yet
+	claimNotDue, err := svc.ClaimJob(ctx, ClaimRequest{
+		WorkerID:      "worker-2",
+		LeaseDuration: 45 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("worker-2 claim returned error: %v", err)
+	}
+	if claimNotDue != nil {
+		t.Fatalf("expected nil claim before retry is due, got: %+v", claimNotDue)
+	}
+
+	// Verify job transitioned to retry_wait with cleared ownership and future next_retry_at
+	var (
+		waitStatus     string
+		waitExecStatus string
+		waitClaimedBy  sql.NullString
+		waitToken      sql.NullString
+		waitExpiresAt  *time.Time
+		waitNextRetry  *time.Time
+		waitAttemptNo  int
+		waitErrCode    sql.NullString
+		waitRetryable  sql.NullBool
+	)
+	err = platformDB.QueryRowContext(ctx, `
+		SELECT status, execution_status, claimed_by, lease_token::text, lease_expires_at, next_retry_at,
+		       attempt_no, error_code, error_retryable
+		FROM app.jobs
+		WHERE id = $1
+	`, res.JobID).Scan(&waitStatus, &waitExecStatus, &waitClaimedBy, &waitToken, &waitExpiresAt, &waitNextRetry, &waitAttemptNo, &waitErrCode, &waitRetryable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waitStatus != "retry_wait" || waitExecStatus != "retry_wait" {
+		t.Fatalf("job status = %s / %s, want retry_wait/retry_wait", waitStatus, waitExecStatus)
+	}
+	if waitClaimedBy.Valid || waitToken.Valid || waitExpiresAt != nil {
+		t.Fatalf("ownership not cleared: claimed_by=%v token=%v expires_at=%v", waitClaimedBy, waitToken, waitExpiresAt)
+	}
+	if waitNextRetry == nil || !waitNextRetry.After(time.Now()) {
+		t.Fatalf("expected next_retry_at in future, got %v", waitNextRetry)
+	}
+	if waitAttemptNo != 1 {
+		t.Fatalf("attempt_no = %d, want 1 before due claim", waitAttemptNo)
+	}
+	if !waitErrCode.Valid || waitErrCode.String != "LEASE_EXPIRED" || !waitRetryable.Valid || !waitRetryable.Bool {
+		t.Fatalf("unexpected error fields: code=%v retryable=%v", waitErrCode, waitRetryable)
+	}
+
+	// Fast-forward next_retry_at without sleeps so retry is due
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET next_retry_at = clock_timestamp() - interval '1 second' WHERE id = $1", res.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Worker 2 claims the now-due scheduled retry
 	claim2, err := svc.ClaimJob(ctx, ClaimRequest{
 		WorkerID:      "worker-2",
 		LeaseDuration: 45 * time.Second,
 	})
 	if err != nil {
-		t.Fatalf("worker-2 takeover returned error: %v", err)
+		t.Fatalf("worker-2 due claim returned error: %v", err)
 	}
 	if claim2 == nil {
-		t.Fatal("worker-2 takeover expected claim, got nil")
+		t.Fatal("worker-2 due claim expected claim, got nil")
 	}
 
 	// Verify claim2 attributes
@@ -955,7 +1028,7 @@ func TestClaimJob_Takeover_LeavesEnteredOrUncertainSQLAlone(t *testing.T) {
 	})
 }
 
-func TestClaimJob_Takeover_ExcludesExpiredSourceLinkedJobWithEvidence(t *testing.T) {
+func TestClaimJob_SourceEvidenceBlocksQueuedResume(t *testing.T) {
 	platformDB, ownerDB := testDBs(t)
 	f := createClaimFixture(t, platformDB, ownerDB)
 	svc := New(platformDB)
@@ -998,7 +1071,7 @@ func TestClaimJob_Takeover_ExcludesExpiredSourceLinkedJobWithEvidence(t *testing
 		t.Fatalf("worker-source initial claim failed: claim=%+v, err=%v", claim1, err)
 	}
 
-	// Add partial statement evidence to source attempt and transition source attempt/job to terminal failure
+	// Unproven source evidence keeps the physical target blocked.
 	_, err = platformDB.ExecContext(ctx, `
 		INSERT INTO app.job_statement_evidence (attempt_id, ordinal, sql_text, outcome)
 		VALUES ($1, 1, 'CREATE TABLE items (id int);', 'succeeded')
@@ -1006,17 +1079,19 @@ func TestClaimJob_Takeover_ExcludesExpiredSourceLinkedJobWithEvidence(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = platformDB.ExecContext(ctx, "UPDATE app.job_attempts SET status = 'partial', finished_at = clock_timestamp() WHERE id = $1", claim1.AttemptID)
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.job_attempts SET status = 'failed', finished_at = clock_timestamp() WHERE id = $1", claim1.AttemptID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET status = 'failed', execution_status = 'partial', finished_at = clock_timestamp() WHERE id = $1", res1.JobID)
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET status = 'failed', execution_status = 'failed', finished_at = clock_timestamp() WHERE id = $1", res1.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Enqueue resume job referencing source execution
 	sourceExecID := claim1.ExecutionID
+	createFixtureSource(t, ctx, platformDB, f, sourceExecID)
+	resumeProposalID := createFixtureProposal(t, ctx, platformDB, f, executioncontract.Resume, &sourceExecID)
 	tx2, err := platformDB.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1025,7 +1100,7 @@ func TestClaimJob_Takeover_ExcludesExpiredSourceLinkedJobWithEvidence(t *testing
 		DatabaseID:          f.dbID,
 		TargetID:            f.targetID,
 		RequestID:           uuid.NewString(),
-		ProposalID:          f.proposalID,
+		ProposalID:          resumeProposalID,
 		MigrationID:         f.draftID,
 		Revision:            1,
 		ActorID:             f.actorID,
@@ -1045,65 +1120,708 @@ func TestClaimJob_Takeover_ExcludesExpiredSourceLinkedJobWithEvidence(t *testing
 		t.Fatal(err)
 	}
 
-	// Initial queued claim for the resume job must succeed
 	claim2, err := svc.ClaimJob(ctx, ClaimRequest{
 		WorkerID:      "worker-resume",
 		LeaseDuration: 30 * time.Second,
 	})
-	if err != nil || claim2 == nil {
-		t.Fatalf("worker-resume initial claim failed: claim=%+v, err=%v", claim2, err)
+	if err != nil || claim2 != nil {
+		t.Fatalf("source evidence must prevent dispatch: claim=%+v err=%v", claim2, err)
 	}
-	if claim2.JobID != res2.JobID {
-		t.Fatalf("claimed job_id = %s, want %s", claim2.JobID, res2.JobID)
+	var status, executionStatus, source string
+	var attemptNo, attempts, sourceEvidence int
+	var blocked, hasLease bool
+	err = platformDB.QueryRowContext(ctx, `
+		SELECT status, execution_status, source_execution_id::text, attempt_no, blocks_database,
+		       lease_token IS NOT NULL,
+		       (SELECT count(*) FROM app.job_attempts WHERE job_id = $1),
+		       (SELECT count(*) FROM app.job_statement_evidence WHERE attempt_id = $2)
+		FROM app.jobs WHERE id = $1
+	`, res2.JobID, claim1.AttemptID).Scan(&status, &executionStatus, &source, &attemptNo, &blocked, &hasLease, &attempts, &sourceEvidence)
+	if err != nil || status != "queued" || executionStatus != "queued" || source != sourceExecID ||
+		attemptNo != 1 || blocked || hasLease || attempts != 0 || sourceEvidence != 1 {
+		t.Fatalf("queued resume changed: status=%s execution=%s source=%s attempt=%d blocked=%v lease=%v attempts=%d sourceEvidence=%d err=%v",
+			status, executionStatus, source, attemptNo, blocked, hasLease, attempts, sourceEvidence, err)
 	}
-	if claim2.AttemptNo != 1 {
-		t.Fatalf("claimed attempt_no = %d, want 1", claim2.AttemptNo)
+}
+
+func TestClaimJob_ScheduledRetry_NotDue(t *testing.T) {
+	platformDB, ownerDB := testDBs(t)
+	f := createClaimFixture(t, platformDB, ownerDB)
+	svc := New(platformDB)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tx, err := platformDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := executioncontract.EnqueueRequest{
+		DatabaseID:          f.dbID,
+		TargetID:            f.targetID,
+		RequestID:           uuid.NewString(),
+		ProposalID:          f.proposalID,
+		MigrationID:         f.draftID,
+		Revision:            1,
+		ActorID:             f.actorID,
+		Action:              executioncontract.Apply,
+		Direction:           executioncontract.Up,
+		Snapshot:            f.snapshot,
+		SnapshotHash:        f.hash,
+		ApprovalFingerprint: "fp_not_due",
+	}
+	res, err := svc.EnqueueTx(ctx, tx, req)
+	if err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 
-	// Expire the resume job's lease without sleep
-	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res2.JobID)
+	claim1, err := svc.ClaimJob(ctx, ClaimRequest{
+		WorkerID:      "worker-1",
+		LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || claim1 == nil {
+		t.Fatalf("worker-1 initial claim failed: claim=%+v, err=%v", claim1, err)
+	}
+
+	// Expire lease
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Takeover attempt must not reclaim the expired source-derived job
-	takeoverClaim, err := svc.ClaimJob(ctx, ClaimRequest{
-		WorkerID:      "worker-takeover",
+	// Worker 2 calls ClaimJob: job should transition to retry_wait and return nil
+	claim2, err := svc.ClaimJob(ctx, ClaimRequest{
+		WorkerID:      "worker-2",
 		LeaseDuration: 30 * time.Second,
 	})
 	if err != nil {
-		t.Fatalf("takeover ClaimJob returned error: %v", err)
+		t.Fatalf("worker-2 ClaimJob error: %v", err)
 	}
-	if takeoverClaim != nil {
-		t.Fatalf("expected expired source-derived job not to be reclaimed, but got claim: %+v", takeoverClaim)
+	if claim2 != nil {
+		t.Fatalf("expected nil claim before retry is due, got %+v", claim2)
 	}
 
-	// Verify resume job in app.jobs was not mutated
+	// Worker 3 calls ClaimJob while next_retry_at is still in future: should still get nil
+	claim3, err := svc.ClaimJob(ctx, ClaimRequest{
+		WorkerID:      "worker-3",
+		LeaseDuration: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("worker-3 ClaimJob error: %v", err)
+	}
+	if claim3 != nil {
+		t.Fatalf("expected nil claim from worker-3 while not due, got %+v", claim3)
+	}
+
+	// Verify app.jobs state remains retry_wait with cleared ownership
 	var (
-		dbClaimedBy string
-		dbToken     string
-		dbStatus    string
-		dbAttemptNo int
+		status      string
+		claimedBy   sql.NullString
+		leaseToken  sql.NullString
+		nextRetryAt *time.Time
 	)
-	err = platformDB.QueryRowContext(ctx, "SELECT claimed_by, lease_token::text, status, attempt_no FROM app.jobs WHERE id = $1", res2.JobID).Scan(&dbClaimedBy, &dbToken, &dbStatus, &dbAttemptNo)
+	err = platformDB.QueryRowContext(ctx, "SELECT status, claimed_by, lease_token::text, next_retry_at FROM app.jobs WHERE id = $1", res.JobID).Scan(&status, &claimedBy, &leaseToken, &nextRetryAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dbClaimedBy != "worker-resume" || dbToken != claim2.LeaseToken || dbStatus != "running" || dbAttemptNo != 1 {
-		t.Fatalf("app.jobs mutated: claimed_by=%s token=%s status=%s attempt_no=%d", dbClaimedBy, dbToken, dbStatus, dbAttemptNo)
+	if status != "retry_wait" {
+		t.Errorf("status = %s, want retry_wait", status)
 	}
+	if claimedBy.Valid || leaseToken.Valid {
+		t.Errorf("ownership not cleared: claimed_by=%v lease_token=%v", claimedBy, leaseToken)
+	}
+	if nextRetryAt == nil || !nextRetryAt.After(time.Now()) {
+		t.Errorf("expected next_retry_at in future, got %v", nextRetryAt)
+	}
+}
 
-	// Verify local attempt in app.job_attempts was not mutated or superseded
-	var (
-		attemptCount      int
-		attemptStatus     string
-		attemptSqlEntered bool
-	)
-	err = platformDB.QueryRowContext(ctx, "SELECT count(*), min(status), bool_or(sql_entered) FROM app.job_attempts WHERE job_id = $1", res2.JobID).Scan(&attemptCount, &attemptStatus, &attemptSqlEntered)
+func TestClaimJob_ScheduledRetry_DueOpensSingleAttempt(t *testing.T) {
+	platformDB, ownerDB := testDBs(t)
+	f := createClaimFixture(t, platformDB, ownerDB)
+	svc := New(platformDB)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tx, err := platformDB.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if attemptCount != 1 || attemptStatus != "running" || attemptSqlEntered {
-		t.Fatalf("job_attempts mutated: count=%d status=%s sql_entered=%v", attemptCount, attemptStatus, attemptSqlEntered)
+	req := executioncontract.EnqueueRequest{
+		DatabaseID:          f.dbID,
+		TargetID:            f.targetID,
+		RequestID:           uuid.NewString(),
+		ProposalID:          f.proposalID,
+		MigrationID:         f.draftID,
+		Revision:            1,
+		ActorID:             f.actorID,
+		Action:              executioncontract.Apply,
+		Direction:           executioncontract.Up,
+		Snapshot:            f.snapshot,
+		SnapshotHash:        f.hash,
+		ApprovalFingerprint: "fp_due_single",
+	}
+	res, err := svc.EnqueueTx(ctx, tx, req)
+	if err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	claim1, err := svc.ClaimJob(ctx, ClaimRequest{
+		WorkerID:      "worker-1",
+		LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || claim1 == nil {
+		t.Fatalf("worker-1 initial claim failed: %v", err)
+	}
+
+	// Expire lease
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Trigger reclaim to retry_wait
+	claimNotDue, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-2", LeaseDuration: 30 * time.Second})
+	if err != nil || claimNotDue != nil {
+		t.Fatalf("expected nil claim during reclaim, got claim=%+v err=%v", claimNotDue, err)
+	}
+
+	// Fast-forward next_retry_at to past (due)
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET next_retry_at = clock_timestamp() - interval '2 seconds' WHERE id = $1", res.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Worker 2 claims the due retry
+	claim2, err := svc.ClaimJob(ctx, ClaimRequest{
+		WorkerID:      "worker-2",
+		LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || claim2 == nil {
+		t.Fatalf("worker-2 claim due retry failed: claim=%+v, err=%v", claim2, err)
+	}
+
+	if claim2.AttemptNo != 2 {
+		t.Errorf("claim2.AttemptNo = %d, want 2", claim2.AttemptNo)
+	}
+	if claim2.AttemptID == claim1.AttemptID || claim2.AttemptID == "" {
+		t.Errorf("claim2.AttemptID = %s, want fresh UUID distinct from %s", claim2.AttemptID, claim1.AttemptID)
+	}
+	if claim2.LeaseToken == claim1.LeaseToken || claim2.LeaseToken == "" {
+		t.Errorf("claim2.LeaseToken = %s, want fresh UUID distinct from %s", claim2.LeaseToken, claim1.LeaseToken)
+	}
+
+	// Verify exactly 2 attempts exist in app.job_attempts
+	var attemptCount int
+	err = platformDB.QueryRowContext(ctx, "SELECT count(*) FROM app.job_attempts WHERE job_id = $1", res.JobID).Scan(&attemptCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attemptCount != 2 {
+		t.Fatalf("expected exactly 2 attempts in app.job_attempts, got %d", attemptCount)
+	}
+}
+
+func TestClaimJob_ScheduledRetry_RepeatedExpiryBound(t *testing.T) {
+	platformDB, ownerDB := testDBs(t)
+	f := createClaimFixture(t, platformDB, ownerDB)
+	svc := New(platformDB)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	tx, err := platformDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := executioncontract.EnqueueRequest{
+		DatabaseID:          f.dbID,
+		TargetID:            f.targetID,
+		RequestID:           uuid.NewString(),
+		ProposalID:          f.proposalID,
+		MigrationID:         f.draftID,
+		Revision:            1,
+		ActorID:             f.actorID,
+		Action:              executioncontract.Apply,
+		Direction:           executioncontract.Up,
+		Snapshot:            f.snapshot,
+		SnapshotHash:        f.hash,
+		ApprovalFingerprint: "fp_bound",
+	}
+	res, err := svc.EnqueueTx(ctx, tx, req)
+	if err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attempt 1: Claim and expire
+	c1, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w1", LeaseDuration: 30 * time.Second})
+	if err != nil || c1 == nil || c1.AttemptNo != 1 {
+		t.Fatalf("c1 failed: %+v, %v", c1, err)
+	}
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reclaim attempt 1 -> retry_wait
+	r1, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w2", LeaseDuration: 30 * time.Second})
+	if err != nil || r1 != nil {
+		t.Fatalf("expected nil claim on reclaim 1, got %+v, %v", r1, err)
+	}
+
+	// Make due and claim Attempt 2
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET next_retry_at = clock_timestamp() - interval '1 second' WHERE id = $1", res.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w2", LeaseDuration: 30 * time.Second})
+	if err != nil || c2 == nil || c2.AttemptNo != 2 {
+		t.Fatalf("c2 failed: %+v, %v", c2, err)
+	}
+	// Expire attempt 2
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reclaim attempt 2 -> retry_wait
+	r2, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w3", LeaseDuration: 30 * time.Second})
+	if err != nil || r2 != nil {
+		t.Fatalf("expected nil claim on reclaim 2, got %+v, %v", r2, err)
+	}
+
+	// Make due and claim Attempt 3 (DefaultMaxAttempts = 3)
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET next_retry_at = clock_timestamp() - interval '1 second' WHERE id = $1", res.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c3, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w3", LeaseDuration: 30 * time.Second})
+	if err != nil || c3 == nil || c3.AttemptNo != 3 {
+		t.Fatalf("c3 failed: %+v, %v", c3, err)
+	}
+	// Expire attempt 3
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reclaim attempt 3: bound reached! Should transition to 'failed' rather than 'retry_wait'
+	r3, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w4", LeaseDuration: 30 * time.Second})
+	if err != nil || r3 != nil {
+		t.Fatalf("expected nil claim on bound reached, got %+v, %v", r3, err)
+	}
+
+	// Verify terminal failed state on app.jobs
+	var (
+		jobStatus    string
+		execStatus   string
+		claimedBy    sql.NullString
+		leaseToken   sql.NullString
+		nextRetryAt  *time.Time
+		finishedAt   *time.Time
+		errCode      string
+		errRetryable bool
+	)
+	err = platformDB.QueryRowContext(ctx, `
+		SELECT status, execution_status, claimed_by, lease_token::text, next_retry_at, finished_at,
+		       COALESCE(error_code, ''), COALESCE(error_retryable, true)
+		FROM app.jobs
+		WHERE id = $1
+	`, res.JobID).Scan(&jobStatus, &execStatus, &claimedBy, &leaseToken, &nextRetryAt, &finishedAt, &errCode, &errRetryable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != "failed" || execStatus != "failed" {
+		t.Errorf("job status = %s / %s, want failed/failed", jobStatus, execStatus)
+	}
+	if claimedBy.Valid || leaseToken.Valid {
+		t.Errorf("ownership should be cleared: claimed_by=%v token=%v", claimedBy, leaseToken)
+	}
+	if nextRetryAt != nil {
+		t.Errorf("next_retry_at should be null at bound, got %v", nextRetryAt)
+	}
+	if finishedAt == nil {
+		t.Errorf("finished_at should not be null for terminal failure")
+	}
+	if errRetryable {
+		t.Errorf("error_retryable = true, want false at bound")
+	}
+	if errCode != "LEASE_EXPIRED" {
+		t.Errorf("errCode = %s, want LEASE_EXPIRED", errCode)
+	}
+
+	// Verify all 3 attempts recorded in app.job_attempts
+	var attemptCount int
+	err = platformDB.QueryRowContext(ctx, "SELECT count(*) FROM app.job_attempts WHERE job_id = $1 AND status = 'failed' AND error_code = 'LEASE_EXPIRED'", res.JobID).Scan(&attemptCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attemptCount != 3 {
+		t.Fatalf("expected 3 failed attempts in app.job_attempts, got %d", attemptCount)
+	}
+
+	// Verify subsequent claim cannot claim the failed job
+	cFinal, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w5", LeaseDuration: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("cFinal error: %v", err)
+	}
+	if cFinal != nil {
+		t.Fatalf("expected nil claim on permanently failed job, got %+v", cFinal)
+	}
+}
+
+func TestClaimJob_ScheduledRetry_DuplicateOrAmbiguousAttempt(t *testing.T) {
+	platformDB, ownerDB := testDBs(t)
+	svc := New(platformDB)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t.Run("duplicate running attempts prevents reclaim", func(t *testing.T) {
+		f := createClaimFixture(t, platformDB, ownerDB)
+
+		tx, err := platformDB.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := executioncontract.EnqueueRequest{
+			DatabaseID:          f.dbID,
+			TargetID:            f.targetID,
+			RequestID:           uuid.NewString(),
+			ProposalID:          f.proposalID,
+			MigrationID:         f.draftID,
+			Revision:            1,
+			ActorID:             f.actorID,
+			Action:              executioncontract.Apply,
+			Direction:           executioncontract.Up,
+			Snapshot:            f.snapshot,
+			SnapshotHash:        f.hash,
+			ApprovalFingerprint: "fp_dup_att",
+		}
+		res, err := svc.EnqueueTx(ctx, tx, req)
+		if err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+
+		c1, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w1", LeaseDuration: 30 * time.Second})
+		if err != nil || c1 == nil {
+			t.Fatalf("claim failed: %v", err)
+		}
+
+		// Inject duplicate running attempt for same job
+		_, err = platformDB.ExecContext(ctx, `
+			INSERT INTO app.job_attempts (
+				job_id, execution_id, database_id, migration_id, revision,
+				actor_id, attempt_no, status, sql_entered, started_at, created_at
+			) VALUES (
+				$1, $2, $3, $4, 1,
+				$5, 1, 'running', false, clock_timestamp(), clock_timestamp()
+			)
+		`, res.JobID, c1.ExecutionID, f.dbID, f.draftID, f.actorID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Expire lease
+		_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Worker 2 calls ClaimJob: ambiguous attempt state must reject reclaim
+		c2, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w2", LeaseDuration: 30 * time.Second})
+		if err != nil {
+			t.Fatalf("ClaimJob error: %v", err)
+		}
+		if c2 != nil {
+			t.Fatalf("expected nil claim on ambiguous job, got %+v", c2)
+		}
+
+		// Job must remain untouched (running, original claimed_by)
+		var status, claimedBy string
+		err = platformDB.QueryRowContext(ctx, "SELECT status, claimed_by FROM app.jobs WHERE id = $1", res.JobID).Scan(&status, &claimedBy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status != "running" || claimedBy != "w1" {
+			t.Errorf("app.jobs altered on ambiguous attempt: status=%s claimed_by=%s", status, claimedBy)
+		}
+	})
+
+	t.Run("ambiguous prior attempt state prevents reclaim", func(t *testing.T) {
+		f := createClaimFixture(t, platformDB, ownerDB)
+
+		tx, err := platformDB.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := executioncontract.EnqueueRequest{
+			DatabaseID:          f.dbID,
+			TargetID:            f.targetID,
+			RequestID:           uuid.NewString(),
+			ProposalID:          f.proposalID,
+			MigrationID:         f.draftID,
+			Revision:            1,
+			ActorID:             f.actorID,
+			Action:              executioncontract.Apply,
+			Direction:           executioncontract.Up,
+			Snapshot:            f.snapshot,
+			SnapshotHash:        f.hash,
+			ApprovalFingerprint: "fp_ambig_prior",
+		}
+		res, err := svc.EnqueueTx(ctx, tx, req)
+		if err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+
+		c1, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w1", LeaseDuration: 30 * time.Second})
+		if err != nil || c1 == nil {
+			t.Fatalf("claim 1 failed: %v", err)
+		}
+
+		// Transition to retry_wait and claim attempt 2
+		_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w2", LeaseDuration: 30 * time.Second})
+		_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET next_retry_at = clock_timestamp() - interval '1 second' WHERE id = $1", res.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c2, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w2", LeaseDuration: 30 * time.Second})
+		if err != nil || c2 == nil || c2.AttemptNo != 2 {
+			t.Fatalf("claim 2 failed: %+v, %v", c2, err)
+		}
+
+		// Mutate prior attempt (attempt 1) to an ambiguous state: status = 'unknown'
+		_, err = platformDB.ExecContext(ctx, "UPDATE app.job_attempts SET status = 'unknown' WHERE id = $1", c1.AttemptID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Expire attempt 2's lease
+		_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Worker 3 calls ClaimJob: ambiguous prior attempt state must prevent reclaim
+		c3, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w3", LeaseDuration: 30 * time.Second})
+		if err != nil {
+			t.Fatalf("ClaimJob error: %v", err)
+		}
+		if c3 != nil {
+			t.Fatalf("expected nil claim on ambiguous prior attempt, got %+v", c3)
+		}
+
+		// Verify job remains in running on attempt 2
+		var status string
+		var attemptNo int
+		err = platformDB.QueryRowContext(ctx, "SELECT status, attempt_no FROM app.jobs WHERE id = $1", res.JobID).Scan(&status, &attemptNo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status != "running" || attemptNo != 2 {
+			t.Errorf("job state mutated despite ambiguous prior attempt: status=%s attempt_no=%d", status, attemptNo)
+		}
+	})
+}
+
+func TestClaimJob_ScheduledRetry_Scope(t *testing.T) {
+	platformDB, ownerDB := testDBs(t)
+	svc := New(platformDB)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	f1 := createClaimFixture(t, platformDB, ownerDB)
+	f2 := createClaimFixture(t, platformDB, ownerDB)
+
+	tx1, err := platformDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res1, err := svc.EnqueueTx(ctx, tx1, executioncontract.EnqueueRequest{
+		DatabaseID:          f1.dbID,
+		TargetID:            f1.targetID,
+		RequestID:           uuid.NewString(),
+		ProposalID:          f1.proposalID,
+		MigrationID:         f1.draftID,
+		Revision:            1,
+		ActorID:             f1.actorID,
+		Action:              executioncontract.Apply,
+		Direction:           executioncontract.Up,
+		Snapshot:            f1.snapshot,
+		SnapshotHash:        f1.hash,
+		ApprovalFingerprint: "fp_scope_1",
+	})
+	if err != nil {
+		tx1.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx1.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	tx2, err := platformDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2, err := svc.EnqueueTx(ctx, tx2, executioncontract.EnqueueRequest{
+		DatabaseID:          f2.dbID,
+		TargetID:            f2.targetID,
+		RequestID:           uuid.NewString(),
+		ProposalID:          f2.proposalID,
+		MigrationID:         f2.draftID,
+		Revision:            1,
+		ActorID:             f2.actorID,
+		Action:              executioncontract.Apply,
+		Direction:           executioncontract.Up,
+		Snapshot:            f2.snapshot,
+		SnapshotHash:        f2.hash,
+		ApprovalFingerprint: "fp_scope_2",
+	})
+	if err != nil {
+		tx2.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Worker 1 claims job 1
+	c1, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w1", LeaseDuration: 30 * time.Second})
+	if err != nil || c1 == nil || c1.JobID != res1.JobID {
+		t.Fatalf("expected job 1 claim, got %+v, %v", c1, err)
+	}
+
+	// Expire job 1's lease
+	_, err = platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '5 seconds' WHERE id = $1", res1.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Worker 2 calls ClaimJob:
+	// Job 1 is reclaimed to retry_wait (not due).
+	// Job 2 (which is queued on db2) should now be claimed!
+	c2, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "w2", LeaseDuration: 30 * time.Second})
+	if err != nil || c2 == nil {
+		t.Fatalf("expected job 2 claim, got %+v, %v", c2, err)
+	}
+	if c2.JobID != res2.JobID || c2.DatabaseID != f2.dbID {
+		t.Fatalf("claimed job mismatch: got jobID=%s dbID=%s, want %s on %s", c2.JobID, c2.DatabaseID, res2.JobID, f2.dbID)
+	}
+
+	// Scope read isolation:
+	job1View, err := svc.GetJob(ctx, f1.dbID, res1.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(f1.dbID, res1.JobID) error: %v", err)
+	}
+	if job1View.Status != executioncontract.RetryWait {
+		t.Errorf("job 1 view status = %s, want retry_wait", job1View.Status)
+	}
+	if job1View.NextRetryAt == nil {
+		t.Errorf("job 1 view next_retry_at should not be nil")
+	}
+
+	// GetJob on database 2 attempting to access job 1 MUST return NOT_FOUND (scoped)
+	_, err = svc.GetJob(ctx, f2.dbID, res1.JobID)
+	if err == nil {
+		t.Fatalf("expected error reading job 1 with database 2 scope, got nil")
+	}
+	var contractErr executioncontract.ContractError
+	if errors.As(err, &contractErr) && contractErr.Code != "NOT_FOUND" {
+		t.Errorf("contract error code = %s, want NOT_FOUND", contractErr.Code)
+	}
+}
+
+func TestReclaimExpiredJobsSkipsAmbiguousFirstCandidate(t *testing.T) {
+	db, owner := testDBs(t)
+	svc := New(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	first, second := createClaimFixture(t, db, owner), createClaimFixture(t, db, owner)
+	enqueue := func(f fixture) {
+		t.Helper()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		_, err = svc.EnqueueTx(ctx, tx, executioncontract.EnqueueRequest{
+			DatabaseID: f.dbID, TargetID: f.targetID, RequestID: uuid.NewString(),
+			ProposalID: f.proposalID, MigrationID: f.draftID, Revision: 1,
+			ActorID: f.actorID, Action: executioncontract.Apply, Direction: executioncontract.Up,
+			Snapshot: f.snapshot, SnapshotHash: f.hash, ApprovalFingerprint: "fp",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enqueue(first)
+	a, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "first"})
+	if err != nil || a == nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	enqueue(second)
+	b, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "second"})
+	if err != nil || b == nil {
+		t.Fatalf("second claim: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `INSERT INTO app.job_attempts
+		(job_id, execution_id, database_id, migration_id, revision, actor_id, attempt_no, status)
+		SELECT job_id, execution_id, database_id, migration_id, revision, actor_id, attempt_no, status
+		FROM app.job_attempts WHERE id = $1`, a.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.ExecContext(ctx, `UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '1 second'
+		WHERE id IN ($1, $2)`, a.JobID, b.JobID); err != nil {
+		t.Fatal(err)
+	}
+	n, err := svc.ReclaimExpiredJobs(ctx, DefaultMaxAttempts, DefaultRetryDelay)
+	if err != nil || n != 1 {
+		t.Fatalf("reclaim count = %d, error = %v", n, err)
+	}
+	var firstStatus, secondStatus string
+	if err = db.QueryRowContext(ctx, `SELECT status FROM app.jobs WHERE id = $1`, a.JobID).Scan(&firstStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRowContext(ctx, `SELECT status FROM app.jobs WHERE id = $1`, b.JobID).Scan(&secondStatus); err != nil {
+		t.Fatal(err)
+	}
+	if firstStatus != "running" || secondStatus != "retry_wait" {
+		t.Fatalf("statuses = %s, %s", firstStatus, secondStatus)
+	}
+	if _, err = db.ExecContext(ctx, `UPDATE app.jobs SET next_retry_at = NULL WHERE id = $1`, b.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "third"}); err != nil || c != nil {
+		t.Fatalf("unscheduled retry claimed: claim=%+v err=%v", c, err)
+	}
+	if _, err = db.ExecContext(ctx, `UPDATE app.jobs SET next_retry_at = clock_timestamp() - interval '1 second' WHERE id = $1`, b.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "third", MaxAttempts: 1}); err != nil || c != nil {
+		t.Fatalf("retry exceeded configured bound: claim=%+v err=%v", c, err)
+	}
+	if c, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "third"}); err != nil || c == nil || c.JobID != b.JobID {
+		t.Fatalf("eligible retry was not claimed: claim=%+v err=%v", c, err)
 	}
 }
