@@ -29,11 +29,14 @@ test "${passwords[${prefix}_EXECUTOR_PASSWORD]}" != "${passwords[${prefix}_PREPA
 mkdir -p db/smoke-test
 snapshot_001=$(mktemp db/smoke-test/target-profile-001.XXXXXX.sql)
 snapshot_002=$(mktemp db/smoke-test/target-profile-002.XXXXXX.sql)
-trap 'rm -f -- "$snapshot_001" "$snapshot_002"' EXIT
+snapshot_003=$(mktemp db/smoke-test/target-profile-003.XXXXXX.sql)
+trap 'rm -f -- "$snapshot_001" "$snapshot_002" "$snapshot_003"' EXIT
 cp db/target-profile/001_receipts.sql "$snapshot_001"
 cp db/target-profile/002_batch_checkpoints.sql "$snapshot_002"
+cp db/target-profile/003_batch_scopes.sql "$snapshot_003"
 checksum_001=$(sha256sum "$snapshot_001" | cut -d ' ' -f1)
 checksum_002=$(sha256sum "$snapshot_002" | cut -d ' ' -f1)
+checksum_003=$(sha256sum "$snapshot_003" | cut -d ' ' -f1)
 
 # Sandi dikirim melalui stdin, bukan argumen proses.
 {
@@ -85,7 +88,22 @@ SQL
   cat <<'SQL'
 INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('002_batch_checkpoints', :'checksum_002');
 \endif
-SELECT (SELECT count(*) = 2 FROM wbd_auth.profile_migrations) AS profile_count_ok \gset
+SELECT EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'wbd_auth' AND tablename = 'profile_migrations')
+       AND EXISTS (SELECT 1 FROM wbd_auth.profile_migrations WHERE version = '003_batch_scopes') AS v003_exists \gset
+\if :v003_exists
+SELECT (SELECT count(*) = 1 FROM wbd_auth.profile_migrations WHERE version = '003_batch_scopes' AND checksum = :'checksum_003') AS checksum_003_matches \gset
+\if :checksum_003_matches
+\else
+\echo 'Target profile 003 checksum mismatch'
+SELECT 1 / 0;
+\endif
+\else
+SQL
+  cat "$snapshot_003"
+  cat <<'SQL'
+INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('003_batch_scopes', :'checksum_003');
+\endif
+SELECT (SELECT count(*) = 3 FROM wbd_auth.profile_migrations) AS profile_count_ok \gset
 \if :profile_count_ok
 \else
 \echo 'Unexpected profile migrations present'
@@ -93,7 +111,9 @@ SELECT 1 / 0;
 \endif
 \if :profile_exists
 \if :v002_exists
+\if :v003_exists
 \echo 'Target profile already applied with matching checksum; no-op.'
+\endif
 \endif
 \endif
 COMMIT;
@@ -105,6 +125,6 @@ SQL
   export TARGET_EXECUTOR_PASSWORD TARGET_PREPARER_PASSWORD TARGET_VIEWER_PASSWORD
   TARGET_SLOT=$2; export TARGET_SLOT
   case "$2" in a) [ "$1" = "$DB_TARGET_A" ] ;; b) [ "$1" = "$DB_TARGET_B" ] ;; esac || exit 1
-  PGPASSWORD=$POSTGRES_PASSWORD exec psql -X -q -h "$3" -U "$POSTGRES_USER" -d "$1" -v expected_target="$1" -v profile_checksum="$4" -v checksum_001="$4" -v checksum_002="$5"
-' sh "$target" "$slot" "$service" "$checksum_001" "$checksum_002"
+  PGPASSWORD=$POSTGRES_PASSWORD exec psql -X -q -h "$3" -U "$POSTGRES_USER" -d "$1" -v expected_target="$1" -v profile_checksum="$4" -v checksum_001="$4" -v checksum_002="$5" -v checksum_003="$6"
+' sh "$target" "$slot" "$service" "$checksum_001" "$checksum_002" "$checksum_003"
 printf 'PASS %s target %s profile applied or already current\n' "$environment" "$slot"
