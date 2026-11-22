@@ -17,12 +17,16 @@ import (
 )
 
 type p3TestEnv struct {
-	platformDB       *sql.DB
-	ownerDB          *sql.DB
-	targetExecDB     *sql.DB
-	targetPrepDB     *sql.DB
-	targetCleanupDB  *sql.DB
-	physicalTargetID string
+	platformDB        *sql.DB
+	ownerDB           *sql.DB
+	targetExecDB      *sql.DB
+	targetPrepDB      *sql.DB
+	targetCleanupDB   *sql.DB
+	physicalTargetID  string
+	targetExecDB_B    *sql.DB
+	targetPrepDB_B    *sql.DB
+	targetCleanupDB_B *sql.DB
+	physicalTargetID_B string
 }
 
 func setupP3TestEnv(t *testing.T) *p3TestEnv {
@@ -82,13 +86,58 @@ func setupP3TestEnvWithTracking(t *testing.T, enabled bool) *p3TestEnv {
 		t.Skipf("requires track_commit_timestamp=%t, got %s", enabled, tracking)
 	}
 
+	execDSNB := os.Getenv("MIGRATION_TEST_TARGET_B_EXECUTOR_URL")
+	prepDSNB := os.Getenv("MIGRATION_TEST_TARGET_B_PREPARER_URL")
+	cleanupDSNB := os.Getenv("MIGRATION_TEST_TARGET_B_CLEANUP_URL")
+
+	var targetExecDB_B, targetPrepDB_B, targetCleanupDB_B *sql.DB
+	var physicalTargetID_B string
+	if execDSNB != "" && prepDSNB != "" {
+		targetExecDB_B, err = sql.Open("pgx", execDSNB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { targetExecDB_B.Close() })
+
+		targetPrepDB_B, err = sql.Open("pgx", prepDSNB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { targetPrepDB_B.Close() })
+
+		if cleanupDSNB != "" {
+			targetCleanupDB_B, err = sql.Open("pgx", cleanupDSNB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { targetCleanupDB_B.Close() })
+		}
+
+		err = targetPrepDB_B.QueryRowContext(ctx, "SELECT physical_target_id::text FROM wbd_auth.target_marker WHERE singleton").Scan(&physicalTargetID_B)
+		if err != nil {
+			t.Fatalf("query physical target B id: %v", err)
+		}
+
+		var trackingB string
+		if err := targetPrepDB_B.QueryRowContext(ctx, "SHOW track_commit_timestamp").Scan(&trackingB); err != nil {
+			t.Fatalf("read target B commit timestamp setting: %v", err)
+		}
+		if (trackingB == "on") != enabled {
+			t.Skipf("requires target B track_commit_timestamp=%t, got %s", enabled, trackingB)
+		}
+	}
+
 	return &p3TestEnv{
-		platformDB:       platformDB,
-		ownerDB:          ownerDB,
-		targetExecDB:     targetExecDB,
-		targetPrepDB:     targetPrepDB,
-		targetCleanupDB:  targetCleanupDB,
-		physicalTargetID: physicalTargetID,
+		platformDB:        platformDB,
+		ownerDB:           ownerDB,
+		targetExecDB:      targetExecDB,
+		targetPrepDB:      targetPrepDB,
+		targetCleanupDB:   targetCleanupDB,
+		physicalTargetID:  physicalTargetID,
+		targetExecDB_B:    targetExecDB_B,
+		targetPrepDB_B:    targetPrepDB_B,
+		targetCleanupDB_B: targetCleanupDB_B,
+		physicalTargetID_B: physicalTargetID_B,
 	}
 }
 
@@ -109,6 +158,43 @@ func (e *p3TestEnv) makeAcquire(t *testing.T) func(ctx context.Context, database
 	}
 }
 
+func (e *p3TestEnv) makeDualAcquire(t *testing.T, dbID_A, dbID_B string) func(ctx context.Context, databaseID string) (*migration.TargetLease, error) {
+	t.Helper()
+	return func(ctx context.Context, databaseID string) (*migration.TargetLease, error) {
+		switch databaseID {
+		case dbID_A:
+			conn, err := e.targetExecDB.Conn(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &migration.TargetLease{
+				Executor: conn,
+				Preparer: e.targetPrepDB,
+				Release: func() {
+					_ = conn.Close()
+				},
+			}, nil
+		case dbID_B:
+			if e.targetExecDB_B == nil || e.targetPrepDB_B == nil {
+				return nil, errors.New("target B not configured")
+			}
+			conn, err := e.targetExecDB_B.Conn(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &migration.TargetLease{
+				Executor: conn,
+				Preparer: e.targetPrepDB_B,
+				Release: func() {
+					_ = conn.Close()
+				},
+			}, nil
+		default:
+			return nil, errors.New("unknown database ID")
+		}
+	}
+}
+
 type p3JobFixture struct {
 	dbID       string
 	targetID   string
@@ -125,11 +211,14 @@ func createP3JobFixture(t *testing.T, env *p3TestEnv, action executioncontract.A
 }
 
 func createP3JobFixtureOnConnection(t *testing.T, env *p3TestEnv, shared *p3JobFixture, action executioncontract.Action, direction executioncontract.Direction, sqlUp, sqlDown string) p3JobFixture {
+	return createP3JobFixtureFull(t, env, env.physicalTargetID, env.targetExecDB, env.targetCleanupDB, "target_a", "worker-p3-test", shared, action, direction, sqlUp, sqlDown)
+}
+
+func createP3JobFixtureFull(t *testing.T, env *p3TestEnv, targetID string, targetExecDB, targetCleanupDB *sql.DB, dbName, workerID string, shared *p3JobFixture, action executioncontract.Action, direction executioncontract.Direction, sqlUp, sqlDown string) p3JobFixture {
 	t.Helper()
 	ctx := context.Background()
 
 	dbID := uuid.NewString()
-	targetID := env.physicalTargetID
 	actorID := uuid.NewString()
 	draftID := uuid.NewString()
 	proposalID := uuid.NewString()
@@ -144,18 +233,20 @@ func createP3JobFixtureOnConnection(t *testing.T, env *p3TestEnv, shared *p3JobF
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		if env.targetCleanupDB != nil {
+		if targetCleanupDB != nil {
 			for _, query := range []string{
 				"DELETE FROM wbd_auth.execution_receipts WHERE database_id = $1",
 				"DELETE FROM wbd_auth.execution_tickets WHERE database_id = $1",
 			} {
-				if _, err := env.targetCleanupDB.ExecContext(cleanupCtx, query, dbID); err != nil {
+				if _, err := targetCleanupDB.ExecContext(cleanupCtx, query, dbID); err != nil {
 					t.Errorf("cleanup target %s: %v", query, err)
 				}
 			}
 		}
-		if _, err := env.targetExecDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS managed."+tableName); err != nil {
-			t.Errorf("cleanup target table: %v", err)
+		if targetExecDB != nil {
+			if _, err := targetExecDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS managed."+tableName); err != nil {
+				t.Errorf("cleanup target table: %v", err)
+			}
 		}
 		for _, query := range []string{
 			"DELETE FROM app.job_commit_proofs WHERE job_id IN (SELECT id FROM app.jobs WHERE database_id = $1)",
@@ -191,8 +282,8 @@ func createP3JobFixtureOnConnection(t *testing.T, env *p3TestEnv, shared *p3JobF
 		_, err = env.platformDB.ExecContext(ctx, `
 			INSERT INTO app.database_connections
 				(id, name, host, port, database_name, username, password_ciphertext, credential_key_id, ssl_mode, target_key, execution_target_id)
-			VALUES ($1, $2, 'postgres-test', 5432, 'target_a', 'user', '\x01', 'key1', 'disable', $3, $4)
-		`, dbID, connName, targetKey, targetID)
+			VALUES ($1, $2, 'postgres-test', 5432, $3, 'user', '\x01', 'key1', 'disable', $4, $5)
+		`, dbID, connName, dbName, targetKey, targetID)
 		if err != nil {
 			t.Fatalf("insert connection: %v", err)
 		}
@@ -269,7 +360,7 @@ func createP3JobFixtureOnConnection(t *testing.T, env *p3TestEnv, shared *p3JobF
 	}
 
 	claim, err := svc.ClaimJob(ctx, ClaimRequest{
-		WorkerID:      "worker-p3-test",
+		WorkerID:      workerID,
 		LeaseDuration: 45 * time.Second,
 	})
 	if err != nil || claim == nil {
@@ -818,6 +909,144 @@ func TestExecuteStandardJob_TargetAdvisoryLockProtection(t *testing.T) {
 	// Release Worker 1
 	close(holdLock)
 	wg.Wait()
+}
+// 7b. Decisive integration test for distinct physical target parallel execution
+func TestExecuteStandardJob_DistinctPhysicalTargets_ParallelExecution(t *testing.T) {
+	env := setupP3TestEnv(t)
+	if env.targetExecDB_B == nil || env.physicalTargetID_B == "" {
+		if os.Getenv("TEST_INTEGRATION_REQUIRED") == "1" {
+			t.Fatal("missing target B database configuration")
+		}
+		t.Skip("target B database configuration not set")
+	}
+	if env.physicalTargetID == env.physicalTargetID_B {
+		t.Fatal("target A and target B must be distinct physical targets")
+	}
+
+	svc := New(env.platformDB)
+	ctx := context.Background()
+
+	tableNameA := "items_p3_par_a_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+	sqlUpA := "CREATE TABLE managed." + tableNameA + " (id bigint primary key);"
+	fixA := createP3JobFixtureFull(t, env, env.physicalTargetID, env.targetExecDB, env.targetCleanupDB, "target_a", "worker-par-a", nil, executioncontract.Apply, executioncontract.Up, sqlUpA, "")
+
+	tableNameB := "items_p3_par_b_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+	sqlUpB := "CREATE TABLE managed." + tableNameB + " (id bigint primary key);"
+	fixB := createP3JobFixtureFull(t, env, env.physicalTargetID_B, env.targetExecDB_B, env.targetCleanupDB_B, "target_b", "worker-par-b", nil, executioncontract.Apply, executioncontract.Up, sqlUpB, "")
+
+	fakeGate := func(snapshot executioncontract.Draft) executioncontract.FakeGate {
+		return executioncontract.FakeGate{
+			RevalidateFunc: func(ctx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+				return executioncontract.ExecutionPlan{
+					Request:       req,
+					Snapshot:      snapshot,
+					Version:       "1",
+					ActorUsername: "testactor",
+					ValidatedAt:   time.Now().UTC(),
+				}, nil
+			},
+			RecordCommitFunc: func(ctx context.Context, tx *sql.Tx, in executioncontract.CommitEvidence) error {
+				return nil
+			},
+		}
+	}
+
+	workerAHoldingLock := make(chan struct{})
+	releaseWorkerA := make(chan struct{})
+
+	acquire := env.makeDualAcquire(t, fixA.dbID, fixB.dbID)
+
+	depsA := ExecutionDeps{
+		Gate:    fakeGate(fixA.snapshot),
+		Acquire: acquire,
+		Timeout: 10 * time.Second,
+		beforeDispatch: func(ctx context.Context) error {
+			close(workerAHoldingLock)
+			<-releaseWorkerA
+			return nil
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var outcomeA *ExecutionOutcome
+	var errA error
+	go func() {
+		defer wg.Done()
+		outcomeA, errA = svc.ExecuteStandardJob(ctx, fixA.claim, depsA)
+	}()
+
+	// Wait until Worker A is holding Target A's advisory lock
+	<-workerAHoldingLock
+
+	// While Worker A is paused and holding Target A's lock, execute Worker B on Target B to completion
+	depsB := ExecutionDeps{
+		Gate:    fakeGate(fixB.snapshot),
+		Acquire: acquire,
+		Timeout: 10 * time.Second,
+	}
+
+	outcomeB, errB := svc.ExecuteStandardJob(ctx, fixB.claim, depsB)
+	if errB != nil {
+		close(releaseWorkerA)
+		wg.Wait()
+		t.Fatalf("worker B failed to execute independently: %v", errB)
+	}
+	if outcomeB == nil || outcomeB.Status != executioncontract.Succeeded {
+		close(releaseWorkerA)
+		wg.Wait()
+		t.Fatalf("expected worker B succeeded, got: %+v", outcomeB)
+	}
+
+	// Verify Target B commit and platform finalization completed BEFORE releasing A
+	var jobBStatus string
+	var jobBBlocked bool
+	err := env.platformDB.QueryRowContext(ctx, "SELECT status, blocks_database FROM app.jobs WHERE id = $1", fixB.claim.JobID).Scan(&jobBStatus, &jobBBlocked)
+	if err != nil || jobBStatus != "succeeded" || jobBBlocked {
+		close(releaseWorkerA)
+		wg.Wait()
+		t.Fatalf("job B platform state mismatch: status=%s blocked=%t err=%v", jobBStatus, jobBBlocked, err)
+	}
+
+	var proofBExists bool
+	err = env.platformDB.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM app.job_commit_proofs WHERE job_id = $1)", fixB.claim.JobID).Scan(&proofBExists)
+	if err != nil || !proofBExists {
+		close(releaseWorkerA)
+		wg.Wait()
+		t.Fatalf("job B commit proof missing: %v", err)
+	}
+
+	var tableBExists bool
+	err = env.targetExecDB_B.QueryRowContext(ctx, "SELECT to_regclass($1) IS NOT NULL", "managed."+tableNameB).Scan(&tableBExists)
+	if err != nil || !tableBExists {
+		close(releaseWorkerA)
+		wg.Wait()
+		t.Fatalf("target B table was not committed: %v", err)
+	}
+
+	// Now release Worker A
+	close(releaseWorkerA)
+	wg.Wait()
+
+	if errA != nil {
+		t.Fatalf("worker A failed after release: %v", errA)
+	}
+	if outcomeA == nil || outcomeA.Status != executioncontract.Succeeded {
+		t.Fatalf("expected worker A succeeded, got: %+v", outcomeA)
+	}
+
+	var jobAStatus string
+	var jobABlocked bool
+	err = env.platformDB.QueryRowContext(ctx, "SELECT status, blocks_database FROM app.jobs WHERE id = $1", fixA.claim.JobID).Scan(&jobAStatus, &jobABlocked)
+	if err != nil || jobAStatus != "succeeded" || jobABlocked {
+		t.Fatalf("job A platform state mismatch: status=%s blocked=%t err=%v", jobAStatus, jobABlocked, err)
+	}
+
+	var tableAExists bool
+	err = env.targetExecDB.QueryRowContext(ctx, "SELECT to_regclass($1) IS NOT NULL", "managed."+tableNameA).Scan(&tableAExists)
+	if err != nil || !tableAExists {
+		t.Fatalf("target A table was not committed: %v", err)
+	}
 }
 
 // 8. Decisive test for ambiguous/conflicting receipt protection (never replay SQL, block database)

@@ -7,7 +7,8 @@ environment=$1
 slot=$2
 service=postgres
 compose=(docker compose)
-[[ $environment == test ]] && { service=postgres-test; compose+=(--profile test); }
+test -n "${COMPOSE_PROJECT_NAME:-}" && compose+=(-p "$COMPOSE_PROJECT_NAME")
+if [ "$environment" = test ]; then service=postgres-test; compose+=(--profile test); fi
 target="${environment}_target_${slot}"
 prefix="DB_${environment^^}_TARGET_${slot^^}"
 declare -A passwords=()
@@ -15,7 +16,7 @@ while IFS='=' read -r key value; do
   value=${value%$'\r'}
   case "$key" in
     "${prefix}_EXECUTOR_PASSWORD"|"${prefix}_PREPARER_PASSWORD"|"${prefix}_VIEWER_PASSWORD")
-      [[ -z ${passwords[$key]+present} ]] || fail 'duplicate target password field'
+      test -z "${passwords[$key]+present}" || fail 'duplicate target password field'
       passwords[$key]=$value ;;
   esac
 done < .env
@@ -23,13 +24,16 @@ for role in EXECUTOR PREPARER VIEWER; do
   key="${prefix}_${role}_PASSWORD"
   [[ ${passwords[$key]:-} =~ ^[a-fA-F0-9]{64}$ ]] || fail "set $key to a unique 64-character hexadecimal password in .env"
 done
-[[ ${passwords[${prefix}_EXECUTOR_PASSWORD]} != "${passwords[${prefix}_PREPARER_PASSWORD]}" && ${passwords[${prefix}_EXECUTOR_PASSWORD]} != "${passwords[${prefix}_VIEWER_PASSWORD]}" && ${passwords[${prefix}_PREPARER_PASSWORD]} != "${passwords[${prefix}_VIEWER_PASSWORD]}" ]] || fail 'target passwords must differ'
+test "${passwords[${prefix}_EXECUTOR_PASSWORD]}" != "${passwords[${prefix}_PREPARER_PASSWORD]}" && test "${passwords[${prefix}_EXECUTOR_PASSWORD]}" != "${passwords[${prefix}_VIEWER_PASSWORD]}" && test "${passwords[${prefix}_PREPARER_PASSWORD]}" != "${passwords[${prefix}_VIEWER_PASSWORD]}" || fail 'target passwords must differ'
 
 mkdir -p db/smoke-test
-snapshot=$(mktemp db/smoke-test/target-profile.XXXXXX.sql)
-trap 'rm -f -- "$snapshot"' EXIT
-cp db/target-profile/001_receipts.sql "$snapshot"
-checksum=$(sha256sum "$snapshot" | cut -d ' ' -f1)
+snapshot_001=$(mktemp db/smoke-test/target-profile-001.XXXXXX.sql)
+snapshot_002=$(mktemp db/smoke-test/target-profile-002.XXXXXX.sql)
+trap 'rm -f -- "$snapshot_001" "$snapshot_002"' EXIT
+cp db/target-profile/001_receipts.sql "$snapshot_001"
+cp db/target-profile/002_batch_checkpoints.sql "$snapshot_002"
+checksum_001=$(sha256sum "$snapshot_001" | cut -d ' ' -f1)
+checksum_002=$(sha256sum "$snapshot_002" | cut -d ' ' -f1)
 
 # Sandi dikirim melalui stdin, bukan argumen proses.
 {
@@ -52,22 +56,45 @@ SELECT 1 / 0;
 \endif
 SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'wbd_auth') AS profile_exists \gset
 \if :profile_exists
-SELECT (SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'wbd_auth') = 'wbd_target_' || :'target_slot' || '_receipt_owner'
-       AND (SELECT count(*) = 1 FROM wbd_auth.profile_migrations)
-       AND checksum = :'profile_checksum'
-       AND (SELECT executor_role = 'wbd_target_' || :'target_slot' || '_executor' FROM wbd_auth.target_marker WHERE singleton) AS checksum_matches
-FROM wbd_auth.profile_migrations WHERE version = '001_receipts' \gset
-\if :checksum_matches
-\echo 'Target profile already applied with matching checksum; no-op.'
+SELECT (SELECT count(*) = 1 FROM wbd_auth.profile_migrations WHERE version = '001_receipts' AND checksum = :'checksum_001')
+       AND (SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'wbd_auth') = 'wbd_target_' || :'target_slot' || '_receipt_owner'
+       AND (SELECT executor_role = 'wbd_target_' || :'target_slot' || '_executor' FROM wbd_auth.target_marker WHERE singleton) AS checksum_001_matches \gset
+\if :checksum_001_matches
 \else
-\echo 'Target profile checksum mismatch'
+\echo 'Target profile 001 checksum mismatch'
 SELECT 1 / 0;
 \endif
 \else
 SQL
-  cat "$snapshot"
+  cat "$snapshot_001"
   cat <<'SQL'
-INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('001_receipts', :'profile_checksum');
+INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('001_receipts', :'checksum_001');
+\endif
+SELECT EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'wbd_auth' AND tablename = 'profile_migrations')
+       AND EXISTS (SELECT 1 FROM wbd_auth.profile_migrations WHERE version = '002_batch_checkpoints') AS v002_exists \gset
+\if :v002_exists
+SELECT (SELECT count(*) = 1 FROM wbd_auth.profile_migrations WHERE version = '002_batch_checkpoints' AND checksum = :'checksum_002') AS checksum_002_matches \gset
+\if :checksum_002_matches
+\else
+\echo 'Target profile 002 checksum mismatch'
+SELECT 1 / 0;
+\endif
+\else
+SQL
+  cat "$snapshot_002"
+  cat <<'SQL'
+INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('002_batch_checkpoints', :'checksum_002');
+\endif
+SELECT (SELECT count(*) = 2 FROM wbd_auth.profile_migrations) AS profile_count_ok \gset
+\if :profile_count_ok
+\else
+\echo 'Unexpected profile migrations present'
+SELECT 1 / 0;
+\endif
+\if :profile_exists
+\if :v002_exists
+\echo 'Target profile already applied with matching checksum; no-op.'
+\endif
 \endif
 COMMIT;
 SQL
@@ -78,6 +105,6 @@ SQL
   export TARGET_EXECUTOR_PASSWORD TARGET_PREPARER_PASSWORD TARGET_VIEWER_PASSWORD
   TARGET_SLOT=$2; export TARGET_SLOT
   case "$2" in a) [ "$1" = "$DB_TARGET_A" ] ;; b) [ "$1" = "$DB_TARGET_B" ] ;; esac || exit 1
-  PGPASSWORD=$POSTGRES_PASSWORD exec psql -X -q -h "$3" -U "$POSTGRES_USER" -d "$1" -v expected_target="$1" -v profile_checksum="$4"
-' sh "$target" "$slot" "$service" "$checksum"
+  PGPASSWORD=$POSTGRES_PASSWORD exec psql -X -q -h "$3" -U "$POSTGRES_USER" -d "$1" -v expected_target="$1" -v profile_checksum="$4" -v checksum_001="$4" -v checksum_002="$5"
+' sh "$target" "$slot" "$service" "$checksum_001" "$checksum_002"
 printf 'PASS %s target %s profile applied or already current\n' "$environment" "$slot"
