@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
@@ -19,6 +20,49 @@ const (
 	// DefaultRetryDelay is the waiting duration before an expired job in 'retry_wait' becomes eligible for reclaim.
 	DefaultRetryDelay = 10 * time.Second
 )
+
+// src and j are the candidate's approved source and candidate respectively.
+const validDownResumeSource = `(j.direction <> 'down' OR (
+	src.action = 'compensate' AND src.direction = 'down' AND src.status = 'partially_reverted'
+	AND EXISTS (
+		SELECT 1 FROM app.jobs up
+		WHERE up.execution_id = src.source_execution_id AND up.id <> src.id AND up.id <> j.id
+		  AND up.target_id = src.target_id AND up.database_id = src.database_id
+		  AND up.migration_id = src.migration_id AND up.revision = src.revision
+		  AND up.snapshot_hash = src.snapshot_hash AND up.mode = 'batch'
+		  AND up.direction = 'up' AND up.status IN ('succeeded', 'partial', 'partially_reverted')
+		  AND EXISTS (
+			SELECT 1 FROM app.job_batch_step_authorizations bsa
+			JOIN app.job_batch_commit_proofs p ON p.step_auth_id = bsa.id
+			  AND p.target_xid = bsa.target_xid AND p.physical_target_id = bsa.physical_target_id
+			  AND p.direction = bsa.direction AND p.scope_execution_id = bsa.scope_execution_id
+			WHERE bsa.scope_execution_id = up.execution_id
+			  AND bsa.physical_target_id = src.target_id AND bsa.direction = 'up'
+		  )
+	)
+))`
+
+// downResumeLineage recognizes only the proved origin's up job and down siblings.
+// The caller must separately preserve the live-lease guard for these jobs.
+func downResumeLineage(candidateID, blocked string) string {
+	return fmt.Sprintf(`EXISTS (
+		SELECT 1 FROM app.jobs candidate
+		JOIN app.jobs src ON src.execution_id = candidate.source_execution_id AND src.id <> candidate.id
+		WHERE candidate.id = %s AND candidate.mode = 'batch' AND candidate.action = 'resume' AND candidate.direction = 'down'
+		  AND src.target_id = candidate.target_id AND src.database_id = candidate.database_id
+		  AND src.migration_id = candidate.migration_id AND src.revision = candidate.revision
+		  AND src.snapshot_hash = candidate.snapshot_hash AND src.mode = 'batch'
+		  AND %s
+		  AND %[3]s.mode = 'batch' AND %[3]s.target_id = candidate.target_id
+		  AND %[3]s.database_id = candidate.database_id AND %[3]s.migration_id = candidate.migration_id
+		  AND %[3]s.revision = candidate.revision AND %[3]s.snapshot_hash = candidate.snapshot_hash
+		  AND ((%[3]s.execution_id = src.source_execution_id AND %[3]s.direction = 'up')
+		       OR (%[3]s.direction = 'down' AND (
+		           %[3]s.execution_id = src.execution_id
+		           OR (%[3]s.action = 'compensate' AND %[3]s.source_execution_id = src.source_execution_id)
+		           OR (%[3]s.action = 'resume' AND %[3]s.source_execution_id = src.execution_id))))
+	)`, candidateID, strings.ReplaceAll(validDownResumeSource, "j.", "candidate."), blocked)
+}
 
 type ClaimRequest struct {
 	WorkerID      string
@@ -48,6 +92,8 @@ type Claim struct {
 	ClaimedBy           string                      `json:"claimed_by"`
 	LeaseToken          string                      `json:"lease_token"`
 	LeaseExpiresAt      time.Time                   `json:"lease_expires_at"`
+	Traceparent         string                      `json:"traceparent,omitempty"`
+	Tracestate          string                      `json:"tracestate,omitempty"`
 }
 
 func (c Claim) RevalidationRequest() executioncontract.RevalidationRequest {
@@ -68,19 +114,73 @@ func (s *Service) reclaimOneExpiredJob(ctx context.Context, maxAttempts int, ret
 	defer tx.Rollback()
 
 	var (
-		jobID     string
-		attemptNo int
+		jobID             string
+		attemptNo         int
+		action            string
+		mode              string
+		sourceExecutionID sql.NullString
 	)
 
 	err = tx.QueryRowContext(ctx, `
-		SELECT j.id, j.attempt_no
+		SELECT j.id, j.attempt_no, j.action, j.mode, j.source_execution_id::text
 		FROM app.jobs j
 		WHERE j.status = 'running'
 		  AND j.execution_status = 'running'
-		  AND ((j.action = 'apply' AND j.source_execution_id IS NULL) OR
-		       (j.action IN ('rollback', 'forward') AND j.source_execution_id IS NOT NULL
-		        AND j.source_execution_id <> j.execution_id))
-		  AND NOT j.blocks_database
+		  AND (
+		      (j.mode = 'standard' AND NOT j.blocks_database
+		       AND ((j.action = 'apply' AND j.source_execution_id IS NULL) OR
+		            (j.action IN ('rollback', 'forward') AND (j.source_execution_id IS NULL OR j.source_execution_id <> j.execution_id))))
+		      OR
+		      (j.mode = 'batch' AND (
+		          (j.action = 'apply' AND j.source_execution_id IS NULL AND NOT j.blocks_database) OR
+		          (j.action = 'forward' AND j.direction = 'up' AND NOT j.blocks_database AND j.source_execution_id IS NOT NULL AND EXISTS (
+		              SELECT 1 FROM app.jobs src
+		              WHERE src.execution_id = j.source_execution_id AND src.id <> j.id
+		                AND src.target_id = j.target_id AND src.database_id = j.database_id
+		                AND src.migration_id = j.migration_id AND src.revision = j.revision
+		                AND src.snapshot_hash = j.snapshot_hash AND src.mode = 'batch'
+		                AND src.direction = 'up' AND src.status = 'succeeded'
+		          )) OR
+		          (j.action = 'resume' AND j.source_execution_id IS NOT NULL AND (NOT j.blocks_database OR j.blocks_database) AND EXISTS (
+		              SELECT 1 FROM app.jobs src
+		              WHERE src.execution_id = j.source_execution_id
+		                AND src.id <> j.id
+		                AND src.target_id = j.target_id
+		                AND src.database_id = j.database_id
+		                AND src.migration_id = j.migration_id
+		                AND src.revision = j.revision
+		                AND src.direction = j.direction
+		                AND src.snapshot_hash = j.snapshot_hash
+		                AND src.mode = 'batch'
+		                AND src.status <> 'succeeded'
+		                AND ` + validDownResumeSource + `
+		          )) OR
+		          (j.action = 'compensate' AND j.direction = 'down' AND j.source_execution_id IS NOT NULL AND EXISTS (
+		              SELECT 1 FROM app.jobs src
+		              WHERE src.execution_id = j.source_execution_id
+		                AND src.id <> j.id
+		                AND src.target_id = j.target_id
+		                AND src.database_id = j.database_id
+		                AND src.migration_id = j.migration_id
+		                AND src.revision = j.revision
+		                AND src.direction = 'up'
+		                AND src.snapshot_hash = j.snapshot_hash
+		                AND src.mode = 'batch'
+		                AND src.status IN ('succeeded', 'partial', 'partially_reverted')
+		                AND EXISTS (
+		                    SELECT 1 FROM app.job_batch_step_authorizations bsa
+		                    JOIN app.job_batch_commit_proofs p ON p.step_auth_id = bsa.id
+		                      AND p.target_xid = bsa.target_xid
+		                      AND p.physical_target_id = bsa.physical_target_id
+		                      AND p.direction = bsa.direction
+		                      AND p.scope_execution_id = bsa.scope_execution_id
+		                    WHERE bsa.scope_execution_id = src.execution_id
+		                      AND bsa.physical_target_id = j.target_id
+		                      AND bsa.direction = 'up'
+		                )
+		          ))
+		      ))
+		  )
 		  AND j.lease_expires_at <= clock_timestamp()
 		  AND NOT EXISTS (
 		      SELECT 1 FROM app.job_attempts a
@@ -91,6 +191,10 @@ func (s *Service) reclaimOneExpiredJob(ctx context.Context, maxAttempts int, ret
 		            OR EXISTS (
 		                SELECT 1 FROM app.job_statement_evidence se
 		                WHERE se.attempt_id = a.id
+		            )
+		            OR EXISTS (
+		                SELECT 1 FROM app.job_batch_step_authorizations bsa
+		                WHERE bsa.attempt_id = a.id
 		            )
 		        )
 		  )
@@ -106,7 +210,7 @@ func (s *Service) reclaimOneExpiredJob(ctx context.Context, maxAttempts int, ret
 		ORDER BY j.created_at ASC
 		LIMIT 1
 		FOR UPDATE OF j SKIP LOCKED
-	`).Scan(&jobID, &attemptNo)
+	`).Scan(&jobID, &attemptNo, &action, &mode, &sourceExecutionID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -174,6 +278,69 @@ func (s *Service) reclaimOneExpiredJob(ctx context.Context, maxAttempts int, ret
 		return false, nil
 	}
 
+	var hasAuth bool
+	err = tx.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM app.job_dispatch_authorizations WHERE attempt_id = $1)
+		    OR EXISTS (SELECT 1 FROM app.job_batch_step_authorizations WHERE attempt_id = $1)
+	`, runningAttempt.id).Scan(&hasAuth)
+	if err != nil || hasAuth {
+		return false, nil
+	}
+
+	if action == "resume" || action == "compensate" {
+		var srcValid bool
+		if action == "resume" {
+			err = tx.QueryRowContext(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM app.jobs src
+					WHERE src.execution_id = j.source_execution_id
+					  AND src.id <> j.id
+					  AND src.target_id = j.target_id
+					  AND src.database_id = j.database_id
+					  AND src.migration_id = j.migration_id
+					  AND src.revision = j.revision
+					  AND src.snapshot_hash = j.snapshot_hash
+					  AND src.mode = 'batch'
+					  AND src.direction = j.direction
+					  AND src.status <> 'succeeded'
+					  AND ` + validDownResumeSource + `
+				)
+				FROM app.jobs j WHERE j.id = $1
+			`, jobID).Scan(&srcValid)
+		} else {
+			err = tx.QueryRowContext(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM app.jobs src
+					WHERE src.execution_id = j.source_execution_id
+					  AND src.id <> j.id
+					  AND src.target_id = j.target_id
+					  AND src.database_id = j.database_id
+					  AND src.migration_id = j.migration_id
+					  AND src.revision = j.revision
+					  AND src.direction = 'up'
+					  AND src.snapshot_hash = j.snapshot_hash
+					  AND src.mode = 'batch'
+					  AND src.status IN ('succeeded', 'partial', 'partially_reverted')
+					  AND EXISTS (
+						  SELECT 1 FROM app.job_batch_step_authorizations bsa
+						  JOIN app.job_batch_commit_proofs p ON p.step_auth_id = bsa.id
+						    AND p.target_xid = bsa.target_xid
+						    AND p.physical_target_id = bsa.physical_target_id
+						    AND p.direction = bsa.direction
+						    AND p.scope_execution_id = bsa.scope_execution_id
+						  WHERE bsa.scope_execution_id = src.execution_id
+						    AND bsa.physical_target_id = j.target_id
+						    AND bsa.direction = 'up'
+					  )
+				)
+				FROM app.jobs j WHERE j.id = $1
+			`, jobID).Scan(&srcValid)
+		}
+		if err != nil || !srcValid {
+			return false, nil
+		}
+	}
+
 	retryable := attemptNo < maxAttempts
 
 	res, err := tx.ExecContext(ctx, `
@@ -201,6 +368,7 @@ func (s *Service) reclaimOneExpiredJob(ctx context.Context, maxAttempts int, ret
 			UPDATE app.jobs
 			SET status = 'retry_wait',
 			    execution_status = 'retry_wait',
+			    blocks_database = false,
 			    claimed_by = NULL,
 			    claimed_at = NULL,
 			    lease_token = NULL,
@@ -330,41 +498,264 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		snapshotHash        string
 		approvalFingerprint sql.NullString
 		currentStatus       string
+		traceparent         sql.NullString
+		tracestate          sql.NullString
 	)
 
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, database_id, target_id, proposal_id, migration_id, revision,
 		       execution_id, actor_id, action, direction, mode, attempt_no,
 		       source_execution_id::text, snapshot_hash, approval_fingerprint,
-		       status
+		       status, traceparent, tracestate
 		FROM app.jobs j
-		WHERE ((j.status = 'queued' AND j.next_retry_at IS NULL AND NOT j.blocks_database) OR
+		WHERE ((j.status = 'queued' AND j.next_retry_at IS NULL
+		        AND (
+		            (j.mode = 'standard' AND NOT j.blocks_database)
+		            OR
+		            (j.mode = 'batch' AND (
+		                (j.action = 'apply' AND j.source_execution_id IS NULL AND NOT j.blocks_database)
+		                OR
+		                (j.action = 'forward' AND j.direction = 'up' AND NOT j.blocks_database AND j.source_execution_id IS NOT NULL AND EXISTS (
+		                    SELECT 1 FROM app.jobs src
+		                    WHERE src.execution_id = j.source_execution_id AND src.id <> j.id
+		                      AND src.target_id = j.target_id AND src.database_id = j.database_id
+		                      AND src.migration_id = j.migration_id AND src.revision = j.revision
+		                      AND src.snapshot_hash = j.snapshot_hash AND src.mode = 'batch'
+		                      AND src.direction = 'up' AND src.status = 'succeeded'
+		                ))
+		                OR
+		                (j.action = 'resume' AND j.source_execution_id IS NOT NULL AND EXISTS (
+		                    SELECT 1 FROM app.jobs src
+		                    WHERE src.execution_id = j.source_execution_id
+		                      AND src.id <> j.id
+		                      AND src.target_id = j.target_id
+		                      AND src.database_id = j.database_id
+		                      AND src.migration_id = j.migration_id
+		                      AND src.revision = j.revision
+		                      AND src.snapshot_hash = j.snapshot_hash
+		                      AND src.mode = 'batch'
+		                      AND src.direction = j.direction
+		                      AND src.status <> 'succeeded'
+		                      AND ` + validDownResumeSource + `
+		                ))
+		                OR
+		                (j.action = 'compensate' AND j.mode = 'batch' AND j.direction = 'down' AND j.source_execution_id IS NOT NULL AND EXISTS (
+		                    SELECT 1 FROM app.jobs src
+		                    WHERE src.execution_id = j.source_execution_id
+		                      AND src.id <> j.id
+		                      AND src.target_id = j.target_id
+		                      AND src.database_id = j.database_id
+		                      AND src.migration_id = j.migration_id
+		                      AND src.revision = j.revision
+		                      AND src.snapshot_hash = j.snapshot_hash
+		                      AND src.mode = 'batch'
+		                      AND src.direction = 'up'
+		                      AND src.status IN ('succeeded', 'partial', 'partially_reverted')
+		                      AND EXISTS (
+		                          SELECT 1 FROM app.job_batch_step_authorizations bsa
+		                          JOIN app.job_batch_commit_proofs p ON p.step_auth_id = bsa.id
+		                            AND p.target_xid = bsa.target_xid
+		                            AND p.physical_target_id = bsa.physical_target_id
+		                            AND p.direction = bsa.direction
+		                            AND p.scope_execution_id = bsa.scope_execution_id
+		                          WHERE bsa.scope_execution_id = src.execution_id
+		                            AND bsa.physical_target_id = j.target_id
+		                            AND bsa.direction = 'up'
+		                      )
+		                ))
+		            ))
+		        )) OR
 		       (j.status = 'retry_wait' AND j.next_retry_at IS NOT NULL
 		        AND j.next_retry_at <= clock_timestamp() AND j.attempt_no < $1
-		        AND NOT j.blocks_database
-		        AND ((j.action = 'apply' AND j.source_execution_id IS NULL) OR
-		             (j.action IN ('rollback', 'forward') AND j.source_execution_id IS NOT NULL
-		              AND j.source_execution_id <> j.execution_id))
+		        AND (
+		            (j.mode = 'standard' AND NOT j.blocks_database
+		             AND ((j.action = 'apply' AND j.source_execution_id IS NULL) OR
+		                  (j.action IN ('rollback', 'forward') AND (j.source_execution_id IS NULL OR j.source_execution_id <> j.execution_id))))
+		            OR
+		            (j.mode = 'batch' AND (
+		                (j.action = 'apply' AND j.source_execution_id IS NULL AND NOT j.blocks_database)
+		                OR
+		                (j.action = 'forward' AND j.direction = 'up' AND NOT j.blocks_database AND j.source_execution_id IS NOT NULL AND EXISTS (
+		                    SELECT 1 FROM app.jobs src
+		                    WHERE src.execution_id = j.source_execution_id AND src.id <> j.id
+		                      AND src.target_id = j.target_id AND src.database_id = j.database_id
+		                      AND src.migration_id = j.migration_id AND src.revision = j.revision
+		                      AND src.snapshot_hash = j.snapshot_hash AND src.mode = 'batch'
+		                      AND src.direction = 'up' AND src.status = 'succeeded'
+		                ))
+		                OR
+		                (j.action = 'resume' AND j.source_execution_id IS NOT NULL AND EXISTS (
+		                    SELECT 1 FROM app.jobs src
+		                    WHERE src.execution_id = j.source_execution_id
+		                      AND src.id <> j.id
+		                      AND src.target_id = j.target_id
+		                      AND src.database_id = j.database_id
+		                      AND src.migration_id = j.migration_id
+		                      AND src.revision = j.revision
+		                      AND src.snapshot_hash = j.snapshot_hash
+		                      AND src.mode = 'batch'
+		                      AND src.direction = j.direction
+		                      AND src.status <> 'succeeded'
+		                      AND ` + validDownResumeSource + `
+		                ))
+		                OR
+		                (j.action = 'compensate' AND j.mode = 'batch' AND j.direction = 'down' AND j.source_execution_id IS NOT NULL AND EXISTS (
+		                    SELECT 1 FROM app.jobs src
+		                    WHERE src.execution_id = j.source_execution_id
+		                      AND src.id <> j.id
+		                      AND src.target_id = j.target_id
+		                      AND src.database_id = j.database_id
+		                      AND src.migration_id = j.migration_id
+		                      AND src.revision = j.revision
+		                      AND src.snapshot_hash = j.snapshot_hash
+		                      AND src.mode = 'batch'
+		                      AND src.direction = 'up'
+		                      AND src.status IN ('succeeded', 'partial', 'partially_reverted')
+		                      AND EXISTS (
+		                          SELECT 1 FROM app.job_batch_step_authorizations bsa
+		                          JOIN app.job_batch_commit_proofs p ON p.step_auth_id = bsa.id
+		                            AND p.target_xid = bsa.target_xid
+		                            AND p.physical_target_id = bsa.physical_target_id
+		                            AND p.direction = bsa.direction
+		                            AND p.scope_execution_id = bsa.scope_execution_id
+		                          WHERE bsa.scope_execution_id = src.execution_id
+		                            AND bsa.physical_target_id = j.target_id
+		                            AND bsa.direction = 'up'
+		                      )
+		                ))
+		            ))
+		        )
 		        AND (SELECT count(*) FROM app.job_attempts a WHERE a.job_id = j.id) = j.attempt_no
 		        AND (SELECT count(DISTINCT a.attempt_no) FROM app.job_attempts a WHERE a.job_id = j.id) = j.attempt_no
 		        AND NOT EXISTS (
 		            SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id AND
 		                (a.attempt_no > j.attempt_no OR a.status <> 'failed' OR
 		                 a.finished_at IS NULL OR a.sql_entered OR
-		                 EXISTS (SELECT 1 FROM app.job_statement_evidence se WHERE se.attempt_id = a.id))
+		                 EXISTS (SELECT 1 FROM app.job_statement_evidence se WHERE se.attempt_id = a.id) OR
+		                 EXISTS (SELECT 1 FROM app.job_batch_step_authorizations bsa WHERE bsa.attempt_id = a.id))
 		        )))
 		  AND NOT EXISTS (
 		      SELECT 1 FROM app.jobs blocked
 		      WHERE blocked.target_id = j.target_id AND blocked.id <> j.id
-		        AND (blocked.blocks_database OR blocked.status IN ('unknown', 'partial', 'partially_reverted')
-		             OR blocked.execution_status IN ('unknown', 'partial', 'partially_reverted')
-		             OR EXISTS (SELECT 1 FROM app.job_attempts a
-		                        WHERE a.job_id = blocked.id
-		                          AND (a.sql_entered OR EXISTS (
-		                              SELECT 1 FROM app.job_statement_evidence se WHERE se.attempt_id = a.id))
-		                          AND (a.status = 'running' OR NOT EXISTS (
-		                              SELECT 1 FROM app.job_dispatch_authorizations d WHERE d.attempt_id = a.id))))
-		  )
+		        AND (
+		            (
+		             NOT (
+		                 (
+		                 j.mode = 'batch' AND blocked.mode = 'batch'
+		                 AND blocked.target_id = j.target_id AND blocked.database_id = j.database_id
+		                 AND blocked.migration_id = j.migration_id AND blocked.revision = j.revision
+		                 AND blocked.snapshot_hash = j.snapshot_hash
+		                 AND (
+		                     (j.action = 'resume' AND j.direction = blocked.direction AND (
+		                         blocked.execution_id IS NOT DISTINCT FROM j.source_execution_id
+		                         OR (blocked.action = 'resume' AND blocked.source_execution_id IS NOT DISTINCT FROM j.source_execution_id)
+		                     ))
+		                     OR
+		                     (j.action = 'compensate' AND j.direction = 'down' AND (
+		                         blocked.execution_id IS NOT DISTINCT FROM j.source_execution_id
+		                         OR (blocked.action IN ('resume', 'compensate') AND blocked.source_execution_id IS NOT DISTINCT FROM j.source_execution_id)
+		                     ))
+		                 )
+		                 ) OR ` + downResumeLineage("j.id", "blocked") + `
+		             )
+		             AND (
+		                 blocked.blocks_database
+		                 OR (
+		                     (blocked.status IN ('unknown', 'partial', 'partially_reverted')
+		                      OR blocked.execution_status IN ('unknown', 'partial', 'partially_reverted'))
+		                     AND NOT EXISTS (
+		                         SELECT 1 FROM app.jobs res
+		                         WHERE (res.execution_id = blocked.execution_id OR res.source_execution_id = blocked.execution_id)
+		                           AND res.target_id = blocked.target_id
+		                           AND res.database_id = blocked.database_id
+		                           AND res.direction = blocked.direction
+		                           AND res.status = 'succeeded'
+		                           AND res.execution_status = 'succeeded'
+		                           AND NOT res.blocks_database
+		                     )
+		                 )
+		                 OR EXISTS (SELECT 1 FROM app.job_attempts a
+		                            WHERE a.job_id = blocked.id
+		                       AND (a.sql_entered OR EXISTS (
+		                           SELECT 1 FROM app.job_statement_evidence se WHERE se.attempt_id = a.id))
+		                       AND (a.status = 'running' OR NOT (
+		                           (blocked.mode = 'standard' AND EXISTS (SELECT 1 FROM app.job_dispatch_authorizations d WHERE d.attempt_id = a.id))
+		                           OR (
+		                               EXISTS (SELECT 1 FROM app.job_batch_step_authorizations bsa WHERE bsa.attempt_id = a.id)
+		                               AND NOT EXISTS (
+		                                   SELECT 1 FROM app.job_batch_step_authorizations unp
+		                                   WHERE unp.attempt_id = a.id
+		                                     AND NOT EXISTS (
+		                                         SELECT 1 FROM app.job_batch_commit_proofs p
+		                                         WHERE p.step_auth_id = unp.id
+		                                           AND p.target_xid = unp.target_xid
+		                                           AND p.physical_target_id = unp.physical_target_id
+		                                           AND p.direction = unp.direction
+		                                           AND p.scope_execution_id = unp.scope_execution_id
+		                                     )
+		                                     AND NOT EXISTS (
+		                                         SELECT 1 FROM app.job_statement_evidence se
+		                                         WHERE se.attempt_id = a.id AND se.ordinal = unp.ordinal AND se.batch_index = unp.batch_index AND se.outcome = 'failed'
+		                                     )
+		                               )
+		                               AND NOT EXISTS (
+		                                   SELECT 1 FROM app.job_statement_evidence unse
+		                                   WHERE unse.attempt_id = a.id
+		                                     AND (
+		                                         unse.batch_index IS NULL
+		                                         OR unse.outcome = 'unknown'
+		                                         OR NOT (
+		                                             (unse.outcome = 'failed' AND EXISTS (
+		                                                 SELECT 1 FROM app.job_batch_step_authorizations bsa
+		                                                 WHERE bsa.attempt_id = unse.attempt_id
+		                                                   AND bsa.job_id = blocked.id
+		                                                   AND bsa.ordinal = unse.ordinal
+		                                                   AND bsa.batch_index = unse.batch_index
+		                                                   AND bsa.physical_target_id = blocked.target_id
+		                                                   AND bsa.direction = blocked.direction
+		                                                   AND (bsa.scope_execution_id = blocked.execution_id OR (blocked.action = 'resume' AND bsa.scope_execution_id = blocked.source_execution_id))
+		                                             ))
+		                                             OR (unse.outcome = 'succeeded' AND EXISTS (
+		                                                 SELECT 1 FROM app.job_batch_step_authorizations bsa
+		                                                 JOIN app.job_batch_commit_proofs p ON p.step_auth_id = bsa.id
+		                                                   AND p.target_xid = bsa.target_xid
+		                                                   AND p.physical_target_id = bsa.physical_target_id
+		                                                   AND p.direction = bsa.direction
+		                                                   AND p.scope_execution_id = bsa.scope_execution_id
+		                                                 WHERE bsa.attempt_id = unse.attempt_id
+		                                                   AND bsa.job_id = blocked.id
+		                                                   AND bsa.ordinal = unse.ordinal
+		                                                   AND bsa.batch_index = unse.batch_index
+		                                                   AND bsa.physical_target_id = blocked.target_id
+		                                                   AND bsa.direction = blocked.direction
+		                                                   AND (bsa.scope_execution_id = blocked.execution_id OR (blocked.action = 'resume' AND bsa.scope_execution_id = blocked.source_execution_id))
+		                                             ))
+		                                         )
+		                                     )
+		                               )
+		                           ))))
+		             )
+		            )
+		            OR
+		             (
+		                 (
+		                 j.action = 'resume' AND j.mode = 'batch' AND blocked.mode = 'batch'
+		                 AND blocked.target_id = j.target_id AND blocked.database_id = j.database_id
+		                 AND blocked.migration_id = j.migration_id AND blocked.revision = j.revision
+		                 AND blocked.direction = j.direction
+		                 AND blocked.snapshot_hash = j.snapshot_hash
+		                 AND (
+		                     blocked.execution_id IS NOT DISTINCT FROM j.source_execution_id
+		                     OR (blocked.action = 'resume' AND blocked.source_execution_id IS NOT DISTINCT FROM j.source_execution_id)
+		                 )
+		                 ) OR ` + downResumeLineage("j.id", "blocked") + `
+		             )
+		             AND (
+		                 (blocked.status = 'running' AND blocked.lease_expires_at > clock_timestamp())
+		                 OR EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = blocked.id AND a.status = 'running' AND blocked.lease_expires_at > clock_timestamp())
+		             )
+		            )
+		        )
 		ORDER BY j.created_at ASC
 		LIMIT 1
 		FOR UPDATE OF j SKIP LOCKED
@@ -372,6 +763,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		&jobID, &databaseID, &targetID, &proposalID, &migrationID, &revision,
 		&executionID, &actorID, &action, &direction, &mode, &attemptNo,
 		&sourceExecutionID, &snapshotHash, &approvalFingerprint, &currentStatus,
+		&traceparent, &tracestate,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -469,5 +861,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		ClaimedBy:           in.WorkerID,
 		LeaseToken:          leaseToken,
 		LeaseExpiresAt:      leaseExpiresAt,
+		Traceparent:         traceparent.String,
+		Tracestate:          tracestate.String,
 	}, nil
 }

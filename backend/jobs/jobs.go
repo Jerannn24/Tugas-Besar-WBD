@@ -65,9 +65,9 @@ func (s *Service) EnqueueTx(
 			Message: "missing required job fields",
 		}
 	}
-	if in.Action == executioncontract.Resume {
+	if in.Action == executioncontract.Resume || in.Action == executioncontract.Compensate {
 		if in.SourceExecutionID == nil || *in.SourceExecutionID == "" {
-			return executioncontract.EnqueueResult{}, makeRequestConflict("resume requires source execution id")
+			return executioncontract.EnqueueResult{}, makeRequestConflict(fmt.Sprintf("%s requires source execution id", in.Action))
 		}
 	}
 

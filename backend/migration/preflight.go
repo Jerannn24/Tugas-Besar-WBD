@@ -61,7 +61,32 @@ func NewPreflight(policy *sqlpolicy.Policy) func(ctx context.Context, tx *sql.Tx
 		return p.lockAndVerify(ctx, tx, schemas)
 	}
 }
-
+// PreflightBatch runs target safety preflight for an approved batch UPDATE table.
+// It enforces schema allowlist, checks ordinary table catalog attributes,
+// locks the target table in ROW EXCLUSIVE mode in the target transaction,
+// and verifies foreign key closure and relation ownership.
+func PreflightBatch(ctx context.Context, tx *sql.Tx, schema, table string) error {
+	if tx == nil {
+		return errors.New("preflight transaction is required")
+	}
+	policy, err := sqlpolicy.New(schema)
+	if err != nil {
+		return fmt.Errorf("create sqlpolicy for batch: %w", err)
+	}
+	infos := []sqlpolicy.Statement{
+		{
+			Text:     fmt.Sprintf("UPDATE %s.%s SET processed = TRUE WHERE id = ANY($1::bigint[])", quoteIdent(schema), quoteIdent(table)),
+			Kind:     sqlpolicy.KindUpdate,
+			Relation: sqlpolicy.Rel{Schema: schema, Name: table},
+		},
+	}
+	schemas := policy.Schemas()
+	p, err := planBatch(infos, schemas, func(r sqlpolicy.Rel) (relInfo, error) { return lookupRelation(ctx, tx, r) })
+	if err != nil {
+		return err
+	}
+	return p.lockAndVerify(ctx, tx, schemas)
+}
 func unsupported(message string) error { return fault(422, "SQL_UNSUPPORTED", message) }
 
 const (

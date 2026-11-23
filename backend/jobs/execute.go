@@ -26,8 +26,17 @@ type ExecutionDeps struct {
 	Acquire func(ctx context.Context, databaseID string) (*migration.TargetLease, error)
 	Timeout time.Duration
 
-	beforeDispatch    func(ctx context.Context) error
-	afterTargetCommit func(ctx context.Context) error
+	beforeDispatch          func(ctx context.Context) error
+	afterTargetCommit       func(ctx context.Context) error
+	beforeBatchDispatch     func(ctx context.Context, batchIndex int) error
+	afterTicketReservation  func(ctx context.Context, batchIndex int) error
+	afterBatchCommit        func(ctx context.Context, batchIndex int) error
+	afterBatchUpdate        func(ctx context.Context, batchIndex int) error
+	afterRollbackFirstWrite func(ctx context.Context) error
+	crashAfterBatchAuthorize func(ctx context.Context, batchIndex int) error
+	crashAfterBatchCommit    func(ctx context.Context, batchIndex int) error
+	beforeRecoveryScanStep   func(ctx context.Context, batchIndex int) error
+	beforeRecoveryClosurePage func(ctx context.Context, kind string, pageIndex int, pageSize int) error
 }
 
 type ExecutionOutcome struct {
@@ -51,8 +60,8 @@ func discardLease(lease *migration.TargetLease) {
 }
 
 func selectSQL(plan executioncontract.ExecutionPlan, action executioncontract.Action, direction executioncontract.Direction) (string, error) {
-	if !((action == executioncontract.Apply || action == executioncontract.Forward) && direction == executioncontract.Up ||
-		action == executioncontract.Rollback && direction == executioncontract.Down) {
+	if !((action == executioncontract.Apply || action == executioncontract.Forward || action == executioncontract.Resume) && direction == executioncontract.Up ||
+		(action == executioncontract.Rollback || action == executioncontract.Resume || action == executioncontract.Compensate) && direction == executioncontract.Down) {
 		return "", executioncontract.ContractError{Code: "INVALID_DIRECTION", Message: "action and direction do not match"}
 	}
 	if direction == executioncontract.Down {
@@ -188,8 +197,10 @@ func (s *Service) failedOutcome(ctx context.Context, claim *Claim, code string, 
 }
 
 func (s *Service) unknownOutcome(ctx context.Context, claim *Claim, cause error) (*ExecutionOutcome, error) {
-	if err := s.markJobUnknown(ctx, claim, cause); err != nil {
-		return nil, errors.Join(cause, err)
+	if claim != nil && claim.LeaseToken != "" {
+		if err := s.markJobUnknown(ctx, claim, cause); err != nil {
+			return nil, errors.Join(cause, err)
+		}
 	}
 	return &ExecutionOutcome{Status: executioncontract.Unknown, Error: cause}, nil
 }
@@ -255,6 +266,9 @@ func (s *Service) rollbackAuthorizedOutcome(ctx context.Context, claim *Claim, s
 }
 
 func (s *Service) authorizeDispatch(ctx context.Context, claim *Claim, plan executioncontract.ExecutionPlan, sqlText, xid string, version int64) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("dispatch authorization aborted: %w", err)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin dispatch auth tx: %w", err)
@@ -309,14 +323,115 @@ func (s *Service) authorizeDispatch(ctx context.Context, claim *Claim, plan exec
 		SELECT EXISTS (
 			SELECT 1 FROM app.jobs j
 			WHERE j.target_id = $1 AND j.id <> $2
-			  AND (j.blocks_database OR j.status IN ('unknown', 'partial', 'partially_reverted')
-			       OR j.execution_status IN ('unknown', 'partial', 'partially_reverted')
-			       OR EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
-			                  AND (a.sql_entered OR EXISTS (
-			                      SELECT 1 FROM app.job_statement_evidence se WHERE se.attempt_id = a.id))
-			                  AND (a.status = 'running' OR NOT EXISTS (
-			                      SELECT 1 FROM app.job_dispatch_authorizations d WHERE d.attempt_id = a.id))))
-		)`, claim.TargetID, claim.JobID).Scan(&blocked); err != nil {
+			  AND (
+			      (
+			       NOT (
+			           $4 = 'resume' AND j.mode = 'batch'
+			           AND j.target_id = $1 AND j.database_id = $5
+			           AND j.migration_id = $6 AND j.revision = $7
+			           AND j.snapshot_hash = $8
+			           AND (
+			               j.execution_id IS NOT DISTINCT FROM $3::uuid
+			               OR (j.action = 'resume' AND j.source_execution_id IS NOT DISTINCT FROM $3::uuid)
+			           )
+			       )
+			       AND (
+			           j.blocks_database
+			           OR (
+			               (j.status IN ('unknown', 'partial', 'partially_reverted')
+			                OR j.execution_status IN ('unknown', 'partial', 'partially_reverted'))
+			               AND NOT EXISTS (
+		                   SELECT 1 FROM app.jobs res
+		                   WHERE (res.execution_id = j.execution_id OR res.source_execution_id = j.execution_id)
+		                     AND res.target_id = j.target_id
+		                     AND res.database_id = j.database_id
+		                     AND res.direction = j.direction
+		                     AND res.status = 'succeeded'
+		                     AND res.execution_status = 'succeeded'
+		                     AND NOT res.blocks_database
+		               )
+		           )
+		           OR EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
+		                  AND (a.sql_entered OR EXISTS (
+		                      SELECT 1 FROM app.job_statement_evidence se WHERE se.attempt_id = a.id))
+		                  AND (a.status = 'running' OR NOT (
+		                      (j.mode = 'standard' AND EXISTS (SELECT 1 FROM app.job_dispatch_authorizations d WHERE d.attempt_id = a.id))
+		                      OR (
+		                          EXISTS (SELECT 1 FROM app.job_batch_step_authorizations bsa WHERE bsa.attempt_id = a.id)
+		                          AND NOT EXISTS (
+		                              SELECT 1 FROM app.job_batch_step_authorizations unp
+		                              WHERE unp.attempt_id = a.id
+		                                AND NOT EXISTS (
+		                                    SELECT 1 FROM app.job_batch_commit_proofs p
+		                                    WHERE p.step_auth_id = unp.id
+		                                      AND p.target_xid = unp.target_xid
+		                                      AND p.physical_target_id = unp.physical_target_id
+		                                      AND p.direction = unp.direction
+		                                      AND p.scope_execution_id = unp.scope_execution_id
+		                                )
+		                                AND NOT EXISTS (
+		                                    SELECT 1 FROM app.job_statement_evidence se
+		                                    WHERE se.attempt_id = a.id AND se.ordinal = unp.ordinal AND se.batch_index = unp.batch_index AND se.outcome = 'failed'
+		                                )
+		                          )
+		                          AND NOT EXISTS (
+		                              SELECT 1 FROM app.job_statement_evidence unse
+		                              WHERE unse.attempt_id = a.id
+		                                AND (
+		                                    unse.batch_index IS NULL
+		                                    OR unse.outcome = 'unknown'
+		                                    OR NOT (
+		                                        (unse.outcome = 'failed' AND EXISTS (
+		                                            SELECT 1 FROM app.job_batch_step_authorizations bsa
+		                                            WHERE bsa.attempt_id = unse.attempt_id
+		                                              AND bsa.job_id = j.id
+		                                              AND bsa.ordinal = unse.ordinal
+		                                              AND bsa.batch_index = unse.batch_index
+		                                              AND bsa.physical_target_id = j.target_id
+		                                              AND bsa.direction = j.direction
+		                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+		                                        ))
+		                                        OR (unse.outcome = 'succeeded' AND EXISTS (
+		                                            SELECT 1 FROM app.job_batch_step_authorizations bsa
+		                                            JOIN app.job_batch_commit_proofs p ON p.step_auth_id = bsa.id
+		                                              AND p.target_xid = bsa.target_xid
+		                                              AND p.physical_target_id = bsa.physical_target_id
+		                                              AND p.direction = bsa.direction
+		                                              AND p.scope_execution_id = bsa.scope_execution_id
+		                                            WHERE bsa.attempt_id = unse.attempt_id
+		                                              AND bsa.job_id = j.id
+		                                              AND bsa.ordinal = unse.ordinal
+		                                              AND bsa.batch_index = unse.batch_index
+		                                              AND bsa.physical_target_id = j.target_id
+		                                              AND bsa.direction = j.direction
+		                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+		                                        ))
+		                                    )
+		                                )
+		                          )
+		                      ))))
+		       )
+		      )
+		      OR
+		      (
+			       (
+			           $4 = 'resume' AND j.mode = 'batch'
+			           AND j.target_id = $1 AND j.database_id = $5
+			           AND j.migration_id = $6 AND j.revision = $7
+			           AND j.snapshot_hash = $8
+			           AND (
+			               j.execution_id IS NOT DISTINCT FROM $3::uuid
+			               OR (j.action = 'resume' AND j.source_execution_id IS NOT DISTINCT FROM $3::uuid)
+			           )
+			       )
+			       AND (
+			           (j.status = 'running' AND j.lease_expires_at > clock_timestamp())
+			           OR EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id AND a.status = 'running' AND j.lease_expires_at > clock_timestamp())
+			       )
+			      )
+			  )
+		)`, claim.TargetID, claim.JobID, claim.SourceExecutionID, claim.Action,
+		claim.DatabaseID, claim.MigrationID, claim.Revision, claim.SnapshotHash).Scan(&blocked); err != nil {
 		return fmt.Errorf("check target block: %w", err)
 	}
 	if blocked {
@@ -516,8 +631,9 @@ func (s *Service) finalizeReceipt(ctx context.Context, claim *Claim, r migration
 		  AND snapshot_hash = $16 AND COALESCE(approval_fingerprint, '') = $17
 		  AND ((status = 'running' AND execution_status = 'running' AND $3 <> ''
 		        AND lease_token = NULLIF($3, '')::uuid AND lease_expires_at > clock_timestamp())
-		       OR ($3 = '' AND ((status = 'unknown' AND execution_status = 'unknown')
-		           OR (status = 'running' AND execution_status = 'running'))))
+		       OR ($3 = '' AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
+		           AND ((status = 'unknown' AND execution_status = 'unknown')
+		                OR (status = 'running' AND execution_status = 'running'))))
 		  AND EXISTS (SELECT 1 FROM app.job_dispatch_authorizations d
 		    JOIN app.job_attempts a ON a.id = d.attempt_id AND a.job_id = d.job_id
 		    JOIN app.job_commit_proofs p ON p.job_id = d.job_id AND p.attempt_id = d.attempt_id
@@ -562,9 +678,11 @@ func (s *Service) ExecuteStandardJob(ctx context.Context, claim *Claim, deps Exe
 	if claim == nil {
 		return nil, executioncontract.ContractError{Code: "INVALID_REQUEST", Message: "claim is required"}
 	}
+	if claim.Mode == executioncontract.Batch {
+		return s.ExecuteBatchJob(ctx, claim, deps)
+	}
 	if claim.Mode != executioncontract.Standard {
-		// shortcut: batch mode deferred to P4, upgrade in P4
-		return nil, executioncontract.ContractError{Code: "UNSUPPORTED_MODE", Message: "standard execution only, batch mode deferred"}
+		return nil, executioncontract.ContractError{Code: "UNSUPPORTED_MODE", Message: "unsupported execution mode"}
 	}
 	if claim.Action != executioncontract.Apply &&
 		claim.Action != executioncontract.Rollback &&
@@ -861,11 +979,15 @@ func (s *Service) ReconcileStandardJobByID(ctx context.Context, jobID string, de
 	}
 	var claim Claim
 	var source sql.NullString
+	var isExpired bool
+	var traceparent, tracestate sql.NullString
 	err = s.db.QueryRowContext(ctx, `
 		SELECT j.id::text, j.execution_id::text, j.database_id::text, j.target_id::text,
 		       j.proposal_id::text, j.migration_id::text, j.revision, j.actor_id::text,
 		       j.action, j.direction, j.mode, j.source_execution_id::text,
-		       j.snapshot_hash, COALESCE(j.approval_fingerprint, ''), a.id::text, a.attempt_no
+		       j.snapshot_hash, COALESCE(j.approval_fingerprint, ''), a.id::text, a.attempt_no,
+		       (j.lease_expires_at IS NULL OR j.lease_expires_at <= clock_timestamp()),
+		       j.traceparent, j.tracestate
 		FROM app.jobs j
 		JOIN app.job_dispatch_authorizations d ON d.job_id = j.id
 		JOIN app.job_attempts a ON a.id = d.attempt_id AND a.job_id = j.id
@@ -874,23 +996,36 @@ func (s *Service) ReconcileStandardJobByID(ctx context.Context, jobID string, de
 		&claim.JobID, &claim.ExecutionID, &claim.DatabaseID, &claim.TargetID,
 		&claim.ProposalID, &claim.MigrationID, &claim.Revision, &claim.ActorID,
 		&claim.Action, &claim.Direction, &claim.Mode, &source, &claim.SnapshotHash,
-		&claim.ApprovalFingerprint, &claim.AttemptID, &claim.AttemptNo)
+		&claim.ApprovalFingerprint, &claim.AttemptID, &claim.AttemptNo,
+		&isExpired, &traceparent, &tracestate)
 	if err != nil {
 		return nil, fmt.Errorf("discover authorized job: %w", err)
+	}
+	if !isExpired {
+		return nil, executioncontract.ContractError{
+			Code:    "TARGET_BLOCKED",
+			Message: fmt.Sprintf("job %s lease has not expired", jobID),
+		}
 	}
 	if source.Valid {
 		claim.SourceExecutionID = &source.String
 	}
+	claim.Traceparent = traceparent.String
+	claim.Tracestate = tracestate.String
 	return s.ReconcileStandardJob(ctx, &claim, deps)
 }
 
 // ListUnresolvedStandardJobIDs discovers blocked authorized jobs for reconciliation after restart.
-func (s *Service) ListUnresolvedStandardJobIDs(ctx context.Context, limit int) ([]string, error) {
+func (s *Service) ListUnresolvedStandardJobIDs(ctx context.Context, limit int, afterID ...string) ([]string, error) {
 	if s.db == nil {
 		return nil, errors.New("db is required")
 	}
 	if limit < 1 || limit > 1000 {
 		return nil, errors.New("limit must be between 1 and 1000")
+	}
+	cursor := ""
+	if len(afterID) > 0 {
+		cursor = afterID[0]
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT j.id::text
@@ -898,9 +1033,11 @@ func (s *Service) ListUnresolvedStandardJobIDs(ctx context.Context, limit int) (
 		JOIN app.job_dispatch_authorizations d ON d.job_id = j.id
 		JOIN app.job_attempts a ON a.id = d.attempt_id AND a.job_id = j.id
 		WHERE j.mode = 'standard' AND j.blocks_database AND j.attempt_no = a.attempt_no
+		  AND (j.lease_expires_at IS NULL OR j.lease_expires_at <= clock_timestamp())
 		  AND j.status IN ('running', 'unknown')
+		  AND ($2 = '' OR j.id > $2::uuid)
 		ORDER BY j.id
-		LIMIT $1`, limit)
+		LIMIT $1`, limit, cursor)
 	if err != nil {
 		return nil, fmt.Errorf("list unresolved authorized jobs: %w", err)
 	}
