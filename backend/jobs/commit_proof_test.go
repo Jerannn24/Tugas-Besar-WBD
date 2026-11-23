@@ -73,6 +73,7 @@ func TestCommitProofSurvivesRecordFailureAndEvidenceMustMatch(t *testing.T) {
 					t.Fatalf("mutate evidence: rows=%d err=%v", n, err)
 				}
 			}
+			_, _ = env.platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1", fix.claim.JobID)
 			outcome, err = New(env.platformDB).ReconcileStandardJobByID(ctx, fix.claim.JobID, deps)
 			if tc.mutation == "" {
 				if err != nil || outcome == nil || outcome.Status != executioncontract.Succeeded || outcome.Error != nil || calls != 2 {

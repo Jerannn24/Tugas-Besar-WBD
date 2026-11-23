@@ -68,11 +68,19 @@ func checkpointTicket(t *testing.T, ctx context.Context, e checkpointEnv, tx *sq
 	if err := tx.QueryRowContext(ctx, "SELECT pg_current_xact_id()::text").Scan(&xid); err != nil { t.Fatal(err) }
 	capability := make([]byte, 32)
 	if _, err := rand.Read(capability); err != nil { t.Fatal(err) }
-	hash := sha256.Sum256(capability)
-	_, err := e.prep.ExecContext(ctx, `INSERT INTO wbd_auth.batch_tickets
-		(execution_id, physical_target_id, target_xid, batch_index, direction, capability_sha256)
-		VALUES ($1, $2, $3::xid8, $4, $5, $6)`, id, e.target, xid, index, direction, hash[:])
-	if err != nil { t.Fatalf("issue ticket: %v", err) }
+	var reserveExists bool
+	_ = e.prep.QueryRowContext(ctx, "SELECT to_regprocedure('wbd_auth.reserve_batch_ticket(uuid,uuid,xid8,integer,text,bytea)') IS NOT NULL").Scan(&reserveExists)
+	if reserveExists {
+		_, err := e.prep.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, $4, $5, $6::bytea)`,
+			id, e.target, xid, index, direction, capability)
+		if err != nil { t.Fatalf("issue ticket: %v", err) }
+	} else {
+		hash := sha256.Sum256(capability)
+		_, err := e.prep.ExecContext(ctx, `INSERT INTO wbd_auth.batch_tickets
+			(execution_id, physical_target_id, target_xid, batch_index, direction, capability_sha256)
+			VALUES ($1, $2, $3::xid8, $4, $5, $6)`, id, e.target, xid, index, direction, hash[:])
+		if err != nil { t.Fatalf("issue ticket: %v", err) }
+	}
 	return capability, xid
 }
 
@@ -152,7 +160,7 @@ func TestBatchCheckpoint_DuplicateRetryRollsBack(t *testing.T) {
 
 	// Ticket keys are unique independently of checkpoint keys.
 	hash := sha256.Sum256(capability)
-	_, err = e.prep.ExecContext(ctx, `INSERT INTO wbd_auth.batch_tickets
+	_, err = e.cleanup.ExecContext(ctx, `INSERT INTO wbd_auth.batch_tickets
 		(execution_id, physical_target_id, target_xid, batch_index, direction, capability_sha256)
 		VALUES ($1, $2, $3::xid8, 0, 'up', $4)`, id, e.target, xid, hash[:])
 	checkpointState(t, err, "23505")
@@ -233,6 +241,7 @@ func TestBatchCheckpoint_MetadataProtection(t *testing.T) {
 	}
 	for _, query := range []string{
 		"SELECT * FROM wbd_auth.batch_tickets",
+		"INSERT INTO wbd_auth.batch_tickets DEFAULT VALUES",
 		"UPDATE wbd_auth.batch_tickets SET batch_index = 0",
 		"DELETE FROM wbd_auth.batch_tickets",
 		"INSERT INTO wbd_auth.batch_checkpoints DEFAULT VALUES",
@@ -249,15 +258,24 @@ func TestBatchCheckpoint_PrivilegeMatrix(t *testing.T) {
 	e := checkpointSetup(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	var hasReservation bool
+	_ = e.cleanup.QueryRowContext(ctx, "SELECT to_regprocedure('wbd_auth.reserve_batch_ticket(uuid,uuid,xid8,integer,text,bytea)') IS NOT NULL").Scan(&hasReservation)
+
+	prepTickets := [4]bool{false, false, false, false}
+	if !hasReservation {
+		prepTickets = [4]bool{false, true, false, false}
+	}
+
 	for _, role := range []struct {
 		name string
 		db *sql.DB
 		tickets, checkpoints [4]bool
-		execute bool
+		execute, reserve bool
 	}{
-		{"executor", e.exec, [4]bool{}, [4]bool{}, true},
-		{"preparer", e.prep, [4]bool{false, true, false, false}, [4]bool{true, false, false, false}, false},
-		{"viewer", e.viewer, [4]bool{}, [4]bool{}, false},
+		{"executor", e.exec, [4]bool{}, [4]bool{}, true, false},
+		{"preparer", e.prep, prepTickets, [4]bool{true, false, false, false}, false, hasReservation},
+		{"viewer", e.viewer, [4]bool{}, [4]bool{}, false, false},
 	} {
 		t.Run(role.name, func(t *testing.T) {
 			var username string
@@ -278,6 +296,154 @@ func TestBatchCheckpoint_PrivilegeMatrix(t *testing.T) {
 			var got bool
 			if err := e.cleanup.QueryRowContext(ctx, "SELECT has_function_privilege($1, 'wbd_auth.record_checkpoint(uuid,integer,text,bigint,bytea)', 'EXECUTE')", username).Scan(&got); err != nil { t.Fatal(err) }
 			if got != role.execute { t.Errorf("record_checkpoint EXECUTE privilege = %t, want %t", got, role.execute) }
+			if err := e.cleanup.QueryRowContext(ctx, "SELECT has_function_privilege($1, 'wbd_auth.reserve_batch_ticket(uuid,uuid,xid8,integer,text,bytea)', 'EXECUTE')", username).Scan(&got); err != nil { t.Fatal(err) }
+			if got != role.reserve { t.Errorf("reserve_batch_ticket EXECUTE privilege = %t, want %t", got, role.reserve) }
 		})
 	}
+}
+
+func TestBatchTicketReservationBoundary(t *testing.T) {
+	e := checkpointSetup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	execID := uuid.New()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		for _, table := range []string{"batch_checkpoints", "batch_tickets"} {
+			_, _ = e.cleanup.ExecContext(ctx, "DELETE FROM wbd_auth."+table+" WHERE execution_id = $1", execID)
+		}
+	})
+
+	// 1. In-flight transaction
+	tx1, err := e.exec.BeginTx(ctx, nil)
+	if err != nil { t.Fatal(err) }
+	var xid1 string
+	if err := tx1.QueryRowContext(ctx, "SELECT pg_current_xact_id()::text").Scan(&xid1); err != nil { t.Fatal(err) }
+	cap1 := make([]byte, 32)
+	cap1[0] = 0x01
+
+	// Call from preparer succeeds
+	_, err = e.prep.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, 0, 'up', $4::bytea)`,
+		execID, e.target, xid1, cap1)
+	if err != nil { t.Fatalf("valid ticket reservation: %v", err) }
+
+	// 2. Calling from executor is rejected
+	_, err = e.exec.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, 1, 'up', $4::bytea)`,
+		execID, e.target, xid1, cap1)
+	checkpointState(t, err, "42501")
+
+	// 3. Calling with wrong target is rejected
+	wrongTarget := uuid.New()
+	_, err = e.prep.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, 1, 'up', $4::bytea)`,
+		execID, wrongTarget, xid1, cap1)
+	checkpointState(t, err, "42501")
+
+	// 4. In-flight replacement refused: tx1 is still in-flight
+	tx2, err := e.exec.BeginTx(ctx, nil)
+	if err != nil { t.Fatal(err) }
+	defer tx2.Rollback()
+	var xid2 string
+	if err := tx2.QueryRowContext(ctx, "SELECT pg_current_xact_id()::text").Scan(&xid2); err != nil { t.Fatal(err) }
+	cap2 := make([]byte, 32)
+	cap2[0] = 0x02
+
+	_, err = e.prep.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, 0, 'up', $4::bytea)`,
+		execID, e.target, xid2, cap2)
+	checkpointState(t, err, "55000") // in-flight prior work refused
+
+	// 5. Abort tx1
+	if err := tx1.Rollback(); err != nil { t.Fatal(err) }
+
+	// 6. Replacement permitted for positively aborted prior XID
+	_, err = e.prep.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, 0, 'up', $4::bytea)`,
+		execID, e.target, xid2, cap2)
+	if err != nil { t.Fatalf("replace aborted ticket: %v", err) }
+
+	// 7. Checkpoint and commit tx2
+	_, err = tx2.ExecContext(ctx, `SELECT wbd_auth.record_checkpoint($1::uuid, 0, 'up', 1, $2::bytea)`, execID, cap2)
+	if err != nil { t.Fatalf("record checkpoint: %v", err) }
+	if err := tx2.Commit(); err != nil { t.Fatal(err) }
+
+	// 8. Refuse replacement when already checkpointed
+	tx3, err := e.exec.BeginTx(ctx, nil)
+	if err != nil { t.Fatal(err) }
+	defer tx3.Rollback()
+	var xid3 string
+	if err := tx3.QueryRowContext(ctx, "SELECT pg_current_xact_id()::text").Scan(&xid3); err != nil { t.Fatal(err) }
+
+	_, err = e.prep.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, 0, 'up', $4::bytea)`,
+		execID, e.target, xid3, cap2)
+	checkpointState(t, err, "55000") // checkpointed old work refused
+
+	// 9. Regression: unavailable old status failing closed, unchanged previous ticket
+	execID2 := uuid.New()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = e.cleanup.ExecContext(ctx, "DELETE FROM wbd_auth.batch_tickets WHERE execution_id = $1", execID2)
+	})
+
+	txA, err := e.exec.BeginTx(ctx, nil)
+	if err != nil { t.Fatal(err) }
+	var xidA string
+	if err := txA.QueryRowContext(ctx, "SELECT pg_current_xact_id()::text").Scan(&xidA); err != nil { t.Fatal(err) }
+	capA := make([]byte, 32)
+	capA[0] = 0xAA
+	_, err = e.prep.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, 0, 'up', $4::bytea)`,
+		execID2, e.target, xidA, capA)
+	if err != nil { t.Fatalf("initial reservation for regression: %v", err) }
+
+	// Simulate unavailable old status by setting target_xid to 1 (pg_xact_status is NULL)
+	_, err = e.cleanup.ExecContext(ctx, `UPDATE wbd_auth.batch_tickets SET target_xid = '1'::xid8 WHERE execution_id = $1 AND batch_index = 0`, execID2)
+	if err != nil { t.Fatalf("set unavailable target_xid: %v", err) }
+
+	txB, err := e.exec.BeginTx(ctx, nil)
+	if err != nil { t.Fatal(err) }
+	defer txB.Rollback()
+	var xidB string
+	if err := txB.QueryRowContext(ctx, "SELECT pg_current_xact_id()::text").Scan(&xidB); err != nil { t.Fatal(err) }
+	capB := make([]byte, 32)
+	capB[0] = 0xBB
+
+	// Reservation must fail closed (SQLSTATE 55000) when old status is unavailable/NULL
+	_, err = e.prep.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, 0, 'up', $4::bytea)`,
+		execID2, e.target, xidB, capB)
+	checkpointState(t, err, "55000")
+
+	// Verify unchanged previous ticket: target_xid and capability_sha256 must NOT have changed
+	var prevXID string
+	var prevCapSha []byte
+	err = e.cleanup.QueryRowContext(ctx, `SELECT target_xid::text, capability_sha256 FROM wbd_auth.batch_tickets WHERE execution_id = $1 AND batch_index = 0`, execID2).Scan(&prevXID, &prevCapSha)
+	if err != nil { t.Fatalf("read previous ticket: %v", err) }
+	expectedCapSha := sha256.Sum256(capA)
+	if prevXID != "1" || string(prevCapSha) != string(expectedCapSha[:]) {
+		t.Fatalf("previous ticket was unexpectedly modified: xid=%s sha=%x", prevXID, prevCapSha)
+	}
+
+	// 10. Regression: aborted reissue succeeds
+	if err := txA.Rollback(); err != nil { t.Fatal(err) }
+	// Restore target_xid to the positively aborted xidA
+	_, err = e.cleanup.ExecContext(ctx, `UPDATE wbd_auth.batch_tickets SET target_xid = $1::xid8 WHERE execution_id = $2 AND batch_index = 0`, xidA, execID2)
+	if err != nil { t.Fatalf("restore aborted target_xid: %v", err) }
+
+	_, err = e.prep.ExecContext(ctx, `SELECT wbd_auth.reserve_batch_ticket($1::uuid, $2::uuid, $3::xid8, 0, 'up', $4::bytea)`,
+		execID2, e.target, xidB, capB)
+	if err != nil { t.Fatalf("aborted reissue reservation should succeed: %v", err) }
+
+	// Verify ticket was updated to new transaction
+	err = e.cleanup.QueryRowContext(ctx, `SELECT target_xid::text, capability_sha256 FROM wbd_auth.batch_tickets WHERE execution_id = $1 AND batch_index = 0`, execID2).Scan(&prevXID, &prevCapSha)
+	if err != nil { t.Fatalf("read reissued ticket: %v", err) }
+	expectedReissuedSha := sha256.Sum256(capB)
+	if prevXID != xidB || string(prevCapSha) != string(expectedReissuedSha[:]) {
+		t.Fatalf("reissued ticket mismatch: xid=%s want=%s sha=%x", prevXID, xidB, prevCapSha)
+	}
+
+	// 11. Regression: preparer direct INSERT revoked on upgrade
+	hashB := sha256.Sum256(capB)
+	_, err = e.prep.ExecContext(ctx, `INSERT INTO wbd_auth.batch_tickets
+		(execution_id, physical_target_id, target_xid, batch_index, direction, capability_sha256)
+		VALUES ($1, $2, $3::xid8, 99, 'up', $4)`, execID2, e.target, xidB, hashB[:])
+	checkpointState(t, err, "42501") // direct insert revoked
 }

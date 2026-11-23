@@ -18,7 +18,7 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -p "$work/db/target-profile"
-cp "$root/db/target-profile/"{apply.sh,001_receipts.sql,002_batch_checkpoints.sql,003_batch_scopes.sql} "$work/db/target-profile/"
+cp "$root/db/target-profile/"{apply.sh,001_receipts.sql,002_batch_checkpoints.sql,003_batch_scopes.sql,004_batch_ticket_reservation.sql,005_batch_compensation.sql} "$work/db/target-profile/"
 cat > "$work/.env" <<'ENV'
 DB_TEST_TARGET_A_EXECUTOR_PASSWORD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 DB_TEST_TARGET_A_PREPARER_PASSWORD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -107,6 +107,15 @@ profile_002() {
     printf "INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('002_batch_checkpoints', '%s');\nCOMMIT;\n" "$checksum"
   } | "${compose[@]}" exec -T -e TARGET_SLOT=a postgres-test psql -X -q -v ON_ERROR_STOP=1 -U postgres -d test_target_a
 }
+profile_003() {
+  local checksum
+  checksum=$(sha256sum db/target-profile/003_batch_scopes.sql | cut -d ' ' -f1)
+  {
+    printf '%s\n' '\set ON_ERROR_STOP on' 'BEGIN;'
+    cat db/target-profile/003_batch_scopes.sql
+    printf "INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('003_batch_scopes', '%s');\nCOMMIT;\n" "$checksum"
+  } | "${compose[@]}" exec -T -e TARGET_SLOT=a postgres-test psql -X -q -v ON_ERROR_STOP=1 -U postgres -d test_target_a
+}
 checkpoint() {
   psql <<'SQL'
 BEGIN;
@@ -159,7 +168,7 @@ assert_receipt() {
 
 start
 apply
-assert_sql "SELECT count(*) = 3 FROM wbd_auth.profile_migrations;"
+assert_sql "SELECT count(*) = 5 FROM wbd_auth.profile_migrations;"
 before=$(psql <<< "SELECT row_to_json(m)::text FROM wbd_auth.target_marker m;")
 ledger=$(psql <<< "SELECT json_agg(m ORDER BY version)::text FROM wbd_auth.profile_migrations m;")
 output=$(apply)
@@ -172,13 +181,17 @@ psql <<< "UPDATE wbd_auth.profile_migrations SET checksum = '$(sha256sum db/targ
 expect_failure 'Target profile 002 checksum mismatch'
 psql <<< "UPDATE wbd_auth.profile_migrations SET checksum = '$(sha256sum db/target-profile/002_batch_checkpoints.sql | cut -d ' ' -f1)' WHERE version = '002_batch_checkpoints'; UPDATE wbd_auth.profile_migrations SET checksum = repeat('0', 64) WHERE version = '003_batch_scopes';"
 expect_failure 'Target profile 003 checksum mismatch'
-psql <<< "UPDATE wbd_auth.profile_migrations SET checksum = '$(sha256sum db/target-profile/003_batch_scopes.sql | cut -d ' ' -f1)' WHERE version = '003_batch_scopes'; DELETE FROM wbd_auth.profile_migrations WHERE version = '001_receipts';"
+psql <<< "UPDATE wbd_auth.profile_migrations SET checksum = '$(sha256sum db/target-profile/003_batch_scopes.sql | cut -d ' ' -f1)' WHERE version = '003_batch_scopes'; UPDATE wbd_auth.profile_migrations SET checksum = repeat('0', 64) WHERE version = '004_batch_ticket_reservation';"
+expect_failure 'Target profile 004 checksum mismatch'
+psql <<< "UPDATE wbd_auth.profile_migrations SET checksum = '$(sha256sum db/target-profile/004_batch_ticket_reservation.sql | cut -d ' ' -f1)' WHERE version = '004_batch_ticket_reservation'; UPDATE wbd_auth.profile_migrations SET checksum = repeat('0', 64) WHERE version = '005_batch_compensation';"
+expect_failure 'Target profile 005 checksum mismatch'
+psql <<< "UPDATE wbd_auth.profile_migrations SET checksum = '$(sha256sum db/target-profile/005_batch_compensation.sql | cut -d ' ' -f1)' WHERE version = '005_batch_compensation'; DELETE FROM wbd_auth.profile_migrations WHERE version = '001_receipts';"
 expect_failure 'Target profile 001 checksum mismatch'
 psql <<< "INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('001_receipts', '$(sha256sum db/target-profile/001_receipts.sql | cut -d ' ' -f1)'), ('unexpected', repeat('0', 64));"
 expect_failure 'Unexpected profile migrations present'
-psql <<< "DELETE FROM wbd_auth.profile_migrations WHERE version = '003_batch_scopes';"
-expect_failure 'Prerequisite profile 001/002 missing or batch_scopes already exists'
-psql <<< "INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('003_batch_scopes', '$(sha256sum db/target-profile/003_batch_scopes.sql | cut -d ' ' -f1)');"
+psql <<< "DELETE FROM wbd_auth.profile_migrations WHERE version = '004_batch_ticket_reservation';"
+expect_failure 'Prerequisite profile 001/002/003 missing or reserve_batch_ticket already exists'
+psql <<< "INSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('004_batch_ticket_reservation', '$(sha256sum db/target-profile/004_batch_ticket_reservation.sql | cut -d ' ' -f1)');"
 stop
 
 start
@@ -191,7 +204,9 @@ apply
 [[ $(psql <<< "SELECT row_to_json(m)::text FROM wbd_auth.target_marker m;") == "$before" ]]
 [[ $(psql <<< "SET SESSION AUTHORIZATION wbd_target_a_preparer; SELECT row_to_json(r)::text FROM wbd_auth.execution_receipts r;") == "$old_receipt" ]]
 assert_receipt '30000000-0000-0000-0000-000000000001' 1
-assert_sql "SELECT count(*) = 3 FROM wbd_auth.profile_migrations;"
+assert_sql "SELECT count(*) = 5 FROM wbd_auth.profile_migrations;"
+assert_sql "SELECT NOT has_table_privilege('wbd_target_a_preparer', 'wbd_auth.batch_tickets', 'INSERT');"
+assert_sql "SELECT has_function_privilege('wbd_target_a_preparer', 'wbd_auth.reserve_batch_ticket(uuid,uuid,xid8,integer,text,bytea)', 'EXECUTE');"
 receipt '30000000-0000-0000-0000-000000000002' 2
 assert_receipt '30000000-0000-0000-0000-000000000002' 2
 assert_sql "SELECT count(*) = 2 FROM wbd_auth.execution_receipts;"
@@ -207,6 +222,7 @@ old_receipt=$(psql <<< "SELECT row_to_json(r)::text FROM wbd_auth.execution_rece
 old_checkpoint=$(psql <<< "SELECT row_to_json(c)::text FROM wbd_auth.batch_checkpoints c;")
 old_ledger=$(psql <<< "SELECT json_agg(m ORDER BY version)::text FROM wbd_auth.profile_migrations m;")
 apply
+assert_sql "SELECT NOT has_table_privilege('wbd_target_a_preparer', 'wbd_auth.batch_tickets', 'INSERT');"
 psql <<< "SET SESSION AUTHORIZATION wbd_target_a_executor; CREATE TABLE managed.scope_unrelated_after (id bigint);"
 assert_sql "SELECT NOT has_table_privilege('wbd_target_a_receipt_owner', 'managed.scope_unrelated_before', 'SELECT') AND NOT has_table_privilege('wbd_target_a_receipt_owner', 'managed.scope_unrelated_after', 'SELECT');"
 [[ $(psql <<< "SELECT row_to_json(r)::text FROM wbd_auth.execution_receipts r;") == "$old_receipt" ]]
@@ -242,15 +258,34 @@ stop
 
 start
 legacy
+profile_002
+profile_003
+receipt '30000000-0000-0000-0000-000000000001' 1
+checkpoint
+old_receipt=$(psql <<< "SELECT row_to_json(r)::text FROM wbd_auth.execution_receipts r;")
+old_checkpoint=$(psql <<< "SELECT row_to_json(c)::text FROM wbd_auth.batch_checkpoints c;")
+old_ledger=$(psql <<< "SELECT json_agg(m ORDER BY version)::text FROM wbd_auth.profile_migrations m;")
+cp db/target-profile/004_batch_ticket_reservation.sql "$work/004-original.sql"
+printf '\nSELECT 1 / 0;\n' >> db/target-profile/004_batch_ticket_reservation.sql
+expect_failure 'division by zero'
+[[ $(psql <<< "SELECT json_agg(m ORDER BY version)::text FROM wbd_auth.profile_migrations m;") == "$old_ledger" ]]
+[[ $(psql <<< "SELECT row_to_json(r)::text FROM wbd_auth.execution_receipts r;") == "$old_receipt" ]]
+[[ $(psql <<< "SELECT row_to_json(c)::text FROM wbd_auth.batch_checkpoints c;") == "$old_checkpoint" ]]
+assert_sql "SELECT to_regprocedure('wbd_auth.reserve_batch_ticket(uuid,uuid,xid8,integer,text,bytea)') IS NULL;"
+assert_sql "SELECT count(*) = 1 FROM managed.checkpoint_fixture WHERE id = 1 AND processed;"
+cp "$work/004-original.sql" db/target-profile/004_batch_ticket_reservation.sql
+stop
+
+start
+legacy
 receipt '30000000-0000-0000-0000-000000000001' 1
 before=$(psql <<< "SELECT row_to_json(m)::text FROM wbd_auth.target_marker m;")
 old_receipt=$(psql <<< "SELECT row_to_json(r)::text FROM wbd_auth.execution_receipts r;")
 printf "\nINSERT INTO wbd_auth.profile_migrations(version, checksum) VALUES ('injected_test', repeat('0', 64));\nSELECT 1 / 0;\n" >> db/target-profile/003_batch_scopes.sql
 expect_failure 'division by zero'
 assert_sql "SELECT count(*) = 1 AND min(version) = '001_receipts' FROM wbd_auth.profile_migrations;"
-assert_sql "SELECT NOT EXISTS (SELECT FROM wbd_auth.profile_migrations WHERE version IN ('injected_test', '002_batch_checkpoints', '003_batch_scopes'));"
-assert_sql "SELECT to_regclass('wbd_auth.batch_tickets') IS NULL AND to_regclass('wbd_auth.batch_checkpoints') IS NULL AND to_regclass('wbd_auth.batch_scopes') IS NULL AND to_regclass('wbd_auth.batch_scope_items') IS NULL AND to_regprocedure('wbd_auth.freeze_batch_scope(uuid,uuid,uuid,uuid)') IS NULL;"
-[[ $(psql <<< "SELECT row_to_json(m)::text FROM wbd_auth.target_marker m;") == "$before" ]]
+assert_sql "SELECT NOT EXISTS (SELECT FROM wbd_auth.profile_migrations WHERE version IN ('injected_test', '002_batch_checkpoints', '003_batch_scopes', '004_batch_ticket_reservation', '005_batch_compensation'));"
+assert_sql "SELECT to_regclass('wbd_auth.batch_tickets') IS NULL AND to_regclass('wbd_auth.batch_checkpoints') IS NULL AND to_regclass('wbd_auth.batch_scopes') IS NULL AND to_regclass('wbd_auth.batch_scope_items') IS NULL AND to_regprocedure('wbd_auth.freeze_batch_scope(uuid,uuid,uuid,uuid)') IS NULL AND to_regprocedure('wbd_auth.reserve_batch_ticket(uuid,uuid,xid8,integer,text,bytea)') IS NULL AND to_regclass('wbd_auth.batch_row_versions') IS NULL;"
 [[ $(psql <<< "SELECT row_to_json(r)::text FROM wbd_auth.execution_receipts r;") == "$old_receipt" ]]
 receipt '30000000-0000-0000-0000-000000000002' 2
 assert_sql "SELECT count(*) = 2 FROM wbd_auth.execution_receipts;"

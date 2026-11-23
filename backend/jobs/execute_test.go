@@ -530,6 +530,7 @@ func TestExecuteStandardJob_CrashAfterTargetCommit_RecoveryWithoutReplay(t *test
 		return executioncontract.ExecutionPlan{}, nil
 	}
 	deps = ExecutionDeps{Gate: gate, Acquire: env.makeAcquire(t), Timeout: 10 * time.Second}
+	_, _ = env.platformDB.ExecContext(ctx, "UPDATE app.jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1", fix.claim.JobID)
 	outcome, err = New(env.platformDB).ReconcileStandardJobByID(ctx, fix.claim.JobID, deps)
 	if err == nil && (outcome == nil || outcome.Error == nil) {
 		t.Fatalf("injected platform failure not surfaced: outcome=%+v err=%v", outcome, err)
