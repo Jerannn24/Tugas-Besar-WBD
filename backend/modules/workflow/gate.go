@@ -420,48 +420,103 @@ func contains(value, part string) bool {
 	return false
 }
 
+
 func gateApprovalFingerprint(ctx context.Context, db *pgxpool.Pool, databaseID uuid.UUID) ([32]byte, error) {
-	rows, err := db.Query(ctx, `SELECT g.id,g.leader_user_id,m.user_id
+	rows, err := db.Query(ctx, `
+		SELECT
+			g.id,
+			g.leader_user_id,
+			COALESCE(leader_user.is_active, FALSE),
+			gr.access,
+			m.user_id,
+			COALESCE(member_user.is_active, FALSE)
 		FROM app.groups g
-		JOIN app.group_database_grants gr ON gr.group_id=g.id
-		LEFT JOIN app.group_memberships m ON m.group_id=g.id
-		WHERE gr.database_id=$1
-		ORDER BY g.id,m.user_id`, databaseID)
+		JOIN app.group_database_grants gr ON gr.group_id = g.id
+		LEFT JOIN app.users leader_user ON leader_user.id = g.leader_user_id
+		LEFT JOIN app.group_memberships m ON m.group_id = g.id
+		LEFT JOIN app.users member_user ON member_user.id = m.user_id
+		WHERE gr.database_id = $1
+		  AND gr.access IN ('view', 'edit')
+		ORDER BY g.id, gr.access, m.user_id
+	`, databaseID)
 	if err != nil {
 		return [32]byte{}, err
 	}
 	defer rows.Close()
-	type roster struct {
-		Group   string   `json:"group"`
-		Leader  *string  `json:"leader"`
-		Members []string `json:"members"`
+
+	type fingerprintMember struct {
+		UserID string `json:"user_id"`
+		Active bool   `json:"active"`
 	}
-	var all []roster
-	var current *roster
+
+	type fingerprintRoster struct {
+		Group        string              `json:"group"`
+		Leader       *string             `json:"leader"`
+		LeaderActive bool                `json:"leader_active"`
+		Access       Access              `json:"access"`
+		Members      []fingerprintMember `json:"members"`
+	}
+
+	var all []fingerprintRoster
+	var current *fingerprintRoster
+
 	for rows.Next() {
-		var group uuid.UUID
-		var leader, member *uuid.UUID
-		if err := rows.Scan(&group, &leader, &member); err != nil {
+		var (
+			group       uuid.UUID
+			leader      *uuid.UUID
+			leaderActive bool
+			access      string
+			member      *uuid.UUID
+			memberActive bool
+		)
+
+		if err := rows.Scan(
+			&group,
+			&leader,
+			&leaderActive,
+			&access,
+			&member,
+			&memberActive,
+		); err != nil {
 			return [32]byte{}, err
 		}
-		if current == nil || current.Group != group.String() {
-			all = append(all, roster{Group: group.String()})
+
+		groupID := group.String()
+
+		if current == nil ||
+			current.Group != groupID ||
+			current.Access != Access(access) {
+			all = append(all, fingerprintRoster{
+				Group:   groupID,
+				Access:  Access(access),
+				Members: []fingerprintMember{},
+			})
 			current = &all[len(all)-1]
 		}
+
+		current.LeaderActive = leaderActive
+
 		if leader != nil {
-			value := leader.String()
-			current.Leader = &value
+			leaderID := leader.String()
+			current.Leader = &leaderID
 		}
+
 		if member != nil {
-			current.Members = append(current.Members, member.String())
+			current.Members = append(current.Members, fingerprintMember{
+				UserID: member.String(),
+				Active: memberActive,
+			})
 		}
 	}
+
 	if err := rows.Err(); err != nil {
 		return [32]byte{}, err
 	}
+
 	raw, err := json.Marshal(all)
 	if err != nil {
 		return [32]byte{}, err
 	}
+
 	return sha256.Sum256(raw), nil
 }

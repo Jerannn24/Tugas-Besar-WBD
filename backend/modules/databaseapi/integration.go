@@ -106,6 +106,13 @@ func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer
 	if err := historyHandler.Register(mux); err != nil {
 		return nil, err
 	}
+	mux.HandleFunc("GET /api/databases/{database_id}/drafts/{draft_id}/execute", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", "POST")
+		writeWorkflowRouteFallback(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Migration execution is now queued through workflow")
+	})
+	mux.HandleFunc("POST /api/databases/{database_id}/drafts/{draft_id}/execute", func(w http.ResponseWriter, r *http.Request) {
+		writeWorkflowRouteFallback(w, http.StatusBadRequest, "INVALID_REQUEST", "Use the proposal queue endpoint")
+	})
 	policy, err := sqlpolicy.New("managed")
 	if err != nil {
 		return nil, err
@@ -125,9 +132,6 @@ func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer
 		Timeout:   30 * time.Second,
 	})
 	if err != nil {
-		return nil, err
-	}
-	if err := migrationHandler.Register(mux); err != nil {
 		return nil, err
 	}
 	api := adaptor.HTTPHandler(jsonFallback(mux))
@@ -193,6 +197,18 @@ func mapAuthzError(err error) error {
 type statusRecorder struct {
 	header http.Header
 	status int
+}
+
+func writeWorkflowRouteFallback(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"code": code, "message": message,
+			"field_errors": map[string]string{}, "retryable": false,
+		},
+	})
 }
 
 func (s *statusRecorder) Header() http.Header         { return s.header }
