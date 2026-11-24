@@ -1,0 +1,17 @@
+{
+  "uid": "dbplatform-observability",
+  "title": "DB Platform Observability",
+  "tags": ["dbplatform", "m2"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Jobs by status", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "targets": [{"expr": "dbplatform_jobs", "refId": "A"}]},
+    {"id": 2, "type": "timeseries", "title": "Migration duration", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "targets": [{"expr": "rate(dbplatform_migration_duration_seconds_sum[5m]) / clamp_min(rate(dbplatform_migration_duration_seconds_count[5m]), 1)", "refId": "A"}]},
+    {"id": 3, "type": "timeseries", "title": "Committed batches", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "targets": [{"expr": "rate(dbplatform_batches_committed_total[5m])", "refId": "A"}]},
+    {"id": 4, "type": "timeseries", "title": "Committed rows", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "targets": [{"expr": "rate(dbplatform_rows_committed_total[5m])", "refId": "A"}]}
+  ],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"}
+}

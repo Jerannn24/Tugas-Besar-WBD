@@ -78,7 +78,81 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+      
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./deploy/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    restart: unless-stopped
 
+  loki:
+    image: grafana/loki:3.5.0
+    volumes:
+      - ./deploy/observability/loki.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    command:
+      - "-config.file=/etc/loki/local-config.yaml"
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.8.0
+    volumes:
+      - ./deploy/observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+    command:
+      - "-config.file=/etc/tempo.yaml"
+    restart: unless-stopped
+
+  alloy:
+    image: grafana/alloy:v1.11.0
+    volumes:
+      - ./deploy/observability/alloy.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "12345:12345"
+      - "4317:4317"
+      - "4318:4318"
+    command:
+      - "run"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    restart: unless-stopped
+    
 volumes:
   postgres-dev-data:
   postgres-test-data:
+
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  alloy-data:
+  grafana-data:

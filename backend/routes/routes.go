@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"log"
+
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/jobs"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/admin"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/auth"
@@ -8,9 +10,9 @@ import (
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/databaseapi"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/workflow"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"log"
 )
 
 func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
@@ -29,6 +31,9 @@ func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
 			"error": nil,
 		})
 	})
+
+	metricsRegistry := telemetry.NewRegistry()
+	telemetry.RegisterRoutes(api, metricsRegistry)
 
 	authRepo := auth.NewRepository(db)
 	authSessions := auth.NewSessionRepository(db)
