@@ -25,6 +25,8 @@ const CODE_TITLES: Record<string, string> = {
   REVIEW_STALE: 'Review sudah usang',
   VERSION_CONFLICT: 'Revisi sudah berubah',
   DATABASE_BUSY: 'Database sedang sibuk',
+  ALREADY_APPLIED: 'Draft sudah diterapkan',
+  INVALID_GROUP_LEADER: 'Leader tidak valid',
 }
 
 const OWN_TITLE: ReadonlySet<WorkflowFailureKind> = new Set(['invalid_request', 'validation', 'server'])

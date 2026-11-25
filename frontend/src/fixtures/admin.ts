@@ -3,6 +3,7 @@ import type { ConnectionInput, ConnectionSummary, Group, GroupGrants, ID, User }
 import { TARGETS, USERS } from './data'
 import { fail, ok, parseBody } from './http'
 import { hasUnresolvedExecution } from './migrations'
+import { GROUP_MAIN } from './samples'
 
 type Grant = GroupGrants['grants'][number]
 type State = {
@@ -14,7 +15,7 @@ type State = {
   seq: number
 }
 
-const STORAGE_KEY = 'fixture_admin_v2'
+const STORAGE_KEY = 'fixture_admin_v3'
 const SSL_MODES: readonly string[] = ['disable', 'require', 'verify-full']
 
 const READERS = '20000000-0000-4000-8000-000000000001'
@@ -29,14 +30,16 @@ function seed(): State {
   return {
     users: Object.values(u),
     groups: [
-      { id: READERS, name: 'readers' },
-      { id: EDITORS, name: 'editors' },
-      { id: STALE, name: 'fixture_stale' },
+      { id: READERS, name: 'readers', leader_user_id: null },
+      { id: EDITORS, name: 'editors', leader_user_id: u.demo_editor.id },
+      { id: STALE, name: 'fixture_stale', leader_user_id: null },
+      { id: GROUP_MAIN, name: 'm2_main', leader_user_id: u.operator.id },
     ],
     members: {
       [READERS]: [u.demo_viewer.id, u.demo_editor.id, u.demo_disabled.id],
       [EDITORS]: [u.demo_editor.id],
       [STALE]: [u.demo_viewer.id, UNKNOWN_USER],
+      [GROUP_MAIN]: [u.operator.id, u.demo_editor.id, u.demo_disabled.id],
     },
     grants: {
       [READERS]: [{ database_id: TARGETS.demo_main.id, access: 'view' }],
@@ -46,6 +49,7 @@ function seed(): State {
         { database_id: TARGETS.demo_readonly.id, access: 'edit' },
       ],
       [STALE]: [],
+      [GROUP_MAIN]: [{ database_id: TARGETS.demo_m2.id, access: 'edit' }],
     },
     connections: [
       {
@@ -61,6 +65,7 @@ function seed(): State {
       },
       { ...TARGETS.demo_second, host: 'target-db', port: 5432, database_name: 'demo_second', username: 'demo_second_app', ssl_mode: 'disable', ...VIEW_ONLY },
       { ...TARGETS.demo_readonly, host: 'target-db', port: 5432, database_name: 'demo_readonly', username: 'demo_readonly_app', ssl_mode: 'disable', ...VIEW_ONLY },
+      { ...TARGETS.demo_m2, host: 'target-db', port: 5432, database_name: 'demo_m2', username: 'demo_m2_app', ssl_mode: 'disable', executor_username: 'demo_m2_executor', preparer_username: 'demo_m2_preparer', execution_ready: true },
       { id: OFFLINE, name: 'demo_offline', host: 'offline.invalid', port: 5432, database_name: 'demo_offline', username: 'demo_offline_app', ssl_mode: 'require', ...VIEW_ONLY },
     ],
     seq: 100,
@@ -99,6 +104,7 @@ const notFound = (what: string) => fail(404, 'NOT_FOUND', `${what} tidak ditemuk
 const badRequest = () => fail(400, 'INVALID_REQUEST', 'Body JSON tidak valid.')
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const chars = (s: string) => [...s].length
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export function handleAdminRequest(req: TransportRequest, username: string, rest: string[]): Response {
   if (!USERS[username]?.is_admin) return fail(403, 'FORBIDDEN', 'Hanya Platform Admin yang dapat mengakses fitur ini.')
@@ -129,6 +135,8 @@ function route(state: State, req: TransportRequest, rest: string[]): Response {
       return renameGroup(state, id, body)
     case 'DELETE groups/:id':
       return removeGroup(state, id)
+    case 'PUT groups/:id/leader':
+      return withGroup(state, id, () => putLeader(state, id, body))
     case 'GET groups/:id/members':
       return withGroup(state, id, () => ok({ group_id: id, user_ids: state.members[id] ?? [] }))
     case 'PUT groups/:id/members':
@@ -226,7 +234,7 @@ function groupName(state: State, body: unknown, self: ID | null): string | Respo
 function createGroup(state: State, body: unknown): Response {
   const name = groupName(state, body, null)
   if (typeof name !== 'string') return name
-  const group: Group = { id: nextId(state, '20000000'), name }
+  const group: Group = { id: nextId(state, '20000000'), name, leader_user_id: null }
   state.groups.push(group)
   state.members[group.id] = []
   state.grants[group.id] = []
@@ -250,6 +258,23 @@ function removeGroup(state: State, id: ID): Response {
   return ok({ deleted: true })
 }
 
+function putLeader(state: State, id: ID, body: unknown): Response {
+  if (!isObject(body) || typeof body.user_id !== 'string' || !UUID.test(body.user_id)) return badRequest()
+  const userId = body.user_id
+  const active = state.users.some((u) => u.id === userId && u.is_active)
+  if (!active || !(state.members[id] ?? []).includes(userId)) {
+    return fail(409, 'INVALID_GROUP_LEADER', 'Leader harus merupakan anggota grup yang aktif')
+  }
+  const group = state.groups.find((g) => g.id === id)
+  if (!group) return notFound('Group')
+  group.leader_user_id = userId
+  return ok(group)
+}
+
+export function fixtureGroupLeader(groupId: ID): ID | null | undefined {
+  return load().groups.find((g) => g.id === groupId)?.leader_user_id
+}
+
 function putMembers(state: State, id: ID, body: unknown): Response {
   if (!isObject(body) || !Array.isArray(body.user_ids) || !body.user_ids.every((x) => typeof x === 'string')) {
     return badRequest()
@@ -261,6 +286,9 @@ function putMembers(state: State, id: ID, body: unknown): Response {
     return invalid({ user_ids: `ID user tidak dikenal: ${unknown.join(', ')}` }, 'Anggota tidak disimpan karena ada ID yang tidak dikenal.')
   }
   state.members[id] = [...ids].sort()
+  
+  const group = state.groups.find((g) => g.id === id)
+  if (group?.leader_user_id && !ids.includes(group.leader_user_id)) group.leader_user_id = null
   return ok({ group_id: id, user_ids: state.members[id] })
 }
 

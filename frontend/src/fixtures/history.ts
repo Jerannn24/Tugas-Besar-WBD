@@ -1,16 +1,45 @@
 import type { TransportRequest } from '../api/client'
-import type { Execution, HistoryAttemptRow, ID, LegacyHistory } from '../api/types'
+import type { AllowedAction, Execution, HistoryAttemptRow, ID, LegacyHistory } from '../api/types'
 import { failM2, ok, okM2 } from './http'
 import { listResponse, query } from './paging'
 import type { AttemptRecord } from './samples'
-import { notFound, type Ctx } from './state'
+import { notFound, type Ctx, type State } from './state'
 
 type CommittedAttempt = AttemptRecord & { commit: NonNullable<AttemptRecord['commit']> }
 
 export const byStartedDesc = (a: AttemptRecord, b: AttemptRecord) =>
   b.started_at.localeCompare(a.started_at) || b.attempt_id.localeCompare(a.attempt_id)
 
-function historyRow(a: AttemptRecord): HistoryAttemptRow {
+const isUpCommit = (a: AttemptRecord) =>
+  a.status === 'succeeded' && a.commit !== null && a.commit.direction === 'up' && a.commit.is_complete
+
+function revertedIds(rows: AttemptRecord[]): Set<ID> {
+  const ids = new Set<ID>()
+  for (const r of rows) {
+    const reverts = r.commit?.reverts_execution_id
+    if (r.status === 'succeeded' && r.commit?.direction === 'down' && r.commit.is_complete && reverts) ids.add(reverts)
+  }
+  return ids
+}
+
+function activeHead(rows: AttemptRecord[]): ID | null {
+  const reverted = revertedIds(rows)
+  return rows.filter(isUpCommit).sort(byStartedDesc).find((r) => !reverted.has(r.execution_id))?.execution_id ?? null
+}
+
+type RowContext = { head: ID | null; reverted: Set<ID>; edit: boolean; state: State }
+
+function rowActions(a: AttemptRecord, rc: RowContext): AllowedAction[] {
+  if (!rc.edit || !isUpCommit(a)) return []
+  const draft = rc.state.drafts.find((d) => d.id === a.migration_id && d.database_id === a.database_id)
+  if (!draft || draft.revision !== a.revision) return []
+  const actions: AllowedAction[] = []
+  if (a.execution_id === rc.head && draft.sql_down) actions.push('propose_rollback')
+  if (rc.reverted.has(a.execution_id) && rc.head !== a.execution_id) actions.push('propose_forward')
+  return actions
+}
+
+function historyRow(a: AttemptRecord, rc: RowContext): HistoryAttemptRow {
   return {
     attempt_id: a.attempt_id,
     execution_id: a.execution_id,
@@ -27,6 +56,8 @@ function historyRow(a: AttemptRecord): HistoryAttemptRow {
     sql_entered: a.sql_entered,
     statements: a.statements,
     commit: a.commit,
+    is_active_head: isUpCommit(a) && a.execution_id === rc.head,
+    allowed_actions: rowActions(a, rc),
   }
 }
 
@@ -93,6 +124,8 @@ export function legacyAttemptPage(req: TransportRequest, databaseId: ID, executi
       source_execution_id: null,
       sql_entered: null,
       statements: [],
+      is_active_head: false,
+      allowed_actions: [],
       commit:
         x.status === 'succeeded'
           ? {
@@ -122,7 +155,7 @@ export function legacyAttemptPage(req: TransportRequest, databaseId: ID, executi
             }
           : null,
     }))
-  return listResponse(req, { db: databaseId, resource: 'migrations', hide }, rows)
+  return listResponse(req, { db: databaseId, resource: 'migrations', hide }, rows, { active_head_execution_id: null })
 }
 
 function listHistory(c: Ctx): Response {
@@ -133,7 +166,13 @@ function listHistory(c: Ctx): Response {
   const hide = readHide(c.req)
   if (hide instanceof Response) return hide
   const visible = hide ? hideRollback(rows) : rows
-  return listResponse(c.req, { db: c.databaseId, resource: 'migrations', hide }, visible.map(historyRow))
+  const rc: RowContext = { head: activeHead(rows), reverted: revertedIds(rows), edit: c.access === 'edit', state: c.state }
+  return listResponse(
+    c.req,
+    { db: c.databaseId, resource: 'migrations', hide },
+    visible.map((a) => historyRow(a, rc)),
+    { active_head_execution_id: rc.head },
+  )
 }
 
 export function historyRoute(key: string, c: Ctx): Response | null {
