@@ -103,10 +103,14 @@ GRANT SELECT ON app.schema_migrations TO wbd_platform_runtime;
 \endif
 SELECT EXISTS (SELECT 1 FROM app.schema_migrations WHERE version = :'migration_version') AS version_exists \gset
 \if :version_exists
-SELECT checksum = :'migration_checksum' AS checksum_matches
+-- Migration 013 reconciles both published versions of 007 without rewriting the ledger.
+SELECT (checksum = :'migration_checksum'
+        OR (version = '007_workflow_history'
+            AND checksum = '59145eacfcf517218cbd6a9efbf6356c8797946bec62965ad2761da55717c5d6'
+            AND :'migration_checksum' = 'cb6197be8e59f85bbb41582faea533d74dd199e012b89a3393a742f96b9019f6')) AS checksum_matches
 FROM app.schema_migrations WHERE version = :'migration_version' \gset
 \if :checksum_matches
-\echo 'Migration already applied with matching checksum; no-op.'
+\echo 'Migration already applied with an accepted checksum; no-op.'
 COMMIT;
 \else
 \echo 'FAIL: migration checksum differs from the applied version'
