@@ -19,12 +19,13 @@ type Props = { databaseId: ID; row: HistoryAttemptRow; actions?: ReactNode }
 export function Attempt({ databaseId, row: a, actions }: Props) {
   const c = a.commit
   return (
-    <li className="history-item card">
+    <li className={`history-item card${a.is_active_head ? ' history-item--head' : ''}`}>
       <div className="card-body">
         <div className="d-flex flex-wrap align-items-center gap-2 mb-2">
           <ActionBadge action={a.action} direction={a.direction} />
           <AttemptBadge status={a.status} />
           <span className="mono fw-bold">{a.version === null ? '-' : `v${a.version}`}</span>
+          {a.is_active_head && <span className="badge bg-green text-green-fg">Posisi aktif</span>}
         </div>
 
         <dl className="history-meta">

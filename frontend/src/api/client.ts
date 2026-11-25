@@ -186,6 +186,14 @@ function toErrorBody(v: unknown): ApiErrorBody | null {
   }
 }
 
+const CODE_ALIASES: Record<string, string> = {
+  INVALID_INPUT: 'INVALID_REQUEST',
+  PROPOSAL_STALE: 'VERSION_CONFLICT',
+  CONFLICT: 'VERSION_CONFLICT',
+}
+
+export const canonicalCode = (code: string): string => CODE_ALIASES[code] ?? code
+
 const GENERIC_MESSAGES: Record<string, string> = {
   UNAUTHENTICATED: 'Sesi berakhir. Mengalihkan ke halaman login…',
   INVALID_CREDENTIALS: 'Username atau password salah.',
@@ -209,6 +217,8 @@ const GENERIC_MESSAGES: Record<string, string> = {
   BATCH_UNSAFE: 'Konfigurasi batch tidak aman.',
   QUEUE_UNAVAILABLE: 'Antrean belum menerima job. Kirim ulang untuk mencoba lagi.',
   NOT_IMPLEMENTED: 'Fitur ini belum tersedia di backend.',
+  ALREADY_APPLIED: 'Draft sudah diterapkan dan tidak dapat diubah lagi.',
+  INVALID_GROUP_LEADER: 'Leader harus anggota aktif group ini.',
 }
 
 export function errorMessage(failure: ApiFailure): string {
@@ -224,13 +234,13 @@ export function errorMessage(failure: ApiFailure): string {
         return GENERIC_MESSAGES[code]
       }
 
-      return message || GENERIC_MESSAGES[code] || 'Permintaan gagal.'
+      return message || GENERIC_MESSAGES[canonicalCode(code)] || 'Permintaan gagal.'
     }
   }
 }
 
 export function isErrorCode(result: ApiResult<unknown>, code: string): boolean {
-  return !result.ok && result.kind === 'http' && result.error.code === code
+  return !result.ok && result.kind === 'http' && canonicalCode(result.error.code) === code
 }
 
 const CSRF_CODES: ReadonlySet<string> = new Set(['CSRF_INVALID', 'CSRF_FAILED'])

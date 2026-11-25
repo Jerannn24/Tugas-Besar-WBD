@@ -47,8 +47,8 @@ function pageOf<T>(items: T[], w: PageWindow, scope: Scope): CursorPage<T> {
   return { items: items.slice(w.offset, end), next_cursor: end < items.length ? btoa(JSON.stringify(cursor)) : null }
 }
 
-export function listResponse<T>(req: TransportRequest, scope: Scope, items: T[]): Response {
+export function listResponse<T>(req: TransportRequest, scope: Scope, items: T[], extra: Record<string, unknown> = {}): Response {
   const w = readWindow(req, scope)
   if (w instanceof Response) return w
-  return okM2(pageOf(items, w, scope))
+  return okM2({ ...pageOf(items, w, scope), ...extra })
 }

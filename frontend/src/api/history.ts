@@ -1,6 +1,6 @@
 import { request } from './client'
 import { pageParams, type PageQuery } from './paging'
-import type { CursorPage, Execution, HistoryAttemptRow, HistoryEntry, ID } from './types'
+import type { Execution, HistoryEntry, HistoryPage, ID } from './types'
 
 const e = encodeURIComponent
 const db = (databaseId: ID) => `/api/databases/${e(databaseId)}`
@@ -11,7 +11,7 @@ export type HistoryQuery = PageQuery & { hideRollback?: boolean }
 export function listHistory(databaseId: ID, q: HistoryQuery = {}) {
   const params = pageParams({ limit: devLimit, ...q })
   if (q.hideRollback) params.set('hide_rollback', 'true')
-  return request<CursorPage<HistoryAttemptRow>>('GET', `${db(databaseId)}/migrations?${params}`)
+  return request<HistoryPage>('GET', `${db(databaseId)}/migrations?${params}`)
 }
 
 export const isHistoryEntry = (x: Execution | HistoryEntry): x is HistoryEntry => 'batch_commits' in x

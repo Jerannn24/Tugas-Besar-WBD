@@ -11,6 +11,7 @@ import type {
   Proposal,
   Validation,
 } from '../api/types'
+import { fixtureGroupLeader } from './admin'
 import { USERS } from './data'
 import { failM2, okM2, parseBody } from './http'
 import { acceptedView } from './jobs'
@@ -50,10 +51,18 @@ function draftView(d: Draft): Draft {
   }
 }
 
+function currentLeader(groupId: ID, snapshot: ID | null): ID | null {
+  const leader = fixtureGroupLeader(groupId)
+  return leader === undefined ? snapshot : leader
+}
+
 function proposalView(p: Proposal, actor: Actor, access: AccessLevel): Proposal {
   const allowed: AllowedAction[] = []
   if (p.status === 'draft' && access === 'edit') allowed.push('submit_review')
-  if (p.status === 'pending_review' && p.approvals.some((a) => a.status === 'pending' && a.leader_user_id === actor.id)) {
+  if (
+    p.status === 'pending_review' &&
+    p.approvals.some((a) => a.status === 'pending' && currentLeader(a.group_id, a.leader_user_id) === actor.id)
+  ) {
     allowed.push('approve')
   }
   if (p.status === 'approved' && access === 'edit') allowed.push('enqueue')
@@ -210,7 +219,12 @@ function submitReview(c: Ctx): Response {
     return failM2(422, 'VALIDATION_FAILED', 'Validasi gagal. Lihat hasil validasi pada proposal.')
   }
   p.status = 'pending_review'
-  p.approvals = REQUIRED_GROUPS.map((g) => ({ ...g, status: 'pending', approved_at: null }))
+  p.approvals = REQUIRED_GROUPS.map((g) => ({
+    group_id: g.group_id,
+    leader_user_id: currentLeader(g.group_id, g.leader_user_id),
+    status: 'pending',
+    approved_at: null,
+  }))
   return okM2(proposalView(p, c.actor, c.access))
 }
 
@@ -237,12 +251,14 @@ function approve(c: Ctx): Response {
     c.state.leader_swap.splice(swap, 1)
     anchor.leader_user_id = c.actor.id === USERS.demo_editor.id ? USERS.operator.id : USERS.demo_editor.id
   }
+  if (swap < 0) anchor.leader_user_id = currentLeader(anchor.group_id, anchor.leader_user_id)
   if (anchor.leader_user_id !== c.actor.id) {
     return failM2(403, 'LEADER_REQUIRED', 'Hanya leader group ini yang dapat menyetujui.')
   }
 
   const now = iso(Date.now())
   for (const a of p.approvals) {
+    if (a.status === 'pending' && a !== anchor) a.leader_user_id = currentLeader(a.group_id, a.leader_user_id)
     if (a.leader_user_id === c.actor.id && a.status === 'pending') {
       a.status = 'approved'
       a.approved_at = now
@@ -268,7 +284,7 @@ function enqueue(c: Ctx): Response {
   if (prior) {
     const j = c.state.jobs.find((x) => x.job_id === prior.job_id)
     if (prior.proposal_id === p.proposal_id && prior.revision === revision && j) {
-      return okM2(acceptedView(j), 200)
+      return okM2({ ...acceptedView(j), replayed: true }, 200)
     }
     return failM2(409, 'REQUEST_CONFLICT', 'request_id sudah dipakai untuk permintaan lain.')
   }
@@ -320,7 +336,7 @@ function enqueue(c: Ctx): Response {
     c.state.response_drop.splice(drop, 1)
     c.dropResponse = true
   }
-  return okM2(acceptedView(job), 202)
+  return okM2({ ...acceptedView(job), replayed: false }, 202)
 }
 
 function createDraft(c: Ctx): Response {

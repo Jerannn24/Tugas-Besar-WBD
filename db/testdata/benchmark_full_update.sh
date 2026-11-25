@@ -60,7 +60,7 @@ exec > >(tee "$report") 2>&1
 container_info=$("${compose[@]}" exec -T "$service" sh -c 'printf "%s cpu, %s kB RAM" "$(nproc)" "$(sed -n "s/^MemTotal: *\([0-9]*\).*/\1/p" /proc/meminfo)"')
 image=$(docker inspect --format '{{.Config.Image}}' "$("${compose[@]}" ps -q "$service")")
 settings=$(printf '%s\n' "SELECT version();" \
-  "SELECT 'shared_buffers=' || current_setting('shared_buffers') || ' work_mem=' || current_setting('work_mem') || ' max_wal_size=' || current_setting('max_wal_size') || ' synchronous_commit=' || current_setting('synchronous_commit') || ' fsync=' || current_setting('fsync') || ' wal_level=' || current_setting('wal_level');" \
+  "SELECT 'shared_buffers=' || current_setting('shared_buffers') || ' work_mem=' || current_setting('work_mem') || ' max_wal_size=' || current_setting('max_wal_size') || ' synchronous_commit=' || current_setting('synchronous_commit') || ' fsync=' || current_setting('fsync') || ' wal_level=' || current_setting('wal_level') || ' track_commit_timestamp=' || current_setting('track_commit_timestamp');" \
   | run_sql)
 
 printf '== Lingkungan ==\n'

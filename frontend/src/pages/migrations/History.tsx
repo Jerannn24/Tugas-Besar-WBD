@@ -1,5 +1,5 @@
-import { useCallback } from 'react'
-import { useSearchParams } from 'react-router'
+import { useCallback, useState } from 'react'
+import { Link, useSearchParams } from 'react-router'
 import { listHistory } from '../../api/history'
 import type { HistoryAttemptRow, ID } from '../../api/types'
 import { Button } from '../../components/Button'
@@ -9,7 +9,10 @@ import { FailureAlert } from '../../components/FailureAlert'
 import { Panel } from '../../components/Panel'
 import { WorkflowAlert } from '../../components/WorkflowAlert'
 import { useCursorList } from '../../lib/cursor'
+import { paths } from '../../lib/paths'
 import { Attempt } from './Attempt'
+import { hasOffers } from './offers'
+import { Propose } from './Propose'
 
 const keyOf = (r: HistoryAttemptRow) => r.attempt_id
 
@@ -39,9 +42,26 @@ function HistorySkeleton() {
   )
 }
 
+function ActiveHead({ databaseId, head, rows }: { databaseId: ID; head: ID; rows: HistoryAttemptRow[] }) {
+  const row = rows.find((r) => r.is_active_head && r.execution_id === head)
+  return (
+    <div className="history-head">
+      <span className="badge bg-green text-green-fg">Posisi aktif</span>
+      <span className="mono fw-bold">{row?.version ? `v${row.version}` : 'execution aktif'}</span>
+      {row?.commit?.title && <span className="small">{row.commit.title}</span>}
+      <Link to={paths.execution(databaseId, head)}>Detail commit</Link>
+    </div>
+  )
+}
+
 function AttemptList({ databaseId, hide }: { databaseId: ID; hide: boolean }) {
+  const [head, setHead] = useState<ID | null | undefined>(undefined)
   const loader = useCallback(
-    (cursor: string | null) => listHistory(databaseId, { cursor, hideRollback: hide }),
+    async (cursor: string | null) => {
+      const res = await listHistory(databaseId, { cursor, hideRollback: hide })
+      if (res.ok && cursor === null) setHead(res.data.active_head_execution_id)
+      return res
+    },
     [databaseId, hide],
   )
   const { state, reload, loadMore } = useCursorList(loader, keyOf)
@@ -64,9 +84,15 @@ function AttemptList({ databaseId, hide }: { databaseId: ID; hide: boolean }) {
           </EmptyState>
         ) : (
           <>
+            {head && <ActiveHead databaseId={databaseId} head={head} rows={state.items} />}
             <ol className="history-list" aria-label="Riwayat migration per attempt">
               {state.items.map((row) => (
-                <Attempt key={row.attempt_id} databaseId={databaseId} row={row} />
+                <Attempt
+                  key={row.attempt_id}
+                  databaseId={databaseId}
+                  row={row}
+                  actions={hasOffers(row) ? <Propose databaseId={databaseId} row={row} /> : undefined}
+                />
               ))}
             </ol>
             <WorkflowAlert failure={state.moreFailure} title="Gagal memuat halaman berikutnya" />

@@ -299,6 +299,29 @@ h2 {
   gap: 0.5rem;
   margin-top: 0.75rem;
 }
+.history-item--head {
+  border-left: 4px solid var(--tblr-green);
+}
+.history-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.history-head a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+}
+.leader-form {
+  display: grid;
+  gap: 0.5rem;
+}
+.leader-form .form-select,
+.leader-form .btn {
+  min-height: 40px;
+}
 
 /* Layar ≥ 576px */
 
@@ -320,6 +343,14 @@ h2 {
 @media (min-width: 768px) {
   .history-meta {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .leader-form {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+  }
+  .leader-form .form-label {
+    grid-column: 1 / -1;
+    margin-bottom: 0;
   }
   .viewer-layout {
     grid-template-columns: minmax(12rem, 16rem) minmax(0, 1fr);
