@@ -39,3 +39,5 @@ SELECT (SELECT array_agg(attname::text || ':' || format_type(atttypid, atttypmod
 \echo 'batch_items: existing table has unexpected columns, key, or owner; refusing to touch it'
 SELECT 1 / 0;
 \endif
+
+SELECT pg_catalog.format('GRANT SELECT (id, processed) ON managed.batch_items TO %I', regexp_replace(current_user, '_executor$', '_receipt_owner')) \gexec
