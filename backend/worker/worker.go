@@ -298,6 +298,7 @@ func (w *Worker) Step(ctx context.Context) (bool, error) {
 	}
 
 	didWork = true
+	jobCtx, workerTrace, hasPersistedTrace := prepareJobTrace(ctx, claim)
 	fields := map[string]any{
 		"worker_id":    w.cfg.WorkerID,
 		"job_id":       claim.JobID,
@@ -310,15 +311,10 @@ func (w *Worker) Step(ctx context.Context) (bool, error) {
 		"direction":    string(claim.Direction),
 		"attempt_no":   claim.AttemptNo,
 	}
-	if claim.Traceparent != "" {
-		fields["traceparent"] = claim.Traceparent
-	}
-	if claim.Tracestate != "" {
-		fields["tracestate"] = claim.Tracestate
-	}
+	addJobTraceFields(fields, claim, workerTrace, hasPersistedTrace)
 	w.log("job_claimed", fields)
 
-	outcome, execErr := w.executeWithRenewal(ctx, claim)
+	outcome, execErr := w.executeWithRenewalWithTrace(jobCtx, claim, workerTrace, hasPersistedTrace)
 	if execErr != nil {
 		failFields := map[string]any{
 			"worker_id":  w.cfg.WorkerID,
@@ -326,14 +322,10 @@ func (w *Worker) Step(ctx context.Context) (bool, error) {
 			"attempt_id": claim.AttemptID,
 			"error_code": classifyError(execErr),
 		}
-		if claim.Traceparent != "" {
-			failFields["traceparent"] = claim.Traceparent
-		}
-		if claim.Tracestate != "" {
-			failFields["tracestate"] = claim.Tracestate
-		}
+		addJobTraceFields(failFields, claim, workerTrace, hasPersistedTrace)
 		w.log("job_execution_failed", failFields)
 	} else if outcome != nil {
+		_, stepEvent := terminalOutcomeEvents(outcome.Status)
 		doneFields := map[string]any{
 			"worker_id":  w.cfg.WorkerID,
 			"job_id":     claim.JobID,
@@ -341,13 +333,13 @@ func (w *Worker) Step(ctx context.Context) (bool, error) {
 			"status":     string(outcome.Status),
 			"receipt":    outcome.Receipt,
 		}
-		if claim.Traceparent != "" {
-			doneFields["traceparent"] = claim.Traceparent
+		if outcome.Status != executioncontract.Succeeded && outcome.Error != nil {
+			if code := classifyError(outcome.Error); code != "" {
+				doneFields["error_code"] = code
+			}
 		}
-		if claim.Tracestate != "" {
-			doneFields["tracestate"] = claim.Tracestate
-		}
-		w.log("job_execution_completed", doneFields)
+		addJobTraceFields(doneFields, claim, workerTrace, hasPersistedTrace)
+		w.log(stepEvent, doneFields)
 	}
 
 	return didWork, execErr
@@ -459,7 +451,59 @@ func TraceFromContext(ctx context.Context) (executioncontract.TraceContext, bool
 	return trace, ok
 }
 
+func prepareJobTrace(ctx context.Context, claim *jobs.Claim) (context.Context, telemetry.Trace, bool) {
+	if claim != nil && claim.Traceparent != "" {
+		persisted := executioncontract.TraceContext{
+			Traceparent: claim.Traceparent,
+			Tracestate:  claim.Tracestate,
+		}
+		if traceCtx, err := telemetry.ContextFromTraceContext(ctx, persisted, ""); err == nil {
+			traceCtx = context.WithValue(traceCtx, traceContextKey{}, persisted)
+			trace, _ := telemetry.TraceFromContext(traceCtx)
+			return traceCtx, trace, true
+		}
+	}
+	traceCtx, _ := telemetry.ContextFromTraceContext(ctx, executioncontract.TraceContext{}, "")
+	trace, _ := telemetry.TraceFromContext(traceCtx)
+	return traceCtx, trace, false
+}
+
+func addJobTraceFields(fields map[string]any, claim *jobs.Claim, trace telemetry.Trace, hasPersistedTrace bool) {
+	if trace.TraceID != "" {
+		fields["trace_id"] = trace.TraceID
+	}
+	if trace.SpanID != "" {
+		fields["span_id"] = trace.SpanID
+	}
+	if hasPersistedTrace && claim != nil {
+		fields["traceparent"] = claim.Traceparent
+		if claim.Tracestate != "" {
+			fields["tracestate"] = claim.Tracestate
+		}
+	}
+}
+
+func terminalOutcomeEvents(status executioncontract.JobStatus) (finishedEvent, stepEvent string) {
+	switch status {
+	case executioncontract.Succeeded:
+		return "job_finished_success", "job_execution_completed"
+	case executioncontract.Failed:
+		return "job_finished_failed", "job_execution_failed"
+	case executioncontract.Partial:
+		return "job_finished_partial", "job_execution_partial"
+	case executioncontract.PartiallyReverted:
+		return "job_finished_partially_reverted", "job_execution_partially_reverted"
+	default:
+		return "job_finished_unknown", "job_execution_unknown"
+	}
+}
+
 func (w *Worker) executeWithRenewal(ctx context.Context, claim *jobs.Claim) (*jobs.ExecutionOutcome, error) {
+	jobCtx, workerTrace, hasPersistedTrace := prepareJobTrace(ctx, claim)
+	return w.executeWithRenewalWithTrace(jobCtx, claim, workerTrace, hasPersistedTrace)
+}
+
+func (w *Worker) executeWithRenewalWithTrace(ctx context.Context, claim *jobs.Claim, workerTrace telemetry.Trace, hasPersistedTrace bool) (*jobs.ExecutionOutcome, error) {
 	execCtx, cancelExec := context.WithCancel(ctx)
 	defer cancelExec()
 
@@ -469,22 +513,6 @@ func (w *Worker) executeWithRenewal(ctx context.Context, claim *jobs.Claim) (*jo
 	}
 	defer w.unregisterActive(aw)
 
-	if claim.Traceparent != "" || claim.Tracestate != "" {
-		execCtx = context.WithValue(execCtx, traceContextKey{}, executioncontract.TraceContext{
-			Traceparent: claim.Traceparent,
-			Tracestate:  claim.Tracestate,
-		})
-	}
-
-	traceCtx, traceErr := telemetry.ContextFromTraceContext(execCtx, executioncontract.TraceContext{
-		Traceparent: claim.Traceparent,
-		Tracestate:  claim.Tracestate,
-	}, "")
-	if traceErr != nil {
-		traceCtx, _ = telemetry.ContextFromTraceContext(execCtx, executioncontract.TraceContext{}, "")
-	}
-	execCtx = traceCtx
-	workerTrace, _ := telemetry.TraceFromContext(execCtx)
 	spanStart := time.Now()
 
 	execFields := map[string]any{
@@ -492,12 +520,7 @@ func (w *Worker) executeWithRenewal(ctx context.Context, claim *jobs.Claim) (*jo
 		"job_id":     claim.JobID,
 		"attempt_id": claim.AttemptID,
 	}
-	if claim.Traceparent != "" {
-		execFields["traceparent"] = claim.Traceparent
-	}
-	if claim.Tracestate != "" {
-		execFields["tracestate"] = claim.Tracestate
-	}
+	addJobTraceFields(execFields, claim, workerTrace, hasPersistedTrace)
 	w.log("job_executing", execFields)
 
 	renewTicker := time.NewTicker(w.cfg.RenewInterval)
@@ -529,12 +552,7 @@ func (w *Worker) executeWithRenewal(ctx context.Context, claim *jobs.Claim) (*jo
 						"attempt_id": claim.AttemptID,
 						"error_code": classifyError(err),
 					}
-					if claim.Traceparent != "" {
-						failFields["traceparent"] = claim.Traceparent
-					}
-					if claim.Tracestate != "" {
-						failFields["tracestate"] = claim.Tracestate
-					}
+					addJobTraceFields(failFields, claim, workerTrace, hasPersistedTrace)
 					w.log("lease_renewal_failed", failFields)
 					cancelExec()
 					return
@@ -546,12 +564,7 @@ func (w *Worker) executeWithRenewal(ctx context.Context, claim *jobs.Claim) (*jo
 					"attempt_id": claim.AttemptID,
 					"expires_at": res.LeaseExpiresAt.Format(time.RFC3339Nano),
 				}
-				if claim.Traceparent != "" {
-					renFields["traceparent"] = claim.Traceparent
-				}
-				if claim.Tracestate != "" {
-					renFields["tracestate"] = claim.Tracestate
-				}
+				addJobTraceFields(renFields, claim, workerTrace, hasPersistedTrace)
 				w.log("lease_renewed", renFields)
 			}
 		}
@@ -596,27 +609,23 @@ func (w *Worker) executeWithRenewal(ctx context.Context, claim *jobs.Claim) (*jo
 			"duration_ms": duration.Milliseconds(),
 			"error_code":  classifyError(err),
 		}
-		if claim.Traceparent != "" {
-			finFields["traceparent"] = claim.Traceparent
-		}
-		if claim.Tracestate != "" {
-			finFields["tracestate"] = claim.Tracestate
-		}
+		addJobTraceFields(finFields, claim, workerTrace, hasPersistedTrace)
 		w.log("job_finished_error", finFields)
 	} else if outcome != nil {
+		finishedEvent, _ := terminalOutcomeEvents(outcome.Status)
 		finFields := map[string]any{
 			"worker_id":   w.cfg.WorkerID,
 			"job_id":      claim.JobID,
 			"duration_ms": duration.Milliseconds(),
 			"status":      string(outcome.Status),
 		}
-		if claim.Traceparent != "" {
-			finFields["traceparent"] = claim.Traceparent
+		if outcome.Status != executioncontract.Succeeded && outcome.Error != nil {
+			if code := classifyError(outcome.Error); code != "" {
+				finFields["error_code"] = code
+			}
 		}
-		if claim.Tracestate != "" {
-			finFields["tracestate"] = claim.Tracestate
-		}
-		w.log("job_finished_success", finFields)
+		addJobTraceFields(finFields, claim, workerTrace, hasPersistedTrace)
+		w.log(finishedEvent, finFields)
 	}
 
 	return outcome, err

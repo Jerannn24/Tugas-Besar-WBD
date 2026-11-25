@@ -2080,3 +2080,349 @@ func TestWorker_TracePropagation(t *testing.T) {
 		t.Fatalf("trace fields not logged: tp=%s, ts=%s", lTP, lTS)
 	}
 }
+
+func TestWorker_TerminalOutcomeEventsAndTraceHelpers(t *testing.T) {
+	cases := []struct {
+		status       executioncontract.JobStatus
+		wantFinished string
+		wantStep     string
+	}{
+		{executioncontract.Succeeded, "job_finished_success", "job_execution_completed"},
+		{executioncontract.Failed, "job_finished_failed", "job_execution_failed"},
+		{executioncontract.Partial, "job_finished_partial", "job_execution_partial"},
+		{executioncontract.PartiallyReverted, "job_finished_partially_reverted", "job_execution_partially_reverted"},
+		{executioncontract.Unknown, "job_finished_unknown", "job_execution_unknown"},
+	}
+	for _, tc := range cases {
+		gotFin, gotStep := terminalOutcomeEvents(tc.status)
+		if gotFin != tc.wantFinished || gotStep != tc.wantStep {
+			t.Fatalf("status=%s: got (%s, %s), want (%s, %s)", tc.status, gotFin, gotStep, tc.wantFinished, tc.wantStep)
+		}
+	}
+
+	validClaim := &jobs.Claim{
+		Traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		Tracestate:  "rojo=1",
+	}
+	validCtx, validTrace, validPersisted := prepareJobTrace(context.Background(), validClaim)
+	if !validPersisted || validTrace.TraceID != "4bf92f3577b34da6a3ce929d0e0e4736" || validTrace.SpanID == "" {
+		t.Fatalf("expected valid persisted trace, got persisted=%v trace=%+v", validPersisted, validTrace)
+	}
+	if tc, ok := TraceFromContext(validCtx); !ok || tc.Traceparent != validClaim.Traceparent || tc.Tracestate != validClaim.Tracestate {
+		t.Fatalf("expected persisted trace in context, got ok=%v tc=%+v", ok, tc)
+	}
+	validFields := map[string]any{}
+	addJobTraceFields(validFields, validClaim, validTrace, validPersisted)
+	if validFields["trace_id"] != "4bf92f3577b34da6a3ce929d0e0e4736" || validFields["span_id"] != validTrace.SpanID || validFields["traceparent"] != validClaim.Traceparent || validFields["tracestate"] != validClaim.Tracestate {
+		t.Fatalf("unexpected valid trace fields: %+v", validFields)
+	}
+
+	for _, badClaim := range []*jobs.Claim{
+		{Traceparent: "", Tracestate: ""},
+		{Traceparent: "invalid-traceparent", Tracestate: "rojo=1"},
+	} {
+		badCtx, localTrace, persisted := prepareJobTrace(context.Background(), badClaim)
+		if persisted {
+			t.Fatalf("expected persisted=false for %+v", badClaim)
+		}
+		if _, ok := TraceFromContext(badCtx); ok {
+			t.Fatalf("expected TraceFromContext=false for %+v", badClaim)
+		}
+		if localTrace.TraceID == "" || localTrace.SpanID == "" {
+			t.Fatalf("expected local fallback trace IDs for %+v, got %+v", badClaim, localTrace)
+		}
+		f := map[string]any{}
+		addJobTraceFields(f, badClaim, localTrace, persisted)
+		if _, hasTP := f["traceparent"]; hasTP {
+			t.Fatalf("unexpected traceparent logged for %+v: %+v", badClaim, f)
+		}
+		if _, hasTS := f["tracestate"]; hasTS {
+			t.Fatalf("unexpected tracestate logged for %+v: %+v", badClaim, f)
+		}
+		if f["trace_id"] != localTrace.TraceID || f["span_id"] != localTrace.SpanID {
+			t.Fatalf("expected local trace_id/span_id, got %+v", f)
+		}
+	}
+
+	wrappedPg := fmt.Errorf("wrapped: %w", &pgconn.PgError{Code: "42P07", Message: "secret_msg"})
+	if got := classifyError(wrappedPg); got != "SQLSTATE:42P07" {
+		t.Fatalf("expected SQLSTATE:42P07, got %s", got)
+	}
+}
+
+func TestWorker_NonSuccessNilErrorOutcomesAndTraceCorrelation(t *testing.T) {
+	env := setupWorkerTestEnv(t)
+	svc := jobs.New(env.platformDB)
+
+	type capturedLog struct {
+		event  string
+		fields map[string]any
+	}
+	captureLogger := func(mu *sync.Mutex, logs *[]capturedLog) func(string, map[string]any) {
+		return func(event string, fields map[string]any) {
+			mu.Lock()
+			defer mu.Unlock()
+			cp := make(map[string]any, len(fields))
+			for k, v := range fields {
+				cp[k] = v
+			}
+			*logs = append(*logs, capturedLog{event: event, fields: cp})
+		}
+	}
+
+	t.Run("failed_sql_nil_error_logs_honest_terminal_events_and_trace_ids", func(t *testing.T) {
+		ctx := context.Background()
+		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+		table := "worker_fail_sql_" + suffix
+		if _, err := env.targetExecDB.ExecContext(ctx, "CREATE TABLE managed."+table+" (id bigint);"); err != nil {
+			t.Fatalf("precreate table: %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = env.targetExecDB.ExecContext(context.Background(), "DROP TABLE IF EXISTS managed."+table)
+		})
+
+		sqlUp := fmt.Sprintf("CREATE TABLE managed.%s (id bigint);", table)
+		fix := enqueueStandardJob(t, env, env.physicalTargetID, "target_a", sqlUp, "")
+		wantTraceID := "4bf92f3577b34da6a3ce929d0e0e4736"
+		wantTP := "00-" + wantTraceID + "-00f067aa0ba902b7-01"
+		wantTS := "rojo=1"
+		if _, err := env.platformDB.ExecContext(ctx, "UPDATE app.jobs SET traceparent = $1, tracestate = $2 WHERE id = $3", wantTP, wantTS, fix.jobID); err != nil {
+			t.Fatalf("set trace context: %v", err)
+		}
+
+		var mu sync.Mutex
+		var logs []capturedLog
+		gate := executioncontract.FakeGate{
+			RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+				return executioncontract.ExecutionPlan{Request: req, Snapshot: fix.snapshot, Version: "1"}, nil
+			},
+		}
+		w, err := New(svc, jobs.ExecutionDeps{Gate: gate, Acquire: env.makeAcquire(t), Timeout: 10 * time.Second}, Config{
+			Logger:       captureLogger(&mu, &logs),
+			PollInterval: 50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("new worker: %v", err)
+		}
+
+		didWork, err := w.Step(ctx)
+		if err != nil || !didWork {
+			t.Fatalf("expected didWork=true err=nil, got didWork=%v err=%v", didWork, err)
+		}
+		jobView, err := svc.GetJob(ctx, fix.dbID, fix.jobID)
+		if err != nil || jobView.Status != executioncontract.Failed {
+			t.Fatalf("expected failed job status, got %+v err=%v", jobView, err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		seen := map[string]bool{}
+		var spanID string
+		for _, entry := range logs {
+			seen[entry.event] = true
+			if entry.event == "job_finished_success" || entry.event == "job_execution_completed" {
+				t.Fatalf("unexpected success event %s for failed job: %+v", entry.event, entry.fields)
+			}
+			if entry.event == "job_claimed" || entry.event == "job_executing" || entry.event == "job_finished_failed" || entry.event == "job_execution_failed" {
+				if entry.fields["trace_id"] != wantTraceID {
+					t.Fatalf("%s trace_id=%v, want %s", entry.event, entry.fields["trace_id"], wantTraceID)
+				}
+				sid, _ := entry.fields["span_id"].(string)
+				if sid == "" {
+					t.Fatalf("%s missing span_id: %+v", entry.event, entry.fields)
+				}
+				if spanID == "" {
+					spanID = sid
+				} else if sid != spanID {
+					t.Fatalf("%s span_id=%s, want consistent %s", entry.event, sid, spanID)
+				}
+				if entry.fields["traceparent"] != wantTP || entry.fields["tracestate"] != wantTS {
+					t.Fatalf("%s trace headers mismatch: %+v", entry.event, entry.fields)
+				}
+			}
+			if entry.event == "job_finished_failed" || entry.event == "job_execution_failed" {
+				if entry.fields["status"] != "failed" || entry.fields["error_code"] != "SQLSTATE:42P07" {
+					t.Fatalf("%s expected status=failed error_code=SQLSTATE:42P07, got %+v", entry.event, entry.fields)
+				}
+			}
+		}
+		for _, want := range []string{"job_claimed", "job_executing", "job_finished_failed", "job_execution_failed"} {
+			if !seen[want] {
+				t.Fatalf("missing expected event %s; saw %+v", want, seen)
+			}
+		}
+	})
+
+	t.Run("partial_batch_nil_error_logs_partial_events_with_trace_ids", func(t *testing.T) {
+		ctx := context.Background()
+		var batchItemsExist bool
+		if err := env.targetExecDB.QueryRowContext(ctx, `
+			SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'managed' AND table_name = 'batch_items')
+		`).Scan(&batchItemsExist); err != nil {
+			t.Fatalf("check managed.batch_items: %v", err)
+		}
+		if !batchItemsExist {
+			if _, err := env.targetExecDB.ExecContext(ctx, "CREATE TABLE managed.batch_items (id bigint PRIMARY KEY, processed boolean NOT NULL DEFAULT false)"); err != nil {
+				t.Fatalf("create managed.batch_items: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = env.targetExecDB.ExecContext(context.Background(), "DROP TABLE IF EXISTS managed.batch_items")
+			})
+			if _, err := env.targetExecDB.ExecContext(ctx, "GRANT SELECT (id, processed) ON managed.batch_items TO wbd_target_a_receipt_owner"); err != nil {
+				t.Fatalf("grant fixture access: %v", err)
+			}
+		}
+		_, _ = env.targetExecDB.ExecContext(ctx, "DELETE FROM managed.batch_items WHERE id IN (91001, 91002)")
+		if _, err := env.targetExecDB.ExecContext(ctx, "INSERT INTO managed.batch_items (id, processed) VALUES (91001, false), (91002, false)"); err != nil {
+			t.Fatalf("seed batch items: %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = env.targetExecDB.ExecContext(context.Background(), "DELETE FROM managed.batch_items WHERE id IN (91001, 91002)")
+		})
+
+		fix := enqueueBatchJob(t, env, env.physicalTargetID, "target_a", 1)
+		t.Cleanup(func() {
+			if env.targetCleanupDB != nil {
+				for _, q := range []string{
+					"DELETE FROM wbd_auth.batch_row_versions WHERE execution_id = $1",
+					"DELETE FROM wbd_auth.batch_tickets WHERE execution_id = $1",
+					"DELETE FROM wbd_auth.batch_checkpoints WHERE execution_id = $1",
+					"DELETE FROM wbd_auth.batch_scope_items WHERE execution_id = $1",
+					"DELETE FROM wbd_auth.batch_scopes WHERE execution_id = $1",
+				} {
+					_, _ = env.targetCleanupDB.ExecContext(context.Background(), q, fix.executionID)
+				}
+			}
+		})
+
+		wantTraceID := "4bf92f3577b34da6a3ce929d0e0e4736"
+		wantTP := "00-" + wantTraceID + "-00f067aa0ba902b7-01"
+		if _, err := env.platformDB.ExecContext(ctx, "UPDATE app.jobs SET traceparent = $1 WHERE id = $2", wantTP, fix.jobID); err != nil {
+			t.Fatalf("set batch traceparent: %v", err)
+		}
+
+		var revalidateCalls int
+		gate := executioncontract.FakeGate{
+			RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+				revalidateCalls++
+				if revalidateCalls >= 3 {
+					return executioncontract.ExecutionPlan{}, executioncontract.ContractError{Code: "REVIEW_STALE", Message: "approval stale"}
+				}
+				return executioncontract.ExecutionPlan{Request: req, Snapshot: fix.snapshot, Version: "1"}, nil
+			},
+			RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
+				return nil
+			},
+		}
+		var mu sync.Mutex
+		var logs []capturedLog
+		w, err := New(svc, jobs.ExecutionDeps{Gate: transactionalBatchGate{gate}, Acquire: env.makeAcquire(t), Timeout: 10 * time.Second}, Config{
+			Logger:       captureLogger(&mu, &logs),
+			PollInterval: 50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("new worker: %v", err)
+		}
+
+		didWork, err := w.Step(ctx)
+		if err != nil || !didWork {
+			t.Fatalf("expected didWork=true err=nil, got didWork=%v err=%v", didWork, err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		seen := map[string]bool{}
+		for _, entry := range logs {
+			seen[entry.event] = true
+			if entry.event == "job_finished_success" || entry.event == "job_execution_completed" {
+				t.Fatalf("unexpected success event %s for partial job: %+v", entry.event, entry.fields)
+			}
+			if entry.event == "job_finished_partial" || entry.event == "job_execution_partial" {
+				if entry.fields["status"] != "partial" || entry.fields["trace_id"] != wantTraceID || entry.fields["span_id"] == "" {
+					t.Fatalf("%s unexpected fields: %+v", entry.event, entry.fields)
+				}
+			}
+		}
+		for _, want := range []string{"job_claimed", "job_executing", "job_finished_partial", "job_execution_partial"} {
+			if !seen[want] {
+				t.Fatalf("missing expected event %s; saw %+v", want, seen)
+			}
+		}
+	})
+
+	t.Run("invalid_trace_context_does_not_disrupt_and_correlates_renewal", func(t *testing.T) {
+		ctx := context.Background()
+		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+		table := "worker_badtrace_" + suffix
+		sqlUp := fmt.Sprintf("CREATE TABLE managed.%s (id bigint);", table)
+		t.Cleanup(func() {
+			_, _ = env.targetExecDB.ExecContext(context.Background(), "DROP TABLE IF EXISTS managed."+table)
+		})
+
+		fix := enqueueStandardJob(t, env, env.physicalTargetID, "target_a", sqlUp, "")
+		if _, err := env.platformDB.ExecContext(ctx, "UPDATE app.jobs SET traceparent = 'invalid-traceparent', tracestate = 'secret=should_not_echo' WHERE id = $1", fix.jobID); err != nil {
+			t.Fatalf("set invalid trace context: %v", err)
+		}
+
+		var sawPersistedContext bool
+		gate := executioncontract.FakeGate{
+			RevalidateFunc: func(rCtx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+				if _, ok := TraceFromContext(rCtx); ok {
+					sawPersistedContext = true
+				}
+				time.Sleep(120 * time.Millisecond)
+				return executioncontract.ExecutionPlan{Request: req, Snapshot: fix.snapshot, Version: "1"}, nil
+			},
+			RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
+				return nil
+			},
+		}
+		var mu sync.Mutex
+		var logs []capturedLog
+		w, err := New(svc, jobs.ExecutionDeps{Gate: gate, Acquire: env.makeAcquire(t), Timeout: 10 * time.Second}, Config{
+			LeaseDuration: 500 * time.Millisecond,
+			RenewInterval: 50 * time.Millisecond,
+			Logger:        captureLogger(&mu, &logs),
+		})
+		if err != nil {
+			t.Fatalf("new worker: %v", err)
+		}
+
+		didWork, err := w.Step(ctx)
+		if err != nil || !didWork {
+			t.Fatalf("expected didWork=true err=nil, got didWork=%v err=%v", didWork, err)
+		}
+		if sawPersistedContext {
+			t.Fatal("expected TraceFromContext=false for invalid persisted traceparent")
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		seen := map[string]bool{}
+		var traceID, spanID string
+		for _, entry := range logs {
+			seen[entry.event] = true
+			if _, hasTP := entry.fields["traceparent"]; hasTP {
+				t.Fatalf("expected no traceparent emitted on invalid context for %s: %+v", entry.event, entry.fields)
+			}
+			if _, hasTS := entry.fields["tracestate"]; hasTS {
+				t.Fatalf("expected no tracestate emitted on invalid context for %s: %+v", entry.event, entry.fields)
+			}
+			tid, _ := entry.fields["trace_id"].(string)
+			sid, _ := entry.fields["span_id"].(string)
+			if tid == "" || sid == "" {
+				t.Fatalf("%s missing trace_id or span_id: %+v", entry.event, entry.fields)
+			}
+			if traceID == "" {
+				traceID, spanID = tid, sid
+			} else if tid != traceID || sid != spanID {
+				t.Fatalf("%s mismatched trace/span (%s, %s), want (%s, %s)", entry.event, tid, sid, traceID, spanID)
+			}
+		}
+		for _, want := range []string{"job_claimed", "job_executing", "lease_renewed", "job_finished_success", "job_execution_completed"} {
+			if !seen[want] {
+				t.Fatalf("missing expected event %s; saw %+v", want, seen)
+			}
+		}
+	})
+}
