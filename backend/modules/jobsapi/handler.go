@@ -44,18 +44,14 @@ type Handler struct {
 	jobs       JobReader
 	actions    ActionReader
 	authorizer authz.Authorizer
-	log        *slog.Logger
+	log        eventLogger
 }
 
 func New(deps Dependencies) (*Handler, error) {
 	if deps.Jobs == nil || deps.Actions == nil || deps.Authorizer == nil {
 		return nil, errors.New("jobs API dependencies are required")
 	}
-	logger := deps.Logger
-	if logger == nil {
-		logger = defaultLogger()
-	}
-	return &Handler{jobs: deps.Jobs, actions: deps.Actions, authorizer: deps.Authorizer, log: logger}, nil
+	return &Handler{jobs: deps.Jobs, actions: deps.Actions, authorizer: deps.Authorizer, log: eventsFor(deps.Logger)}, nil
 }
 
 // Register must run before the M1 /databases/* wildcard so these routes match first.

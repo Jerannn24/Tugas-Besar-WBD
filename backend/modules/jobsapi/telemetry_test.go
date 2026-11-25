@@ -3,12 +3,14 @@ package jobsapi
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -95,5 +97,45 @@ func TestRequestsLogStartAndFinish(t *testing.T) {
 				t.Fatalf("%+v", fin)
 			}
 		})
+	}
+}
+
+func TestDefaultLoggerIsTelemetry(t *testing.T) {
+	h, err := New(Dependencies{Jobs: newFixture().jobs, Actions: newFixture().actions, Authorizer: newFixture().authz})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.log != telemetry.DefaultLogger() {
+		t.Fatalf("default logger = %T, want telemetry.DefaultLogger()", h.log)
+	}
+}
+
+func TestTelemetryLoggerCarriesTrace(t *testing.T) {
+	f := newFixture()
+	h, err := New(Dependencies{Jobs: f.jobs, Actions: f.actions, Authorizer: f.authz})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	h.log = telemetry.NewLogger(&buf, slog.LevelInfo)
+	app := fiber.New()
+	api := app.Group("/api", telemetry.Middleware(nil), sessionAs(actorID))
+	protected := api.Group("", authz.ActorMiddleware(f.authz))
+	protected.Get("/databases/:database_id/jobs", h.observe("jobs.list", h.ListJobs))
+
+	req := httptest.NewRequest("GET", base+"/jobs", nil)
+	req.Header.Set("X-Correlation-ID", requestCorrelation)
+	req.Header.Set("X-Request-ID", "44444444-4444-4444-8444-444444444444")
+	if _, err := app.Test(req, -1); err != nil {
+		t.Fatal(err)
+	}
+	lines := logLines(t, &buf)
+	if len(lines) != 2 {
+		t.Fatalf("%+v", lines)
+	}
+	for _, l := range lines {
+		if l["trace_id"] == nil || l["span_id"] == nil || l["correlation_id"] != requestCorrelation || l["operation"] != "jobs.list" {
+			t.Fatalf("trace not carried: %+v", l)
+		}
 	}
 }
