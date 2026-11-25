@@ -241,25 +241,41 @@ func (g *Gate) AllowedActions(ctx context.Context, actorID, databaseID, executio
 	if accessRank == 0 {
 		return nil, contractError("FORBIDDEN", "Access denied", false)
 	}
-	var status string
-	err = g.db.QueryRow(ctx, `SELECT status FROM app.migration_executions
-		WHERE id=$1 AND database_id=$2`, execution, database).Scan(&status)
+	var resume, compensate, rollback, forward bool
+	err = g.db.QueryRow(ctx, `SELECT
+		COALESCE(app.workflow_source_valid(j.database_id, d.execution_target_id, j.migration_id, j.revision, 'resume', j.execution_id, j.mode), false),
+		COALESCE(app.workflow_source_valid(j.database_id, d.execution_target_id, j.migration_id, j.revision, 'compensate', j.execution_id, j.mode), false),
+		COALESCE(app.workflow_source_valid(j.database_id, d.execution_target_id, j.migration_id, j.revision, 'rollback', j.execution_id, j.mode), false),
+		COALESCE(app.workflow_source_valid(j.database_id, d.execution_target_id, j.migration_id, j.revision, 'forward', j.execution_id, j.mode), false)
+		FROM app.jobs j
+		JOIN app.database_connections d ON d.id=j.database_id AND d.deleted_at IS NULL
+		JOIN app.migration_drafts draft ON draft.id=j.migration_id AND draft.database_id=j.database_id
+		  AND draft.revision=j.revision AND draft.mode=j.mode
+		WHERE j.execution_id=$1 AND j.database_id=$2`, execution, database).
+		Scan(&resume, &compensate, &rollback, &forward)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, contractError("NOT_FOUND", "Execution not found", false)
+		return []executioncontract.AllowedAction{}, nil
 	}
 	if err != nil {
 		return nil, contractError("INTERNAL_ERROR", "Unable to read execution", true)
 	}
-	switch status {
-	case "failed":
-		return []executioncontract.AllowedAction{"resume", "compensate"}, nil
-	case "succeeded":
-		return []executioncontract.AllowedAction{"rollback", "forward", "compensate"}, nil
-	case "unknown":
-		return []executioncontract.AllowedAction{"resume", "compensate"}, nil
-	default:
-		return []executioncontract.AllowedAction{}, nil
+	actions := []executioncontract.AllowedAction{}
+	if accessRank < 2 {
+		return actions, nil
 	}
+	if resume {
+		actions = append(actions, "propose_resume")
+	}
+	if compensate {
+		actions = append(actions, "propose_compensate")
+	}
+	if rollback {
+		actions = append(actions, "propose_rollback")
+	}
+	if forward {
+		actions = append(actions, "propose_forward")
+	}
+	return actions, nil
 }
 
 func (g *Gate) ReturnToReviewTx(ctx context.Context, tx *sql.Tx, in executioncontract.RevalidationRequest) error {

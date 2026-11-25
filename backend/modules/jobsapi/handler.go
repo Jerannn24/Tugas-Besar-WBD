@@ -37,7 +37,7 @@ type Dependencies struct {
 	Jobs       JobReader
 	Actions    ActionReader
 	Authorizer authz.Authorizer
-	Logger 	   *slog.Logger
+	Logger     *slog.Logger
 }
 
 type Handler struct {
@@ -89,7 +89,10 @@ func (h *Handler) ListJobs(c *fiber.Ctx) error {
 	}
 	cache := map[string][]executioncontract.AllowedAction{}
 	for i := range items {
-		items[i].AllowedActions = h.allowedActions(c.UserContext(), req, items[i].ExecutionID, cache)
+		items[i].AllowedActions, err = h.allowedActions(c.UserContext(), req, items[i].ExecutionID, cache)
+		if err != nil {
+			return modelError(c, err)
+		}
 	}
 	return response.JSON(c, fiber.StatusOK, executioncontract.JobPage{Items: items, NextCursor: result.NextCursor})
 }
@@ -103,7 +106,10 @@ func (h *Handler) GetJob(c *fiber.Ctx) error {
 	if err != nil {
 		return modelError(c, err)
 	}
-	job.AllowedActions = h.allowedActions(c.UserContext(), req, job.ExecutionID, nil)
+	job.AllowedActions, err = h.allowedActions(c.UserContext(), req, job.ExecutionID, nil)
+	if err != nil {
+		return modelError(c, err)
+	}
 	return response.JSON(c, fiber.StatusOK, job)
 }
 
@@ -155,18 +161,21 @@ func (h *Handler) guard(c *fiber.Ctx, resourceParam string) (*request, error) {
 	return req, nil
 }
 
-func (h *Handler) allowedActions(ctx context.Context, req *request, executionID string, cache map[string][]executioncontract.AllowedAction) []executioncontract.AllowedAction {
+func (h *Handler) allowedActions(ctx context.Context, req *request, executionID string, cache map[string][]executioncontract.AllowedAction) ([]executioncontract.AllowedAction, error) {
 	if actions, ok := cache[executionID]; ok {
-		return actions
+		return actions, nil
 	}
 	actions, err := h.actions.AllowedActions(ctx, req.actorID, req.databaseID, executionID)
-	if err != nil || actions == nil {
+	if err != nil {
+		return nil, err
+	}
+	if actions == nil {
 		actions = []executioncontract.AllowedAction{}
 	}
 	if cache != nil {
 		cache[executionID] = actions
 	}
-	return actions
+	return actions, nil
 }
 
 func parsePage(c *fiber.Ctx) (executioncontract.Page, map[string]string) {
@@ -211,6 +220,9 @@ func accessError(c *fiber.Ctx, err error) error {
 }
 
 func modelError(c *fiber.Ctx, err error) error {
+	if errors.Is(err, authz.ErrUnauthenticated) || errors.Is(err, authz.ErrForbidden) || errors.Is(err, authz.ErrNotFound) {
+		return accessError(c, err)
+	}
 	var value executioncontract.ContractError
 	var pointer *executioncontract.ContractError
 	code := ""
@@ -220,6 +232,10 @@ func modelError(c *fiber.Ctx, err error) error {
 		code = pointer.Code
 	}
 	switch code {
+	case "UNAUTHENTICATED":
+		return unauthenticated(c)
+	case "FORBIDDEN":
+		return response.Fail(c, fiber.StatusForbidden, "FORBIDDEN", "Akses ditolak")
 	case "NOT_FOUND":
 		return notFound(c)
 	case "INVALID_REQUEST":

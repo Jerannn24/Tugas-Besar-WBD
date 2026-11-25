@@ -372,14 +372,24 @@ func TestAllowedActions(t *testing.T) {
 		}
 	})
 	for _, path := range []string{"/jobs", "/jobs/" + jobID} {
-		t.Run("reader fails "+path, func(t *testing.T) {
-			f := newFixture()
-			f.actions.err = errors.New(leak)
-			status, _, raw := do(t, f.app(t, true), base+path)
-			if status != 200 || !strings.Contains(raw, `"allowed_actions":[]`) || strings.Contains(raw, "propose_") {
-				t.Fatalf("status=%d body %s", status, raw)
-			}
-		})
+		for _, tc := range []struct {
+			name   string
+			err    error
+			status int
+		}{
+			{"internal", errors.New(leak), 500},
+			{"forbidden", executioncontract.ContractError{Code: "FORBIDDEN"}, 403},
+			{"unauthenticated", executioncontract.ContractError{Code: "UNAUTHENTICATED"}, 401},
+		} {
+			t.Run(tc.name+" "+path, func(t *testing.T) {
+				f := newFixture()
+				f.actions.err = tc.err
+				status, _, raw := do(t, f.app(t, true), base+path)
+				if status != tc.status || strings.Contains(raw, leak) || strings.Contains(raw, "allowed_actions") {
+					t.Fatalf("status=%d body %s", status, raw)
+				}
+			})
+		}
 	}
 	t.Run("model value not trusted", func(t *testing.T) {
 		f := newFixture()

@@ -13,6 +13,7 @@ import (
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/databaseapi"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/jobsapi"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/workflow"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/worker"
@@ -57,10 +58,11 @@ func Register(ctx context.Context, app *fiber.App, db *pgxpool.Pool, jwtSecret s
 		return nil, errors.Join(fmt.Errorf("initialize workflow: %w", err), shutdown())
 	}
 	jobService := jobs.New(platform)
+	gate := workflow.NewGate(db)
 	var queueWorkers [2]*worker.Worker
 	for i := range queueWorkers {
 		queueWorkers[i], err = worker.New(jobService, jobs.ExecutionDeps{
-			Gate:    workflow.NewGate(db),
+			Gate:    gate,
 			Acquire: databaseapi.AcquireLease(connectionPools),
 		}, worker.Config{})
 		if err != nil {
@@ -70,6 +72,9 @@ func Register(ctx context.Context, app *fiber.App, db *pgxpool.Pool, jwtSecret s
 	workflowService.SetPlatform(platform)
 	workflowService.SetJobs(jobService)
 	workflow.RegisterRoutes(protected, workflow.NewHandler(workflowService), auth.CSRFMiddleware())
+	if err := jobsapi.Register(protected, jobsapi.Dependencies{Jobs: jobService, Actions: gate, Authorizer: authorizer}); err != nil {
+		return nil, errors.Join(fmt.Errorf("initialize jobs API: %w", err), shutdown())
+	}
 	stopReconciler, err := databaseapi.Register(protected, platform, authorizer, connectionPools)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("initialize database API: %w", err), shutdown())
