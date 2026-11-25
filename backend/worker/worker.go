@@ -12,6 +12,7 @@ import (
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/jobs"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -475,6 +476,17 @@ func (w *Worker) executeWithRenewal(ctx context.Context, claim *jobs.Claim) (*jo
 		})
 	}
 
+	traceCtx, traceErr := telemetry.ContextFromTraceContext(execCtx, executioncontract.TraceContext{
+		Traceparent: claim.Traceparent,
+		Tracestate:  claim.Tracestate,
+	}, "")
+	if traceErr != nil {
+		traceCtx, _ = telemetry.ContextFromTraceContext(execCtx, executioncontract.TraceContext{}, "")
+	}
+	execCtx = traceCtx
+	workerTrace, _ := telemetry.TraceFromContext(execCtx)
+	spanStart := time.Now()
+
 	execFields := map[string]any{
 		"worker_id":  w.cfg.WorkerID,
 		"job_id":     claim.JobID,
@@ -557,6 +569,21 @@ func (w *Worker) executeWithRenewal(ctx context.Context, claim *jobs.Claim) (*jo
 	default:
 		outcome, err = w.jobs.ExecuteStandardJob(execCtx, claim, w.deps)
 	}
+
+	spanAttrs := map[string]string{
+		"worker_id": w.cfg.WorkerID, "job_id": claim.JobID, "execution_id": claim.ExecutionID,
+		"attempt_id": claim.AttemptID, "database_id": claim.DatabaseID, "target_id": claim.TargetID,
+		"mode": string(claim.Mode), "action": string(claim.Action), "direction": string(claim.Direction),
+	}
+	if outcome != nil {
+		spanAttrs["status"] = string(outcome.Status)
+	}
+	telemetry.ExportSpan(context.Background(), telemetry.Span{
+		TraceID: workerTrace.TraceID, SpanID: workerTrace.SpanID, ParentSpanID: workerTrace.ParentSpanID,
+		Name: "worker.execute", Kind: 1, StartedAt: spanStart, EndedAt: time.Now(),
+		Failed:     err != nil || outcome != nil && outcome.Status != executioncontract.Succeeded,
+		Attributes: spanAttrs,
+	})
 
 	cancelExec()
 	<-renewDone

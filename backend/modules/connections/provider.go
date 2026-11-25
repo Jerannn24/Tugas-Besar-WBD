@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/stdlib"
 )
@@ -84,6 +85,8 @@ func openRolePools(cfg targetConfig) (rolePools, error) {
 	if err != nil {
 		return rolePools{}, err
 	}
+	ec.Tracer = telemetry.DefaultQueryTracer()
+	pc.Tracer = telemetry.DefaultQueryTracer()
 	executor := stdlib.OpenDB(*ec)
 	// Executor sessions carry advisory locks and transaction state: never
 	// keep idle ones around for reuse.

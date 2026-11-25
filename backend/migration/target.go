@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/history"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 )
 
 type TargetLease struct {
@@ -93,7 +94,15 @@ FROM pg_catalog.pg_roles r WHERE rolname=session_user`).Scan(&executorDB, &sessi
 	}
 	hash := sha256.Sum256([]byte("migration:" + marker))
 	s.key = int64(binary.BigEndian.Uint64(hash[:8]))
-	if _, err := lease.Executor.ExecContext(ctx, `SELECT pg_catalog.pg_advisory_lock($1)`, s.key); err != nil {
+	lockCtx, lockTrace := telemetry.ChildTrace(ctx)
+	lockStart := time.Now()
+	_, lockErr := lease.Executor.ExecContext(lockCtx, `SELECT pg_catalog.pg_advisory_lock($1)`, s.key)
+	telemetry.ExportSpan(context.Background(), telemetry.Span{
+		TraceID: lockTrace.TraceID, SpanID: lockTrace.SpanID, ParentSpanID: lockTrace.ParentSpanID,
+		Name: "target.lock", Kind: 1, StartedAt: lockStart, EndedAt: time.Now(), Failed: lockErr != nil,
+		Attributes: map[string]string{"target_id": targetID},
+	})
+	if lockErr != nil {
 		return nil, fault(409, "DATABASE_BUSY", "Target execution lock is unavailable")
 	}
 	s.locked, ok = true, true

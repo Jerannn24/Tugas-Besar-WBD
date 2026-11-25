@@ -42,12 +42,12 @@ func (t *QueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 	attrs = append(attrs, slogDuration(time.Since(started.at)), slogInt("rows_affected", data.CommandTag.RowsAffected()))
 	failed := data.Err != nil
 	if data.Err != nil {
-		msg, state := SafeError(data.Err)
+		state := ""
 		var pgErr *pgconn.PgError
 		if errors.As(data.Err, &pgErr) {
 			state = pgErr.Code
 		}
-		attrs = append(attrs, slogString("error", msg))
+		attrs = append(attrs, slogString("error", "query failed"))
 		if state != "" {
 			attrs = append(attrs, slogString("sql_state", state))
 		}
@@ -57,7 +57,7 @@ func (t *QueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 	} else if t != nil && t.Logger != nil {
 		t.Logger.Info(ctx, sqlEventName(started.query, "completed"), attrs...)
 	}
-	ExportSpan(context.Background(), Span{TraceID: started.trace.TraceID, SpanID: started.trace.SpanID, ParentSpanID: started.trace.ParentSpanID, Name: "db.sql.query", Kind: 3, StartedAt: started.at, EndedAt: time.Now(), Failed: failed, Attributes: map[string]string{"db.system": "postgresql", "db.statement": MaskSQL(started.query), "db.operation.parameter_count": fmt.Sprint(len(started.args)), "correlation_id": started.trace.CorrelationID}})
+	ExportSpan(context.Background(), Span{TraceID: started.trace.TraceID, SpanID: started.trace.SpanID, ParentSpanID: started.trace.ParentSpanID, Name: "db.sql.query", Kind: 3, StartedAt: started.at, EndedAt: time.Now(), Failed: failed, Attributes: map[string]string{"db.system": "postgresql", "db.statement": MaskSecrets(MaskSQL(started.query)), "db.operation.parameter_count": fmt.Sprint(len(started.args)), "correlation_id": started.trace.CorrelationID}})
 }
 
 func slogDuration(d time.Duration) slog.Attr {

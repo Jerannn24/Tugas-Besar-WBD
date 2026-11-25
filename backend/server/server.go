@@ -22,12 +22,12 @@ func New(ctx context.Context, db *pgxpool.Pool, jwtSecret string) (*fiber.App, f
 		ReadTimeout:  15 * time.Second,
 	})
 
+	app.Use(Logging())
+
 	app.Get("/health", func(c *fiber.Ctx) error {
 		c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSONCharsetUTF8)
 		return c.Send(okBytes)
 	})
-
-	app.Use(Logging())
 
 	shutdown, err := routes.Register(ctx, app, db, jwtSecret)
 	if err != nil {
