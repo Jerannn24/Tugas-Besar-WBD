@@ -3,6 +3,7 @@ package workflow
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
@@ -32,7 +33,18 @@ func (h *Handler) create(c *fiber.Ctx) error {
 	if err := c.BodyParser(&input); err != nil {
 		return invalid(c)
 	}
+	if raw := c.Params("database_id"); raw != "" {
+		databaseID, err := uuid.Parse(raw)
+		if err != nil || input.Revision <= 0 || input.DatabaseID != "" && input.DatabaseID != databaseID.String() {
+			return invalid(c)
+		}
+		input.DatabaseID = databaseID.String()
+	}
 	proposal, err := h.service.Create(c.UserContext(), actor.ID, input)
+	if err != nil {
+		return mapError(c, err)
+	}
+	proposal, err = h.service.present(c.UserContext(), actor.ID, proposal)
 	if err != nil {
 		return mapError(c, err)
 	}
@@ -48,7 +60,24 @@ func (h *Handler) submit(c *fiber.Ctx) error {
 	if err != nil {
 		return invalid(c)
 	}
-	proposal, err := h.service.Submit(c.UserContext(), actor.ID, id)
+	revision := 0
+	if c.Params("database_id") != "" {
+		var input struct {
+			Revision int `json:"revision"`
+		}
+		if err := c.BodyParser(&input); err != nil || input.Revision <= 0 {
+			return invalid(c)
+		}
+		revision = input.Revision
+		if err := h.scoped(c, actor.ID, id, input.Revision); err != nil {
+			return mapError(c, err)
+		}
+	}
+	proposal, err := h.service.Submit(c.UserContext(), actor.ID, id, revision)
+	if err != nil {
+		return mapError(c, err)
+	}
+	proposal, err = h.service.present(c.UserContext(), actor.ID, proposal)
 	if err != nil {
 		return mapError(c, err)
 	}
@@ -80,6 +109,9 @@ func (h *Handler) approve(c *fiber.Ctx) error {
 	if err != nil || input.Revision <= 0 {
 		return invalid(c)
 	}
+	if err := h.scoped(c, actor.ID, id, input.Revision); err != nil {
+		return mapError(c, err)
+	}
 
 	proposal, err := h.service.Approve(
 		c.UserContext(),
@@ -88,6 +120,10 @@ func (h *Handler) approve(c *fiber.Ctx) error {
 		groupID,
 		input.Revision,
 	)
+	if err != nil {
+		return mapError(c, err)
+	}
+	proposal, err = h.service.present(c.UserContext(), actor.ID, proposal)
 	if err != nil {
 		return mapError(c, err)
 	}
@@ -104,7 +140,14 @@ func (h *Handler) get(c *fiber.Ctx) error {
 	if err != nil {
 		return invalid(c)
 	}
+	if err := h.scoped(c, actor.ID, id, 0); err != nil {
+		return mapError(c, err)
+	}
 	proposal, err := h.service.Get(c.UserContext(), actor.ID, id)
+	if err != nil {
+		return mapError(c, err)
+	}
+	proposal, err = h.service.present(c.UserContext(), actor.ID, proposal)
 	if err != nil {
 		return mapError(c, err)
 	}
@@ -124,6 +167,13 @@ func (h *Handler) enqueue(c *fiber.Ctx) error {
 	if err := c.BodyParser(&input); err != nil {
 		return invalid(c)
 	}
+	if c.Params("database_id") != "" && input.Revision <= 0 {
+		return invalid(c)
+	}
+	// Enqueue resolves revision conflicts after checking existing request intent.
+	if err := h.scoped(c, actor.ID, id, 0); err != nil {
+		return mapError(c, err)
+	}
 	result, err := h.service.Enqueue(c.UserContext(), actor.ID, id, input)
 	if err != nil {
 		return mapError(c, err)
@@ -134,6 +184,80 @@ func (h *Handler) enqueue(c *fiber.Ctx) error {
 	}
 
 	return response.JSON(c, status, result)
+}
+
+func (h *Handler) scoped(c *fiber.Ctx, actor, id uuid.UUID, revision int) error {
+	raw := c.Params("database_id")
+	if raw == "" {
+		return nil
+	}
+	databaseID, err := uuid.Parse(raw)
+	if err != nil {
+		return ErrInvalidProposal
+	}
+	proposal, err := h.service.Get(c.UserContext(), actor, id)
+	if err != nil {
+		return err
+	}
+	if proposal.DatabaseID != databaseID.String() {
+		return ErrNotFound
+	}
+	if revision > 0 && revision != proposal.Revision {
+		return ErrProposalStale
+	}
+	return nil
+}
+
+func (h *Handler) list(c *fiber.Ctx) error {
+	actor, ok := authz.ActorFromContext(c)
+	if !ok {
+		return response.Fail(c, http.StatusUnauthorized, "UNAUTHENTICATED", "Sesi tidak valid")
+	}
+	databaseID, err := uuid.Parse(c.Params("database_id"))
+	if err != nil {
+		return invalid(c)
+	}
+	if err := h.service.authorizer.RequireAccess(c.UserContext(), actor.ID, databaseID, authz.AccessView); err != nil {
+		return mapError(c, err)
+	}
+	limit := 20
+	if c.Context().QueryArgs().Has("limit") {
+		limit, err = strconv.Atoi(c.Query("limit"))
+		if err != nil || limit < 1 || limit > 100 {
+			return invalid(c)
+		}
+	}
+	var cursor *uuid.UUID
+	if c.Context().QueryArgs().Has("cursor") {
+		id, err := uuid.Parse(c.Query("cursor"))
+		if err != nil {
+			return invalid(c)
+		}
+		cursor = &id
+	}
+	ids, err := h.service.repository.ListIDs(c.UserContext(), databaseID, cursor, limit+1)
+	if err != nil {
+		return mapError(c, err)
+	}
+	var next *string
+	if len(ids) > limit {
+		value := ids[limit-1].String()
+		next = &value
+		ids = ids[:limit]
+	}
+	items := make([]Proposal, 0, len(ids))
+	for _, id := range ids {
+		proposal, err := h.service.Get(c.UserContext(), actor.ID, id)
+		if err != nil {
+			return mapError(c, err)
+		}
+		proposal, err = h.service.present(c.UserContext(), actor.ID, proposal)
+		if err != nil {
+			return mapError(c, err)
+		}
+		items = append(items, proposal)
+	}
+	return response.JSON(c, http.StatusOK, fiber.Map{"items": items, "next_cursor": next})
 }
 
 func invalid(c *fiber.Ctx) error {
@@ -167,7 +291,7 @@ func mapError(c *fiber.Ctx, err error) error {
 		return response.Fail(c, http.StatusConflict, "CONFLICT", "Proposal tidak dapat diubah pada status ini")
 	case errors.Is(err, ErrPendingApprovals):
 		return response.Fail(c, http.StatusConflict, "APPROVAL_REQUIRED", "Persetujuan proposal belum lengkap")
-	case errors.Is(err, authz.ErrForbidden):
+	case errors.Is(err, ErrForbidden), errors.Is(err, authz.ErrForbidden):
 		return response.Fail(c, http.StatusForbidden, "FORBIDDEN", "Akses ditolak")
 	case errors.Is(err, ErrInvalidProposal):
 		return invalid(c)

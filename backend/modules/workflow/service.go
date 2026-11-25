@@ -12,6 +12,7 @@ import (
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -42,18 +43,19 @@ type Snapshot struct {
 type snapshot = Snapshot
 
 type Proposal struct {
-	ProposalID          string                       `json:"proposal_id"`
-	DatabaseID          string                       `json:"database_id"`
-	MigrationID         string                       `json:"migration_id"`
-	Revision            int                          `json:"revision"`
-	Action              string                       `json:"action"`
-	SourceExecutionID   *string                      `json:"source_execution_id"`
-	Status              string                       `json:"status"`
-	Snapshot            Snapshot                     `json:"snapshot"`
-	SnapshotHash        string                       `json:"snapshot_hash"`
-	ApprovalFingerprint string                       `json:"approval_fingerprint"`
-	Validation          executioncontract.Validation `json:"validation"`
-	Approvals           []Approval                   `json:"approvals"`
+	ProposalID          string                        `json:"proposal_id"`
+	DatabaseID          string                        `json:"database_id"`
+	MigrationID         string                        `json:"migration_id"`
+	Revision            int                           `json:"revision"`
+	Action              string                        `json:"action"`
+	SourceExecutionID   *string                       `json:"source_execution_id"`
+	Status              string                        `json:"status"`
+	Snapshot            Snapshot                      `json:"snapshot"`
+	SnapshotHash        string                        `json:"snapshot_hash"`
+	ApprovalFingerprint string                        `json:"approval_fingerprint"`
+	Validation          *executioncontract.Validation `json:"validation"`
+	Approvals           []Approval                    `json:"approvals"`
+	AllowedActions      []string                      `json:"allowed_actions"`
 }
 
 type Approval struct {
@@ -65,6 +67,7 @@ type Approval struct {
 
 type CreateInput struct {
 	DatabaseID        string  `json:"database_id"`
+	Revision          int     `json:"revision"`
 	MigrationID       string  `json:"migration_id"`
 	Action            string  `json:"action"`
 	SourceExecutionID *string `json:"source_execution_id"`
@@ -75,9 +78,12 @@ type serviceRepository interface {
 	sourceSnapshot(context.Context, uuid.UUID, uuid.UUID, int, string, *uuid.UUID, string) (Snapshot, error)
 	FingerprintForDatabase(context.Context, uuid.UUID) ([]uuid.UUID, [32]byte, error)
 	CreateProposal(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, int, string, *uuid.UUID, Snapshot, [32]byte, [32]byte, []byte) (uuid.UUID, error)
-	Submit(context.Context, uuid.UUID, uuid.UUID) (Proposal, error)
+	Submit(context.Context, uuid.UUID, uuid.UUID, int) (Proposal, error)
 	Approve(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, int) (Proposal, error)
 	Get(context.Context, uuid.UUID) (Proposal, error)
+	ListIDs(context.Context, uuid.UUID, *uuid.UUID, int) ([]uuid.UUID, error)
+	MayReview(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (bool, error)
+	mayEnqueue(context.Context, uuid.UUID, uuid.UUID) error
 }
 
 type Service struct {
@@ -124,6 +130,9 @@ func (s *Service) Create(ctx context.Context, actor uuid.UUID, in CreateInput) (
 	snapshot, err := s.repository.LoadDraft(ctx, databaseID, migrationID)
 	if err != nil {
 		return Proposal{}, err
+	}
+	if in.Revision > 0 && in.Revision != snapshot.Revision {
+		return Proposal{}, ErrProposalStale
 	}
 	var sourceExecutionID *uuid.UUID
 	if in.SourceExecutionID != nil {
@@ -175,7 +184,7 @@ func (s *Service) Create(ctx context.Context, actor uuid.UUID, in CreateInput) (
 	return proposal, nil
 }
 
-func (s *Service) Submit(ctx context.Context, actor, id uuid.UUID) (Proposal, error) {
+func (s *Service) Submit(ctx context.Context, actor, id uuid.UUID, revision int) (Proposal, error) {
 	proposal, err := s.repository.Get(ctx, id)
 	if err != nil {
 		return Proposal{}, err
@@ -187,7 +196,7 @@ func (s *Service) Submit(ctx context.Context, actor, id uuid.UUID) (Proposal, er
 	if err = s.authorizer.RequireAccess(ctx, actor, databaseID, authz.AccessEdit); err != nil {
 		return Proposal{}, err
 	}
-	return s.repository.Submit(ctx, id, actor)
+	return s.repository.Submit(ctx, id, actor, revision)
 }
 
 func (s *Service) Approve(
@@ -231,9 +240,51 @@ func (s *Service) Get(ctx context.Context, actor, id uuid.UUID) (Proposal, error
 	}
 	return proposal, nil
 }
+func (s *Service) present(ctx context.Context, actor uuid.UUID, proposal Proposal) (Proposal, error) {
+	proposal.Approvals = append([]Approval{}, proposal.Approvals...)
+	proposal.AllowedActions = []string{}
+	databaseID, err := uuid.Parse(proposal.DatabaseID)
+	if err != nil {
+		return Proposal{}, ErrInvalidProposal
+	}
+	switch proposal.Status {
+	case "draft", "approved":
+		err = s.authorizer.RequireAccess(ctx, actor, databaseID, authz.AccessEdit)
+		if err == nil && proposal.Status == "draft" {
+			proposal.AllowedActions = append(proposal.AllowedActions, "submit_review")
+		} else if err == nil {
+			id, parseErr := uuid.Parse(proposal.ProposalID)
+			if parseErr != nil {
+				return Proposal{}, ErrInvalidProposal
+			}
+			err = s.repository.mayEnqueue(ctx, actor, id)
+			if err == nil {
+				proposal.AllowedActions = append(proposal.AllowedActions, "enqueue")
+			} else if !errors.Is(err, ErrForbidden) && !errors.Is(err, ErrPendingApprovals) {
+				return Proposal{}, err
+			}
+		} else if !errors.Is(err, authz.ErrForbidden) {
+			return Proposal{}, err
+		}
+	case "pending_review":
+		id, err := uuid.Parse(proposal.ProposalID)
+		if err != nil {
+			return Proposal{}, ErrInvalidProposal
+		}
+		allowed, err := s.repository.MayReview(ctx, actor, databaseID, id)
+		if err != nil {
+			return Proposal{}, err
+		}
+		if allowed {
+			proposal.AllowedActions = append(proposal.AllowedActions, "approve")
+		}
+	}
+	return proposal, nil
+}
 
 type EnqueueInput struct {
 	RequestID         string  `json:"request_id"`
+	Revision          int     `json:"revision"`
 	SourceExecutionID *string `json:"source_execution_id,omitempty"`
 }
 
@@ -317,6 +368,90 @@ func (s *Service) Enqueue(ctx context.Context, actor, proposalID uuid.UUID, inpu
 	if err != nil {
 		return EnqueueOutput{}, err
 	}
+	var originalFingerprint sql.NullString
+	var originalError sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT approval_fingerprint,error_code FROM app.jobs
+		WHERE database_id=$1 AND request_id=$2`, databaseID, requestID.String()).Scan(&originalFingerprint, &originalError)
+	replayRequest := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return EnqueueOutput{}, err
+	}
+
+	snapshotHashHex := shaHex(snapshotHash)
+	approvalFingerprintHex := shaHex(approvalFingerprint)
+	direction := executioncontract.Up
+	if action == string(executioncontract.Rollback) || action == string(executioncontract.Compensate) {
+		direction = executioncontract.Down
+	}
+	var sourceExecutionID *executioncontract.ID
+	if input.SourceExecutionID != nil {
+		parsed, parseErr := uuid.Parse(*input.SourceExecutionID)
+		if parseErr != nil {
+			return EnqueueOutput{}, ErrInvalidProposal
+		}
+		if !proposalSource.Valid || parsed.String() != proposalSource.String {
+			// Existing request IDs are checked against their original source below.
+			if !replayRequest {
+				return EnqueueOutput{}, ErrInvalidProposal
+			}
+			source := parsed.String()
+			sourceExecutionID = &source
+		}
+	}
+	if proposalSource.Valid && sourceExecutionID == nil {
+		sourceExecutionID = &proposalSource.String
+	}
+	if action == string(executioncontract.Resume) {
+		if !proposalSource.Valid {
+			return EnqueueOutput{}, ErrInvalidProposal
+		}
+		var sourceDirection string
+		err = tx.QueryRowContext(ctx, `SELECT direction FROM app.jobs WHERE execution_id=$1 AND database_id=$2
+			AND target_id=$3 AND migration_id=$4 AND revision=$5 AND mode='batch'
+			ORDER BY created_at,id LIMIT 1`,
+			proposalSource.String, databaseID, targetID.String, migrationID, revision).Scan(&sourceDirection)
+		if errors.Is(err, sql.ErrNoRows) {
+			return EnqueueOutput{}, ErrInvalidProposal
+		}
+		if err != nil {
+			return EnqueueOutput{}, err
+		}
+		direction = executioncontract.Direction(sourceDirection)
+	}
+	var snapshot executioncontract.Draft
+	if err := json.Unmarshal(snapshotJSON, &snapshot); err != nil {
+		return EnqueueOutput{}, ErrInvalidProposal
+	}
+
+	var traceparent, tracestate string
+	if trace, ok := telemetry.TraceFromContext(ctx); ok {
+		traceparent, tracestate = trace.Traceparent(), trace.TraceState
+	}
+	requestRevision := revision
+	if replayRequest && input.Revision > 0 {
+		requestRevision = input.Revision
+	}
+	if replayRequest && status == "pending_review" && originalError.Valid && originalError.String == "REVIEW_STALE" {
+		approvalFingerprintHex = originalFingerprint.String
+	}
+	request := executioncontract.EnqueueRequest{
+		TargetID: targetID.String, RequestID: requestID.String(), ActorID: actor.String(),
+		DatabaseID: databaseID.String(), ProposalID: proposalID.String(), MigrationID: migrationID.String(),
+		SourceExecutionID: sourceExecutionID, Revision: requestRevision, Action: executioncontract.Action(action),
+		Direction: direction, Snapshot: snapshot, SnapshotHash: snapshotHashHex,
+		ApprovalFingerprint: approvalFingerprintHex, Traceparent: traceparent, Tracestate: tracestate,
+	}
+	if replayRequest {
+		result, err := s.jobs.EnqueueTx(ctx, tx, request)
+		if err != nil {
+			return EnqueueOutput{}, err
+		}
+		return EnqueueOutput{JobAccepted: result.JobAccepted, Replayed: result.Replayed}, nil
+	}
+
+	if input.Revision > 0 && input.Revision != revision {
+		return EnqueueOutput{}, ErrProposalStale
+	}
 	if status != "approved" && status != "queued" {
 		return EnqueueOutput{}, ErrConflict
 	}
@@ -368,54 +503,7 @@ func (s *Service) Enqueue(ctx context.Context, actor, proposalID uuid.UUID, inpu
 		return EnqueueOutput{}, ErrPendingApprovals
 	}
 
-	snapshotHashHex := shaHex(snapshotHash)
-	approvalFingerprintHex := shaHex(approvalFingerprint)
-	direction := executioncontract.Up
-	if action == string(executioncontract.Rollback) || action == string(executioncontract.Compensate) {
-		direction = executioncontract.Down
-	}
-	var sourceExecutionID *executioncontract.ID
-	if input.SourceExecutionID != nil {
-		parsed, parseErr := uuid.Parse(*input.SourceExecutionID)
-		if parseErr != nil {
-			return EnqueueOutput{}, ErrInvalidProposal
-		}
-		if !proposalSource.Valid || parsed.String() != proposalSource.String {
-			return EnqueueOutput{}, ErrInvalidProposal
-		}
-	}
-	if proposalSource.Valid {
-		sourceExecutionID = &proposalSource.String
-	}
-	if action == string(executioncontract.Resume) {
-		if sourceExecutionID == nil {
-			return EnqueueOutput{}, ErrInvalidProposal
-		}
-		var sourceDirection string
-		err = tx.QueryRowContext(ctx, `SELECT direction FROM app.jobs WHERE execution_id=$1 AND database_id=$2
-			AND target_id=$3 AND migration_id=$4 AND revision=$5 AND mode='batch'
-			ORDER BY created_at,id LIMIT 1`,
-			*sourceExecutionID, databaseID, targetID.String, migrationID, revision).Scan(&sourceDirection)
-		if errors.Is(err, sql.ErrNoRows) {
-			return EnqueueOutput{}, ErrInvalidProposal
-		}
-		if err != nil {
-			return EnqueueOutput{}, err
-		}
-		direction = executioncontract.Direction(sourceDirection)
-	}
-	var snapshot executioncontract.Draft
-	if err := json.Unmarshal(snapshotJSON, &snapshot); err != nil {
-		return EnqueueOutput{}, ErrInvalidProposal
-	}
-
-	result, err := s.jobs.EnqueueTx(ctx, tx, executioncontract.EnqueueRequest{
-		TargetID: targetID.String, RequestID: requestID.String(), ActorID: actor.String(),
-		DatabaseID: databaseID.String(), ProposalID: proposalID.String(), MigrationID: migrationID.String(),
-		SourceExecutionID: sourceExecutionID, Revision: revision, Action: executioncontract.Action(action),
-		Direction: direction, Snapshot: snapshot, SnapshotHash: snapshotHashHex,
-		ApprovalFingerprint: approvalFingerprintHex,
-	})
+	result, err := s.jobs.EnqueueTx(ctx, tx, request)
 	if err != nil {
 		return EnqueueOutput{}, err
 	}

@@ -198,7 +198,9 @@ Untuk menjalankan lagi di hari berikutnya, cukup `docker compose up -d postgres 
 2. **Admin → Users**: buat akun user.
 3. **Admin → Groups**: buat grup, tambahkan anggota, lalu beri grant ke database.
 4. **Databases**: lihat schema dan isi tabel.
-5. **Migrations**: buat draft dan lihat riwayat. Eksekusi baru wajib melalui proposal yang disetujui dan `POST /api/proposals/{proposal_id}/queue`; backend tidak lagi melayani `POST /api/databases/{database_id}/drafts/{draft_id}/execute`. Tombol execute lama pada frontend belum memakai alur proposal.
+5. **Migrations**: buat draft, lanjutkan ke review dan approval, lalu gunakan **Execute** di SPA. Tombol ini memanggil `POST /api/databases/{database_id}/proposals/{proposal_id}/jobs` dan menampilkan job. Eksekusi langsung dari draft tidak lagi tersedia.
+
+   Riwayat mendukung pagination dengan `?limit=20` dan parameter opsional `hide_rollback=true`; tanpa query, respons memakai bentuk legacy. Kelayakan rollback dan forward sudah ditentukan di backend, tetapi kontrol rollback dan forward pada SPA saat ini masih merupakan handoff frontend.
 
 ## Testing dan Quality Check
 
@@ -243,6 +245,15 @@ docker compose --profile test run --rm --no-deps \
   -e AUTH_TEST_DATABASE_URL="postgres://wbd_platform_runtime:<DB_TEST_RUNTIME_PASSWORD>@postgres-test:5432/test_platform?sslmode=disable" \
   backend go test ./modules/auth/...
 ```
+
+### Bukti penerimaan performa
+
+Pada PostgreSQL 16.15 lokal terisolasi (target B), tabel `managed.batch_items` berisi 1.000.000 baris; dataset yang sama di-reset ke `processed=false` antara pengujian. Pengaturan: `shared_buffers=128MB`, `synchronous_commit=on`, dan default `fsync=on`.
+
+- Satu `UPDATE` tanpa batch: 8,524 detik.
+- Job batch yang disetujui, ukuran 10.000: 61,371 detik dari masuk antrean hingga teramati selesai; 100 batch / 1.000.000 baris di-commit.
+
+Batch menyediakan progres dan checkpoint, bukan klaim peningkatan kecepatan.
 
 ## Referensi Port dan Variabel
 

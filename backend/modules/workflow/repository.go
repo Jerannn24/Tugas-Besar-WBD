@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
 type fingerprintMember struct {
 	UserID string `json:"user_id"`
 	Active bool   `json:"active"`
@@ -267,7 +268,11 @@ func (r *Repository) CreateProposal(
 ) (uuid.UUID, error) {
 	id := uuid.New()
 
-	_, err := r.db.Exec(ctx, `
+	tag, err := r.db.Exec(ctx, `
+		WITH draft AS (
+			SELECT id FROM app.migration_drafts
+			WHERE id=$3 AND database_id=$2 AND revision=$4 FOR UPDATE
+		)
 		INSERT INTO app.migration_proposals (
 			id,
 			database_id,
@@ -282,10 +287,8 @@ func (r *Repository) CreateProposal(
 			validation,
 			created_by
 		)
-		VALUES (
-			$1, $2, $3, $4, $5, $6,
-			'draft', $7, $8, $9, NULL, $10
-		)
+		SELECT $1, $2, $3, $4, $5, $6,
+			'draft', $7, $8, $9, NULL, $10 FROM draft
 	`,
 		id,
 		databaseID,
@@ -301,6 +304,9 @@ func (r *Repository) CreateProposal(
 	if err != nil {
 		return uuid.Nil, err
 	}
+	if tag.RowsAffected() != 1 {
+		return uuid.Nil, ErrProposalStale
+	}
 
 	return id, nil
 }
@@ -308,6 +314,7 @@ func (r *Repository) CreateProposal(
 func (r *Repository) Submit(
 	ctx context.Context,
 	id, actorID uuid.UUID,
+	requestedRevision int,
 ) (Proposal, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
@@ -346,6 +353,9 @@ func (r *Repository) Submit(
 	}
 	if err != nil {
 		return Proposal{}, err
+	}
+	if requestedRevision > 0 && requestedRevision != revision {
+		return Proposal{}, ErrProposalStale
 	}
 	if status != "draft" {
 		return Proposal{}, ErrConflict
@@ -793,6 +803,66 @@ func (r *Repository) Get(ctx context.Context, id uuid.UUID) (Proposal, error) {
 		return Proposal{}, err
 	}
 	return proposal, nil
+}
+
+func (r *Repository) ListIDs(ctx context.Context, databaseID uuid.UUID, cursor *uuid.UUID, limit int) ([]uuid.UUID, error) {
+	if cursor != nil {
+		var exists bool
+		if err := r.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM app.migration_proposals WHERE database_id=$1 AND id=$2)`, databaseID, *cursor).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, ErrInvalidProposal
+		}
+	}
+	rows, err := r.db.Query(ctx, `SELECT id FROM app.migration_proposals WHERE database_id=$1 AND ($2::uuid IS NULL OR id < $2) ORDER BY id DESC LIMIT $3`, databaseID, cursor, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (r *Repository) mayEnqueue(ctx context.Context, actor, proposalID uuid.UUID) error {
+	return NewPolicy(r.db).MayEnqueue(ctx, actor, proposalID)
+}
+
+func (r *Repository) MayReview(ctx context.Context, actor, databaseID, proposalID uuid.UUID) (bool, error) {
+	var allowed bool
+	err := r.db.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM app.migration_proposal_approvals a
+		JOIN app.migration_proposals p ON p.id=a.proposal_id AND p.database_id=$2
+		JOIN app.migration_drafts draft ON draft.id=p.migration_id AND draft.database_id=$2 AND draft.revision=p.revision
+		JOIN app.groups g ON g.id=a.group_id AND g.leader_user_id=$1
+		JOIN app.users u ON u.id=$1 AND u.is_active
+		JOIN app.group_memberships m ON m.group_id=g.id AND m.user_id=$1
+		JOIN app.group_database_grants d ON d.group_id=g.id AND d.database_id=$2 AND d.access IN ('view','edit')
+		WHERE a.proposal_id=$3 AND a.status='pending' AND a.leader_user_id=$1
+		  AND a.approval_round=(SELECT MAX(x.approval_round) FROM app.migration_proposal_approvals x WHERE x.proposal_id=a.proposal_id AND x.group_id=a.group_id)
+	)`, actor, databaseID, proposalID).Scan(&allowed)
+	if err != nil || !allowed {
+		return false, err
+	}
+	proposal, err := r.Get(ctx, proposalID)
+	if err != nil {
+		return false, err
+	}
+	_, fingerprint, err := r.FingerprintForDatabase(ctx, databaseID)
+	if err != nil {
+		return false, err
+	}
+	if proposal.ApprovalFingerprint != hexEncode(fingerprint[:]) {
+		return false, nil
+	}
+	return allowed, err
 }
 
 func fingerprintTx(
