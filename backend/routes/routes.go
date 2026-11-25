@@ -1,15 +1,18 @@
 package routes
 
 import (
+	"log"
+
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/jobs"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/admin"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/auth"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/databaseapi"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/workflow"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"log"
 )
 
 func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
@@ -29,6 +32,9 @@ func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
 		})
 	})
 
+	metricsRegistry := telemetry.NewRegistry()
+	telemetry.RegisterRoutes(api, metricsRegistry)
+
 	authRepo := auth.NewRepository(db)
 	authSessions := auth.NewSessionRepository(db)
 	authService := auth.NewService(authRepo, authSessions, auth.LoadSessionConfig(jwtSecret))
@@ -45,15 +51,22 @@ func Register(app *fiber.App, db *pgxpool.Pool, jwtSecret string) {
 	connectionService := connections.NewService(connectionRepository, connectionPools)
 	connectionHandler := connections.NewHandler(connectionService)
 	connections.RegisterRoutes(protected, connectionHandler, authz.AdminMiddleware(authorizer), auth.CSRFMiddleware())
+	platform, platformErr := databaseapi.OpenPlatform()
 	workflowService, err := workflow.NewService(db, authorizer)
 	if err != nil {
 		log.Printf("workflow API disabled: %v", err)
 	} else {
-		workflow.RegisterRoutes(protected, workflow.NewHandler(workflowService), auth.CSRFMiddleware())
+		if platformErr != nil {
+			log.Printf("workflow queue disabled: %v", platformErr)
+		} else {
+			workflowService.SetPlatform(platform)
+			workflowService.SetJobs(jobs.New(platform))
+			workflow.RegisterRoutes(protected, workflow.NewHandler(workflowService), auth.CSRFMiddleware())
+		}
 	}
 
-	if platform, err := databaseapi.OpenPlatform(); err != nil {
-		log.Printf("database API disabled: %v", err)
+	if platformErr != nil {
+		log.Printf("database API disabled: %v", platformErr)
 	} else if stopReconciler, err := databaseapi.Register(protected, platform, authorizer, connectionPools); err != nil {
 		_ = platform.Close()
 		log.Printf("database API disabled: %v", err)

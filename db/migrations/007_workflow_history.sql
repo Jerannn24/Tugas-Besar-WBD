@@ -42,6 +42,7 @@ BEGIN
         OR NEW.mode IS DISTINCT FROM OLD.mode
         OR NEW.batch IS DISTINCT FROM OLD.batch
         OR NEW.revision IS DISTINCT FROM OLD.revision
+        OR NEW.revision_locked_at IS DISTINCT FROM OLD.revision_locked_at
     ) THEN
         RAISE EXCEPTION 'executed migration revision is immutable'
             USING ERRCODE = '23514';
