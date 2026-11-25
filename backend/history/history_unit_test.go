@@ -91,6 +91,7 @@ func TestHistoryUnitSuccessAndMissingExecution(t *testing.T) {
 		m, mux := historyMock(t)
 		now := time.Now().UTC()
 		m.ExpectQuery("SELECT e.id::text,e.database_id::text,e.draft_id::text").WithArgs(dbA, execTwo).WillReturnRows(sqlmock.NewRows(executionColumns).AddRow(execTwo, dbA, "draft", 2, "2", "Failed", "bad sql", userID, "tester", now, now, "failed", "SQL_ERROR", "safe detail", execTwo, execOne, nil, nil))
+		m.ExpectQuery("SELECT jsonb_build_object").WithArgs(dbA, execOne).WillReturnRows(sqlmock.NewRows([]string{"commit"}))
 		var e Execution
 		decodeData(t, do(mux, "/api/databases/"+dbA+"/migrations/"+execTwo), &e)
 		if e.Error == nil || e.Error.Code != "SQL_ERROR" || e.Error.Message != "safe detail" || e.Status != "failed" || e.FinishedAt == nil || e.AttemptID == nil || *e.AttemptID != execTwo || e.ExecutionID == nil || *e.ExecutionID != execOne {

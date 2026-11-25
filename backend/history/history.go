@@ -113,22 +113,15 @@ FROM (
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.d.Timeout)
 	defer cancel()
-	id, ok := h.authorize(ctx, w, r)
+	id, actor, ok := h.authorize(ctx, w, r)
 	if !ok {
 		return
 	}
-	query := executionSelect
-	if r.URL.Query().Get("hide_rollback") == "true" {
-		query = `WITH executions AS (` + executionSelect + `)
-			SELECT * FROM executions e
-			WHERE e.status <> 'succeeded' OR NOT EXISTS (
-				SELECT 1 FROM executions other
-				WHERE other.status = 'succeeded'
-				  AND ((e.reverts_execution_id IS NOT NULL AND other.id = e.reverts_execution_id)
-				    OR (other.reverts_execution_id IS NOT NULL AND other.reverts_execution_id = e.id))
-			)`
+	if r.URL.Query().Has("limit") || r.URL.Query().Has("cursor") || r.URL.Query().Has("hide_rollback") {
+		h.listAttempts(ctx, w, r, id, actor.ID)
+		return
 	}
-	rows, err := h.d.Platform.QueryContext(ctx, query+` ORDER BY e.version::bigint DESC,e.id DESC`, id)
+	rows, err := h.d.Platform.QueryContext(ctx, executionSelect+` ORDER BY e.version::bigint DESC,e.id DESC`, id)
 	if err != nil {
 		internal(w)
 		return
@@ -153,7 +146,7 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) detail(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.d.Timeout)
 	defer cancel()
-	id, ok := h.authorize(ctx, w, r)
+	id, _, ok := h.authorize(ctx, w, r)
 	if !ok {
 		return
 	}
@@ -162,7 +155,7 @@ func (h *Handler) detail(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 400, "INVALID_REQUEST", "Invalid execution id")
 		return
 	}
-	execution, err := scan(h.d.Platform.QueryRowContext(ctx, executionSelect+` WHERE e.id=$2`, id, executionID))
+	execution, err := scan(h.d.Platform.QueryRowContext(ctx, executionSelect+` WHERE e.id=$2 OR e.execution_id=$2 ORDER BY (e.status='succeeded') DESC,e.started_at DESC,e.id DESC LIMIT 1`, id, executionID))
 	if errors.Is(err, sql.ErrNoRows) {
 		apiError(w, 404, "NOT_FOUND", "Execution not found")
 		return
@@ -170,6 +163,17 @@ func (h *Handler) detail(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		internal(w)
 		return
+	}
+	if execution.ExecutionID != nil {
+		commit, err := h.commit(ctx, id, *execution.ExecutionID)
+		if err != nil {
+			internal(w)
+			return
+		}
+		if commit != nil {
+			write(w, http.StatusOK, map[string]any{"data": commit})
+			return
+		}
 	}
 	write(w, http.StatusOK, map[string]any{"data": execution})
 }
@@ -199,22 +203,22 @@ func scan(row rowScanner) (Execution, error) {
 	return execution, nil
 }
 
-func (h *Handler) authorize(ctx context.Context, w http.ResponseWriter, r *http.Request) (string, bool) {
+func (h *Handler) authorize(ctx context.Context, w http.ResponseWriter, r *http.Request) (string, Actor, bool) {
 	actor, err := h.d.Actor(r.WithContext(ctx))
 	if err != nil || actor.ID == "" {
 		apiError(w, 401, "UNAUTHENTICATED", "Authentication required")
-		return "", false
+		return "", Actor{}, false
 	}
 	id := r.PathValue("database_id")
 	if !validUUID(id) {
 		apiError(w, 400, "INVALID_REQUEST", "Invalid database id")
-		return "", false
+		return "", Actor{}, false
 	}
 	if err := h.d.Authorize(ctx, actor, id); err != nil {
 		accessError(w, err)
-		return "", false
+		return "", Actor{}, false
 	}
-	return id, true
+	return id, actor, true
 }
 
 func validUUID(s string) bool {

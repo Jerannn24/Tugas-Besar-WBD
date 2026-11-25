@@ -341,6 +341,48 @@ func TestLiveHistory(t *testing.T) {
 		}
 	})
 
+	t.Run("paged legacy executions expose commits only for success", func(t *testing.T) {
+		var page struct {
+			Items []struct {
+				ExecutionID string  `json:"execution_id"`
+				Version     *string `json:"version"`
+				SQLEntered  *bool   `json:"sql_entered"`
+				Statements  []struct {
+					SQL     string `json:"sql"`
+					Outcome string `json:"outcome"`
+				} `json:"statements"`
+				AllowedActions []string `json:"allowed_actions"`
+				IsActiveHead   bool     `json:"is_active_head"`
+				Commit         *struct {
+					ExecutionID  string            `json:"execution_id"`
+					BatchCommits []json.RawMessage `json:"batch_commits"`
+				} `json:"commit"`
+			} `json:"items"`
+		}
+		decodeData(t, do(mux, "/api/databases/"+dbA+"/migrations?limit=20"), &page)
+		if len(page.Items) != 3 {
+			t.Fatalf("items = %+v", page.Items)
+		}
+		sqlByExecution := map[string]string{
+			execOne:   "CREATE TABLE u(id int);",
+			execTwo:   "ALTER TABLE nope ADD c int;",
+			execThree: "CREATE INDEX i ON u(id);",
+		}
+		for _, item := range page.Items {
+			if item.SQLEntered != nil || len(item.Statements) != 1 || item.Statements[0].SQL != sqlByExecution[item.ExecutionID] ||
+				item.Statements[0].Outcome != "unknown" || item.AllowedActions == nil || len(item.AllowedActions) != 0 || item.IsActiveHead {
+				t.Fatalf("legacy evidence = %+v", item)
+			}
+			if item.ExecutionID == execOne {
+				if item.Version == nil || *item.Version != "1" || item.Commit == nil || item.Commit.ExecutionID != execOne || item.Commit.BatchCommits == nil {
+					t.Fatalf("successful item = %+v", item)
+				}
+			} else if item.Version != nil || item.Commit != nil {
+				t.Fatalf("uncommitted item = %+v", item)
+			}
+		}
+	})
+
 	t.Run("detail succeeded", func(t *testing.T) {
 		var got Execution
 		decodeData(t, do(mux, "/api/databases/"+dbA+"/migrations/"+execOne), &got)
