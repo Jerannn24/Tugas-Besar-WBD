@@ -10,7 +10,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-var executionColumns = []string{"id", "database_id", "draft_id", "draft_revision", "version", "title", "sql", "executed_by", "executed_username", "started_at", "finished_at", "status", "error_code", "error_message"}
+var executionColumns = []string{"id", "database_id", "draft_id", "draft_revision", "version", "title", "sql", "executed_by", "executed_username", "started_at", "finished_at", "status", "error_code", "error_message", "attempt_id", "execution_id", "source_execution_id", "reverts_execution_id"}
 
 func historyMock(t *testing.T) (sqlmock.Sqlmock, *http.ServeMux) {
 	t.Helper()
@@ -54,9 +54,9 @@ func TestHistoryQueryAndScanFailuresAreSanitized(t *testing.T) {
 				} else {
 					rows := sqlmock.NewRows(executionColumns)
 					if stage == "scan" {
-						rows.AddRow(execOne, dbA, "draft", "invalid revision", bigVer, "Title", "SELECT 1", userID, "user", time.Now(), nil, "running", nil, nil)
+						rows.AddRow(execOne, dbA, "draft", "invalid revision", bigVer, "Title", "SELECT 1", userID, "user", time.Now(), nil, "running", nil, nil, nil, nil, nil, nil)
 					} else {
-						rows.AddRow(execOne, dbA, "draft", 1, bigVer, "Title", "SELECT 1", userID, "user", time.Now(), nil, "running", nil, nil).RowError(0, errors.New("private stream error"))
+						rows.AddRow(execOne, dbA, "draft", 1, bigVer, "Title", "SELECT 1", userID, "user", time.Now(), nil, "running", nil, nil, nil, nil, nil, nil).RowError(0, errors.New("private stream error"))
 					}
 					query.WillReturnRows(rows)
 				}
@@ -74,7 +74,7 @@ func TestHistoryUnitSuccessAndMissingExecution(t *testing.T) {
 	t.Run("list preserves bigint and nullable fields", func(t *testing.T) {
 		m, mux := historyMock(t)
 		local := time.Date(2026, 10, 25, 19, 0, 0, 0, time.FixedZone("WIB", 7*3600))
-		m.ExpectQuery("SELECT e.id::text,e.database_id::text,e.draft_id::text").WithArgs(dbA).WillReturnRows(sqlmock.NewRows(executionColumns).AddRow(execOne, dbA, "draft", 3, bigVer, "Title", "SELECT 1", userID, "tester", local, nil, "running", nil, nil))
+		m.ExpectQuery("SELECT e.id::text,e.database_id::text,e.draft_id::text").WithArgs(dbA).WillReturnRows(sqlmock.NewRows(executionColumns).AddRow(execOne, dbA, "draft", 3, bigVer, "Title", "SELECT 1", userID, "tester", local, nil, "running", nil, nil, nil, nil, nil, nil))
 		var v struct {
 			Items []Execution `json:"items"`
 		}
@@ -90,10 +90,10 @@ func TestHistoryUnitSuccessAndMissingExecution(t *testing.T) {
 	t.Run("failed detail", func(t *testing.T) {
 		m, mux := historyMock(t)
 		now := time.Now().UTC()
-		m.ExpectQuery("SELECT e.id::text,e.database_id::text,e.draft_id::text").WithArgs(dbA, execTwo).WillReturnRows(sqlmock.NewRows(executionColumns).AddRow(execTwo, dbA, "draft", 2, "2", "Failed", "bad sql", userID, "tester", now, now, "failed", "SQL_ERROR", "safe detail"))
+		m.ExpectQuery("SELECT e.id::text,e.database_id::text,e.draft_id::text").WithArgs(dbA, execTwo).WillReturnRows(sqlmock.NewRows(executionColumns).AddRow(execTwo, dbA, "draft", 2, "2", "Failed", "bad sql", userID, "tester", now, now, "failed", "SQL_ERROR", "safe detail", execTwo, execOne, nil, nil))
 		var e Execution
 		decodeData(t, do(mux, "/api/databases/"+dbA+"/migrations/"+execTwo), &e)
-		if e.Error == nil || e.Error.Code != "SQL_ERROR" || e.Error.Message != "safe detail" || e.Status != "failed" || e.FinishedAt == nil {
+		if e.Error == nil || e.Error.Code != "SQL_ERROR" || e.Error.Message != "safe detail" || e.Status != "failed" || e.FinishedAt == nil || e.AttemptID == nil || *e.AttemptID != execTwo || e.ExecutionID == nil || *e.ExecutionID != execOne {
 			t.Fatalf("execution: %+v", e)
 		}
 	})
