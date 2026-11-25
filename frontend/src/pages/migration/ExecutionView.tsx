@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router'
 import type { ApiFailure } from '../../api/client'
 import { getMigration } from '../../api/endpoints'
-import type { DatabaseSummary, Execution, ID } from '../../api/types'
+import type { DatabaseSummary, Execution, HistoryEntry, ID } from '../../api/types'
 import { Button } from '../../components/Button'
 import { FailureAlert } from '../../components/FailureAlert'
 import { Loading } from '../../components/Loading'
 import { Panel } from '../../components/Panel'
-import { pageUrl } from '../../lib/query'
+import { paths } from '../../lib/paths'
 import { ExecutionDetail } from './ExecutionDetail'
 
 type State =
   | { status: 'loading' }
-  | { status: 'ready'; execution: Execution; refreshing: boolean }
+  | { status: 'ready'; execution: Execution | HistoryEntry; refreshing: boolean }
   | { status: 'failed'; failure: ApiFailure }
 
 export function ExecutionView({ database, executionId }: { database: DatabaseSummary; executionId: ID }) {
@@ -71,7 +72,7 @@ export function ExecutionView({ database, executionId }: { database: DatabaseSum
       <ExecutionDetail execution={x} />
       {database.access === 'edit' && (
         <p className="mt-3 mb-0">
-          <a href={pageUrl('/migration/', { database: database.id, draft: x.draft_id })}>Buka draft asal</a>
+          <Link to={paths.draft(database.id, x.draft_id)}>Buka draft asal</Link>
         </p>
       )}
     </Panel>

@@ -14,7 +14,7 @@ import { FormField } from '../../components/FormField'
 import { MutationAlert } from '../../components/MutationAlert'
 import { Panel } from '../../components/Panel'
 import { describeFailure, type MutationFailure } from '../../lib/mutation'
-import { useBeforeUnload } from '../../lib/unload'
+import { LeaveGuard } from '../../components/LeaveGuard'
 
 type SslMode = ConnectionInput['ssl_mode']
 type Role = 'executor' | 'preparer'
@@ -154,7 +154,6 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
   const [confirmClear, setConfirmClear] = useState(false)
 
   const changed = (Object.keys(form) as (keyof Form)[]).filter((k) => form[k] !== initial[k])
-  useBeforeUnload(changed.length > 0)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -299,6 +298,8 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
   }
 
   return (
+    <>
+      <LeaveGuard when={changed.length > 0} />
     <Panel
       title={connection ? <>Edit connection: {connection.name}</> : 'Tambah connection'}
       actions={
@@ -419,5 +420,6 @@ export function ConnectionForm({ connection, onSaved, onClose }: Props) {
         </p>
       </ConfirmDialog>
     </Panel>
+    </>
   )
 }

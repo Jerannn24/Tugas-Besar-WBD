@@ -6,22 +6,29 @@ export const USERS: Record<string, User> = {
   demo_editor: { id: '10000000-0000-4000-8000-000000000003', username: 'demo_editor', is_admin: false, is_active: true },
   demo_outsider: { id: '10000000-0000-4000-8000-000000000004', username: 'demo_outsider', is_admin: false, is_active: true },
   demo_disabled: { id: '10000000-0000-4000-8000-000000000005', username: 'demo_disabled', is_admin: false, is_active: false },
+  operator: { id: '00000020-0000-4000-8000-000000000020', username: 'operator', is_admin: false, is_active: true },
 }
 
 export const TARGETS = {
   demo_main: { id: '30000000-0000-4000-8000-000000000001', name: 'demo_main' },
   demo_second: { id: '30000000-0000-4000-8000-000000000002', name: 'demo_second' },
   demo_readonly: { id: '30000000-0000-4000-8000-000000000004', name: 'demo_readonly' },
+  demo_m2: { id: '00000001-0000-4000-8000-000000000001', name: 'demo_m2' },
 } satisfies Record<string, { id: ID; name: string }>
 
 export const DATABASES_BY_USER: Record<string, DatabaseSummary[]> = {
   demo_admin: [], 
-  demo_viewer: [{ ...TARGETS.demo_main, access: 'view', execution_ready: true }],
+  demo_viewer: [
+    { ...TARGETS.demo_main, access: 'view', execution_ready: true },
+    { ...TARGETS.demo_m2, access: 'view', execution_ready: true },
+  ],
   demo_editor: [
     { ...TARGETS.demo_main, access: 'edit', execution_ready: true },
     { ...TARGETS.demo_second, access: 'view', execution_ready: false },
     { ...TARGETS.demo_readonly, access: 'edit', execution_ready: false },
+    { ...TARGETS.demo_m2, access: 'edit', execution_ready: true },
   ],
+  operator: [{ ...TARGETS.demo_m2, access: 'edit', execution_ready: true }],
   demo_outsider: [],
   demo_disabled: [], 
 }

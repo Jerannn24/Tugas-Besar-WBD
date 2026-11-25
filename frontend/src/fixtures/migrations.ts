@@ -2,6 +2,7 @@ import type { TransportRequest } from '../api/client'
 import type { Draft, Execution, ExecutionStatus, ID } from '../api/types'
 import { DATABASES_BY_USER, TARGETS, USERS } from './data'
 import { fail, ok, parseBody } from './http'
+import { hasHistoryQuery, legacyAttemptPage } from './history'
 
 export const NETWORK_DROP = Symbol('network-drop')
 
@@ -212,6 +213,14 @@ export function handleMigrationRequest(
 
   switch (key) {
     case 'GET migrations':
+      if (hasHistoryQuery(req)) {
+        result = legacyAttemptPage(
+          req,
+          databaseId,
+          state.executions.filter((x) => x.database_id === databaseId).map(executionView),
+        )
+        break
+      }
       result = ok({
         items: state.executions
           .filter((x) => x.database_id === databaseId)

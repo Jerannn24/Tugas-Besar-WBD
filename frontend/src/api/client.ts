@@ -196,6 +196,19 @@ const GENERIC_MESSAGES: Record<string, string> = {
   DATABASE_BUSY: 'Database target sedang menjalankan migration. Coba lagi nanti.',
   TARGET_UNAVAILABLE: 'Database target tidak dapat dihubungi.',
   INTERNAL_ERROR: 'Terjadi kesalahan pada server.',
+  INVALID_REQUEST: 'Permintaan tidak valid.',
+  LEADER_REQUIRED: 'Hanya leader group yang dapat menyetujui proposal ini.',
+  REQUEST_CONFLICT: 'Request ID sudah dipakai untuk permintaan lain.',
+  APPROVAL_REQUIRED: 'Proposal belum mendapat semua approval yang wajib.',
+  REVIEW_STALE: 'Review sudah usang. Muat ulang proposal untuk meninjau kembali.',
+  HISTORY_CONFLICT: 'Riwayat migration berubah. Muat ulang sebelum melanjutkan.',
+  VALIDATION_FAILED: 'Input tidak valid.',
+  SQL_UNSUPPORTED: 'SQL tidak didukung.',
+  MIGRATION_IRREVERSIBLE: 'Migration tidak dapat dibatalkan.',
+  INVALID_MIGRATION_ORDER: 'Urutan migration tidak valid.',
+  BATCH_UNSAFE: 'Konfigurasi batch tidak aman.',
+  QUEUE_UNAVAILABLE: 'Antrean belum menerima job. Kirim ulang untuk mencoba lagi.',
+  NOT_IMPLEMENTED: 'Fitur ini belum tersedia di backend.',
 }
 
 export function errorMessage(failure: ApiFailure): string {
