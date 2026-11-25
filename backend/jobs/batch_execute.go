@@ -568,16 +568,7 @@ func (s *Service) checkBatchLeaseAndTargetBlock(ctx context.Context, claim *Clai
 			           OR (
 			               (j.status IN ('unknown', 'partial', 'partially_reverted')
 			                OR j.execution_status IN ('unknown', 'partial', 'partially_reverted'))
-			               AND NOT EXISTS (
-			                   SELECT 1 FROM app.jobs res
-			                   WHERE (res.execution_id = j.execution_id OR res.source_execution_id = j.execution_id)
-			                     AND res.target_id = j.target_id
-			                     AND res.database_id = j.database_id
-			                     AND res.direction = j.direction
-			                     AND res.status = 'succeeded'
-			                     AND res.execution_status = 'succeeded'
-			                     AND NOT res.blocks_database
-			               )
+			               AND NOT ` + resolvedBlocker("j") + `
 			           )
 			           OR EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
 			                  AND (a.sql_entered OR EXISTS (
@@ -753,16 +744,7 @@ func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, gate
 			           OR (
 			               (j.status IN ('unknown', 'partial', 'partially_reverted')
 			                OR j.execution_status IN ('unknown', 'partial', 'partially_reverted'))
-			               AND NOT EXISTS (
-			                   SELECT 1 FROM app.jobs res
-			                   WHERE (res.execution_id = j.execution_id OR res.source_execution_id = j.execution_id)
-			                     AND res.target_id = j.target_id
-			                     AND res.database_id = j.database_id
-			                     AND res.direction = j.direction
-			                     AND res.status = 'succeeded'
-			                     AND res.execution_status = 'succeeded'
-			                     AND NOT res.blocks_database
-			               )
+			               AND NOT ` + resolvedBlocker("j") + `
 			           )
 			           OR EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
 			                  AND (a.sql_entered OR EXISTS (
