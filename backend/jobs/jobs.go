@@ -168,20 +168,19 @@ func (s *Service) EnqueueTx(
 			Message: "target binding has changed",
 		}
 	}
-	// Proposal identity is immutable, but lock the row against deletion until the
-	// job referencing it has been inserted. Snapshot encodings are owned by the
-	// proposal producer and are not interchangeable with the job's representation.
-	var proposalDatabaseID, proposalMigrationID, proposalAction string
+	// Serialize proposal admission with workflow review and other enqueues.
+	// Snapshot encodings belong to the proposal producer.
+	var proposalDatabaseID, proposalMigrationID, proposalAction, proposalStatus string
 	var proposalRevision int
 	var proposalSourceExecutionID *string
 	err = tx.QueryRowContext(ctx, `
 		SELECT database_id::text, migration_id::text, revision, action,
-		       source_execution_id::text
+		       source_execution_id::text, status
 		FROM app.migration_proposals
 		WHERE id = $1
-		FOR KEY SHARE
+		FOR UPDATE
 	`, in.ProposalID).Scan(&proposalDatabaseID, &proposalMigrationID, &proposalRevision,
-		&proposalAction, &proposalSourceExecutionID)
+		&proposalAction, &proposalSourceExecutionID, &proposalStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return executioncontract.EnqueueResult{}, executioncontract.ContractError{
 			Code:    "NOT_FOUND",
@@ -195,6 +194,44 @@ func (s *Service) EnqueueTx(
 		proposalRevision != in.Revision || proposalAction != string(in.Action) ||
 		!sameID(proposalSourceExecutionID, in.SourceExecutionID) {
 		return executioncontract.EnqueueResult{}, makeRequestConflict("request intent differs from proposal")
+	}
+
+	// Only a stale, pre-dispatch failure followed by a genuinely new approved
+	// round permits another job. Every other prior job remains a blocker.
+	var blocked bool
+	err = tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM app.jobs j
+			WHERE j.proposal_id = $1 AND (
+				j.status = 'failed' AND j.execution_status = 'failed'
+				AND j.error_code = 'REVIEW_STALE' AND NOT j.blocks_database
+				AND $2 = 'approved'
+				AND EXISTS (
+					SELECT 1 FROM app.migration_proposal_approvals a
+					WHERE a.proposal_id = j.proposal_id
+					  AND a.approval_round = (SELECT max(x.approval_round) FROM app.migration_proposal_approvals x WHERE x.proposal_id = j.proposal_id)
+					  AND a.created_at > j.created_at
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM app.migration_proposal_approvals a
+					WHERE a.proposal_id = j.proposal_id
+					  AND a.approval_round = (SELECT max(x.approval_round) FROM app.migration_proposal_approvals x WHERE x.proposal_id = j.proposal_id)
+					  AND (a.status <> 'approved' OR a.created_at <= j.created_at)
+				)
+				AND NOT EXISTS (SELECT 1 FROM app.job_dispatch_authorizations a WHERE a.job_id = j.id)
+				AND NOT EXISTS (SELECT 1 FROM app.job_batch_step_authorizations a WHERE a.job_id = j.id)
+				AND NOT EXISTS (
+					SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
+					  AND (a.sql_entered OR EXISTS (SELECT 1 FROM app.job_statement_evidence e WHERE e.attempt_id = a.id))
+				)
+			) IS NOT TRUE
+		)
+	`, in.ProposalID, proposalStatus).Scan(&blocked)
+	if err != nil {
+		return executioncontract.EnqueueResult{}, fmt.Errorf("query prior proposal jobs: %w", err)
+	}
+	if blocked {
+		return executioncontract.EnqueueResult{}, makeRequestConflict("proposal already has an execution job")
 	}
 
 	jobID := uuid.NewString()
