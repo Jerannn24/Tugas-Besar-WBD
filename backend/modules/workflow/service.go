@@ -72,6 +72,7 @@ type CreateInput struct {
 
 type serviceRepository interface {
 	LoadDraft(context.Context, uuid.UUID, uuid.UUID) (Snapshot, error)
+	sourceSnapshot(context.Context, uuid.UUID, uuid.UUID, int, string, *uuid.UUID, string) (Snapshot, error)
 	FingerprintForDatabase(context.Context, uuid.UUID) ([]uuid.UUID, [32]byte, error)
 	CreateProposal(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, int, string, *uuid.UUID, Snapshot, [32]byte, [32]byte, []byte) (uuid.UUID, error)
 	Submit(context.Context, uuid.UUID, uuid.UUID) (Proposal, error)
@@ -114,6 +115,9 @@ func (s *Service) Create(ctx context.Context, actor uuid.UUID, in CreateInput) (
 	if err != nil || !validAction(in.Action) {
 		return Proposal{}, ErrInvalidProposal
 	}
+	if in.Action != "apply" && in.SourceExecutionID == nil || in.Action == "apply" && in.SourceExecutionID != nil {
+		return Proposal{}, ErrInvalidProposal
+	}
 	if err = s.authorizer.RequireAccess(ctx, actor, databaseID, authz.AccessEdit); err != nil {
 		return Proposal{}, err
 	}
@@ -128,6 +132,12 @@ func (s *Service) Create(ctx context.Context, actor uuid.UUID, in CreateInput) (
 			return Proposal{}, ErrInvalidProposal
 		}
 		sourceExecutionID = &parsed
+	}
+	if sourceExecutionID != nil {
+		snapshot, err = s.repository.sourceSnapshot(ctx, databaseID, migrationID, snapshot.Revision, in.Action, sourceExecutionID, snapshot.Mode)
+		if err != nil {
+			return Proposal{}, err
+		}
 	}
 	snapshotHash, err := digest(snapshot)
 	if err != nil {
@@ -276,18 +286,31 @@ func (s *Service) Enqueue(ctx context.Context, actor, proposalID uuid.UUID, inpu
 	}
 	defer tx.Rollback()
 
+	// Lock the connection first, as draft edits and target reservations do.
+	var targetID sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT execution_target_id::text FROM app.database_connections
+		WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, databaseID).Scan(&targetID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return EnqueueOutput{}, ErrNotFound
+	}
+	if err != nil {
+		return EnqueueOutput{}, err
+	}
+	if !targetID.Valid {
+		return EnqueueOutput{}, executioncontract.ContractError{Code: "TARGET_UNAVAILABLE", Message: "Execution target is not ready", Retryable: true}
+	}
+
 	var status, action string
 	var revision int
-	var targetID sql.NullString
+	var proposalSource sql.NullString
 	var snapshotJSON []byte
 	var snapshotHash, approvalFingerprint []byte
 	err = tx.QueryRowContext(ctx, `SELECT p.status,p.action,p.revision,p.snapshot,p.snapshot_hash,p.approval_fingerprint,
-		c.execution_target_id::text
+		p.source_execution_id::text
 		FROM app.migration_proposals p
-		JOIN app.database_connections c ON c.id=p.database_id
 		WHERE p.id=$1 AND p.database_id=$2 AND p.migration_id=$3
 		FOR UPDATE OF p`, proposalID, databaseID, migrationID).
-		Scan(&status, &action, &revision, &snapshotJSON, &snapshotHash, &approvalFingerprint, &targetID)
+		Scan(&status, &action, &revision, &snapshotJSON, &snapshotHash, &approvalFingerprint, &proposalSource)
 	if err == sql.ErrNoRows {
 		return EnqueueOutput{}, ErrNotFound
 	}
@@ -297,27 +320,28 @@ func (s *Service) Enqueue(ctx context.Context, actor, proposalID uuid.UUID, inpu
 	if status != "approved" && status != "queued" {
 		return EnqueueOutput{}, ErrConflict
 	}
-	if !targetID.Valid {
-		return EnqueueOutput{}, executioncontract.ContractError{Code: "TARGET_UNAVAILABLE", Message: "Execution target is not ready", Retryable: true}
-	}
 	var draftRevision int
 	err = tx.QueryRowContext(ctx, `SELECT revision FROM app.migration_drafts
 		WHERE id=$1 AND database_id=$2 FOR UPDATE`, migrationID, databaseID).Scan(&draftRevision)
-	if err == sql.ErrNoRows || draftRevision != revision {
+	if errors.Is(err, sql.ErrNoRows) {
 		return EnqueueOutput{}, ErrProposalStale
 	}
 	if err != nil {
 		return EnqueueOutput{}, err
 	}
+	if draftRevision != revision {
+		return EnqueueOutput{}, ErrProposalStale
+	}
 
-	var fingerprint []byte
-	_ = tx.QueryRowContext(ctx, `SELECT approval_fingerprint
-		FROM app.migration_proposals WHERE id=$1`, proposalID).Scan(&fingerprint)
 	currentFingerprint, err := approvalFingerprintTx(ctx, tx, databaseID)
 	if err != nil {
 		return EnqueueOutput{}, err
 	}
-	if len(fingerprint) != 32 || !equalBytes(fingerprint, currentFingerprint[:]) {
+	if !equalBytes(approvalFingerprint, currentFingerprint[:]) {
+		if status == "queued" {
+			// A worker must fence the old job before reopening a queued proposal.
+			return EnqueueOutput{}, ErrProposalStale
+		}
 		_, err = tx.ExecContext(
 			ctx,
 			`UPDATE app.migration_proposals
@@ -336,18 +360,7 @@ func (s *Service) Enqueue(ctx context.Context, actor, proposalID uuid.UUID, inpu
 		return EnqueueOutput{}, ErrProposalStale
 	}
 	var required, approved int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(DISTINCT gr.group_id),
-		COUNT(DISTINCT gr.group_id) FILTER (WHERE EXISTS (
-			SELECT 1 FROM app.migration_proposal_approvals a
-			WHERE a.proposal_id=$1 AND a.group_id=gr.group_id
-			  AND a.status='approved'
-			  AND a.approval_round=(SELECT MAX(a2.approval_round)
-				FROM app.migration_proposal_approvals a2
-				WHERE a2.proposal_id=$1 AND a2.group_id=gr.group_id)
-		))
-		FROM app.group_database_grants gr
-		WHERE gr.database_id = $2
-			AND gr.access IN ('view', 'edit')`, proposalID, databaseID).Scan(&required, &approved)
+	err = tx.QueryRowContext(ctx, currentApprovalCountsQuery, proposalID, databaseID, nil).Scan(&required, &approved)
 	if err != nil {
 		return EnqueueOutput{}, err
 	}
@@ -356,7 +369,7 @@ func (s *Service) Enqueue(ctx context.Context, actor, proposalID uuid.UUID, inpu
 	}
 
 	snapshotHashHex := shaHex(snapshotHash)
-	approvalFingerprintHex := shaHex(fingerprint)
+	approvalFingerprintHex := shaHex(approvalFingerprint)
 	direction := executioncontract.Up
 	if action == string(executioncontract.Rollback) || action == string(executioncontract.Compensate) {
 		direction = executioncontract.Down
@@ -367,8 +380,29 @@ func (s *Service) Enqueue(ctx context.Context, actor, proposalID uuid.UUID, inpu
 		if parseErr != nil {
 			return EnqueueOutput{}, ErrInvalidProposal
 		}
-		value := parsed.String()
-		sourceExecutionID = &value
+		if !proposalSource.Valid || parsed.String() != proposalSource.String {
+			return EnqueueOutput{}, ErrInvalidProposal
+		}
+	}
+	if proposalSource.Valid {
+		sourceExecutionID = &proposalSource.String
+	}
+	if action == string(executioncontract.Resume) {
+		if sourceExecutionID == nil {
+			return EnqueueOutput{}, ErrInvalidProposal
+		}
+		var sourceDirection string
+		err = tx.QueryRowContext(ctx, `SELECT direction FROM app.jobs WHERE execution_id=$1 AND database_id=$2
+			AND target_id=$3 AND migration_id=$4 AND revision=$5 AND mode='batch'
+			ORDER BY created_at,id LIMIT 1`,
+			*sourceExecutionID, databaseID, targetID.String, migrationID, revision).Scan(&sourceDirection)
+		if errors.Is(err, sql.ErrNoRows) {
+			return EnqueueOutput{}, ErrInvalidProposal
+		}
+		if err != nil {
+			return EnqueueOutput{}, err
+		}
+		direction = executioncontract.Direction(sourceDirection)
 	}
 	var snapshot executioncontract.Draft
 	if err := json.Unmarshal(snapshotJSON, &snapshot); err != nil {
@@ -400,49 +434,13 @@ func shaHex(value []byte) string {
 }
 
 func approvalFingerprintTx(ctx context.Context, tx *sql.Tx, databaseID uuid.UUID) ([32]byte, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT g.id,g.leader_user_id,m.user_id
-		FROM app.groups g
-		JOIN app.group_database_grants gr ON gr.group_id=g.id
-		LEFT JOIN app.group_memberships m ON m.group_id=g.id
-		WHERE gr.database_id=$1
-		ORDER BY g.id,m.user_id`, databaseID)
+	rows, err := tx.QueryContext(ctx, approvalRosterQuery, databaseID)
 	if err != nil {
 		return [32]byte{}, err
 	}
 	defer rows.Close()
-	type roster struct {
-		Group   string   `json:"group"`
-		Leader  *string  `json:"leader"`
-		Members []string `json:"members"`
-	}
-	var all []roster
-	var current *roster
-	for rows.Next() {
-		var group uuid.UUID
-		var leader, member sql.NullString
-		if err := rows.Scan(&group, &leader, &member); err != nil {
-			return [32]byte{}, err
-		}
-		if current == nil || current.Group != group.String() {
-			all = append(all, roster{Group: group.String()})
-			current = &all[len(all)-1]
-		}
-		if leader.Valid {
-			value := leader.String
-			current.Leader = &value
-		}
-		if member.Valid {
-			current.Members = append(current.Members, member.String)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return [32]byte{}, err
-	}
-	raw, err := json.Marshal(all)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	return sha256.Sum256(raw), nil
+	_, fingerprint, err := scanFingerprintRows(rows)
+	return fingerprint, err
 }
 
 func validateSnapshot(snapshot Snapshot) executioncontract.Validation {

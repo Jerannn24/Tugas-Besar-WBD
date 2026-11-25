@@ -53,6 +53,27 @@ func (r *Repository) LoadDraft(ctx context.Context, databaseID, migrationID uuid
 	return snapshot, nil
 }
 
+func (r *Repository) sourceSnapshot(ctx context.Context, databaseID, migrationID uuid.UUID, revision int, action string, source *uuid.UUID, mode string) (Snapshot, error) {
+	var valid bool
+	var raw []byte
+	err := r.db.QueryRow(ctx, `SELECT COALESCE(app.workflow_source_valid($1, d.execution_target_id, $2, $3, $4, $5, $6), false),
+		(SELECT j.snapshot FROM app.jobs j WHERE j.execution_id=$5 AND j.database_id=$1
+		 AND j.target_id=d.execution_target_id AND j.migration_id=$2 AND j.revision=$3 ORDER BY j.created_at,j.id LIMIT 1)
+		FROM app.database_connections d WHERE d.id=$1 AND d.deleted_at IS NULL`,
+		databaseID, migrationID, revision, action, source, mode).Scan(&valid, &raw)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if !valid {
+		return Snapshot{}, ErrInvalidProposal
+	}
+	var snapshot Snapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return Snapshot{}, ErrInvalidProposal
+	}
+	return snapshot, nil
+}
+
 func (r *Repository) Fingerprint(ctx context.Context) ([]uuid.UUID, [32]byte, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT
@@ -79,11 +100,7 @@ func (r *Repository) Fingerprint(ctx context.Context) ([]uuid.UUID, [32]byte, er
 	return scanFingerprintRows(rows)
 }
 
-func (r *Repository) FingerprintForDatabase(
-	ctx context.Context,
-	databaseID uuid.UUID,
-) ([]uuid.UUID, [32]byte, error) {
-	rows, err := r.db.Query(ctx, `
+const approvalRosterQuery = `
 		SELECT
 			group_row.id,
 			group_row.leader_user_id,
@@ -106,7 +123,49 @@ func (r *Repository) FingerprintForDatabase(
 			group_row.id,
 			grant_row.access,
 			membership.user_id
-	`, databaseID)
+	`
+
+const currentApprovalCountsQuery = `
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (
+				WHERE latest_approval.status = 'approved'
+					AND ($3::timestamptz IS NULL OR latest_approval.approved_at <= $3)
+					AND latest_approval.leader_user_id = group_row.leader_user_id
+					AND group_row.leader_user_id IS NOT NULL
+					AND leader_user.is_active
+					AND EXISTS (
+						SELECT 1
+						FROM app.group_memberships membership
+						WHERE membership.group_id = group_row.id
+							AND membership.user_id = group_row.leader_user_id
+					)
+			)
+		FROM app.group_database_grants grant_row
+		JOIN app.groups group_row
+			ON group_row.id = grant_row.group_id
+		LEFT JOIN app.users leader_user
+			ON leader_user.id = group_row.leader_user_id
+		LEFT JOIN LATERAL (
+			SELECT
+				approval.status,
+				approval.leader_user_id,
+				approval.approved_at
+			FROM app.migration_proposal_approvals approval
+			WHERE approval.proposal_id = $1
+				AND approval.group_id = group_row.id
+			ORDER BY approval.approval_round DESC
+			LIMIT 1
+		) latest_approval ON TRUE
+		WHERE grant_row.database_id = $2
+			AND grant_row.access IN ('view', 'edit')
+	`
+
+func (r *Repository) FingerprintForDatabase(
+	ctx context.Context,
+	databaseID uuid.UUID,
+) ([]uuid.UUID, [32]byte, error) {
+	rows, err := r.db.Query(ctx, approvalRosterQuery, databaseID)
 
 	if err != nil {
 		return nil, [32]byte{}, err
@@ -116,9 +175,12 @@ func (r *Repository) FingerprintForDatabase(
 	return scanFingerprintRows(rows)
 }
 
-
 func scanFingerprintRows(
-	rows pgx.Rows,
+	rows interface {
+		Next() bool
+		Scan(...any) error
+		Err() error
+	},
 ) ([]uuid.UUID, [32]byte, error) {
 	var (
 		all     []fingerprintRoster
@@ -652,39 +714,7 @@ func (r *Repository) Approve(
 	// Hitung approval terbaru untuk setiap grup secara independen.
 	var required, approved int
 
-	err = tx.QueryRow(ctx, `
-		SELECT
-			COUNT(*),
-			COUNT(*) FILTER (
-				WHERE latest_approval.status = 'approved'
-					AND latest_approval.leader_user_id = group_row.leader_user_id
-					AND group_row.leader_user_id IS NOT NULL
-					AND leader_user.is_active
-					AND EXISTS (
-						SELECT 1
-						FROM app.group_memberships membership
-						WHERE membership.group_id = group_row.id
-							AND membership.user_id = group_row.leader_user_id
-					)
-			)
-		FROM app.group_database_grants grant_row
-		JOIN app.groups group_row
-			ON group_row.id = grant_row.group_id
-		LEFT JOIN app.users leader_user
-			ON leader_user.id = group_row.leader_user_id
-		LEFT JOIN LATERAL (
-			SELECT
-				approval.status,
-				approval.leader_user_id
-			FROM app.migration_proposal_approvals approval
-			WHERE approval.proposal_id = $1
-				AND approval.group_id = group_row.id
-			ORDER BY approval.approval_round DESC
-			LIMIT 1
-		) latest_approval ON TRUE
-		WHERE grant_row.database_id = $2
-			AND grant_row.access IN ('view', 'edit')
-	`, proposalID, databaseID).Scan(&required, &approved)
+	err = tx.QueryRow(ctx, currentApprovalCountsQuery, proposalID, databaseID, nil).Scan(&required, &approved)
 
 	if err != nil {
 		return Proposal{}, err
@@ -770,30 +800,7 @@ func fingerprintTx(
 	tx pgx.Tx,
 	databaseID uuid.UUID,
 ) ([]uuid.UUID, [32]byte, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT
-			group_row.id,
-			group_row.leader_user_id,
-			COALESCE(leader_user.is_active, FALSE),
-			grant_row.access,
-			membership.user_id,
-			COALESCE(member_user.is_active, FALSE)
-		FROM app.groups group_row
-		JOIN app.group_database_grants grant_row
-			ON grant_row.group_id = group_row.id
-		LEFT JOIN app.users leader_user
-			ON leader_user.id = group_row.leader_user_id
-		LEFT JOIN app.group_memberships membership
-			ON membership.group_id = group_row.id
-		LEFT JOIN app.users member_user
-			ON member_user.id = membership.user_id
-		WHERE grant_row.database_id = $1
-			AND grant_row.access IN ('view', 'edit')
-		ORDER BY
-			group_row.id,
-			grant_row.access,
-			membership.user_id
-	`, databaseID)
+	rows, err := tx.Query(ctx, approvalRosterQuery, databaseID)
 
 	if err != nil {
 		return nil, [32]byte{}, err
