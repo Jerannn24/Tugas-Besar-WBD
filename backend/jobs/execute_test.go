@@ -758,13 +758,14 @@ func TestExecuteStandardJob_RealReviewChangesBeforeAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	proposalID := uuid.MustParse(proposal.ProposalID)
-	if _, err := reviews.Submit(ctx, actor, proposalID); err != nil {
+	if _, err := reviews.Submit(ctx, actor, proposalID, proposal.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if approved, err := reviews.Approve(ctx, actor, proposalID, groupID, 1); err != nil || approved.Status != "approved" {
 		t.Fatalf("approve: status=%q err=%v", approved.Status, err)
 	}
-	job, err := reviews.Enqueue(ctx, actor, proposalID, workflow.EnqueueInput{RequestID: uuid.NewString()})
+	input := workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: proposal.Revision}
+	job, err := reviews.Enqueue(ctx, actor, proposalID, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -803,12 +804,35 @@ func TestExecuteStandardJob_RealReviewChangesBeforeAuthorization(t *testing.T) {
 	if err != nil || code != "REVIEW_STALE" || attemptStatus != "failed" || entered || authorized || approvalStatus != "pending_review" {
 		t.Fatalf("stale state: code=%s attempt=%s entered=%v authorized=%v review=%s err=%v", code, attemptStatus, entered, authorized, approvalStatus, err)
 	}
+	exec(`UPDATE app.group_database_grants SET access='edit' WHERE group_id=$1 AND database_id=$2`, groupID, fix.dbID)
+	replay, err := reviews.Enqueue(ctx, actor, proposalID, input)
+	if err != nil || !replay.Replayed || replay.JobID != job.JobID || replay.Status != executioncontract.Failed {
+		t.Fatalf("stale replay: result=%+v err=%v", replay, err)
+	}
+	different := input
+	different.Revision++
+	if _, err := reviews.Enqueue(ctx, actor, proposalID, different); !errors.Is(err, executioncontract.ErrRequestConflict) {
+		t.Fatalf("changed revision replay: %v", err)
+	}
+	different = input
+	different.RequestID = uuid.NewString()
+	if _, err := reviews.Enqueue(ctx, actor, proposalID, different); !errors.Is(err, workflow.ErrConflict) {
+		t.Fatalf("pending review admitted a new request: %v", err)
+	}
+	if err := env.platformDB.QueryRowContext(ctx, `SELECT status FROM app.migration_proposals WHERE id=$1`, proposalID).Scan(&approvalStatus); err != nil || approvalStatus != "pending_review" {
+		t.Fatalf("replay changed review state: status=%s err=%v", approvalStatus, err)
+	}
+	exec(`UPDATE app.group_database_grants SET access='view' WHERE group_id=$1 AND database_id=$2`, groupID, fix.dbID)
 	var exists bool
 	if err := env.targetExecDB.QueryRowContext(ctx, "SELECT to_regclass($1) IS NOT NULL", "managed."+table).Scan(&exists); err != nil || exists {
 		t.Fatalf("stale SQL must not run: table=%v err=%v", exists, err)
 	}
 	if approved, err := reviews.Approve(ctx, actor, proposalID, groupID, 1); err != nil || approved.Status != "approved" {
 		t.Fatalf("approve fresh round: status=%q err=%v", approved.Status, err)
+	}
+	exec(`UPDATE app.group_database_grants SET access='edit' WHERE group_id=$1 AND database_id=$2`, groupID, fix.dbID)
+	if _, err := reviews.Enqueue(ctx, actor, proposalID, input); !errors.Is(err, executioncontract.ErrRequestConflict) {
+		t.Fatalf("reapproved changed fingerprint replay: %v", err)
 	}
 }
 

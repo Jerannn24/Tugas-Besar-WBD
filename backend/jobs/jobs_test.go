@@ -318,24 +318,9 @@ func TestEnqueueTx_PersistAndGetJob(t *testing.T) {
 
 func TestEnqueueTx_ConcurrentRequest(t *testing.T) {
 	platformDB, ownerDB := testDBs(t)
-	f := createFixture(t, platformDB, ownerDB)
 	svc := New(platformDB)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	req := executioncontract.EnqueueRequest{
-		DatabaseID:          f.dbID,
-		TargetID:            f.targetID,
-		ProposalID:          f.proposalID,
-		MigrationID:         f.draftID,
-		Revision:            1,
-		ActorID:             f.actorID,
-		Action:              executioncontract.Apply,
-		Direction:           executioncontract.Up,
-		Snapshot:            f.snapshot,
-		SnapshotHash:        f.hash,
-		ApprovalFingerprint: "fingerprint_replay",
-	}
 
 	for _, conflict := range []bool{false, true} {
 		name := "replay"
@@ -343,6 +328,20 @@ func TestEnqueueTx_ConcurrentRequest(t *testing.T) {
 			name = "conflict"
 		}
 		t.Run(name, func(t *testing.T) {
+			f := createFixture(t, platformDB, ownerDB)
+			req := executioncontract.EnqueueRequest{
+				DatabaseID:          f.dbID,
+				TargetID:            f.targetID,
+				ProposalID:          f.proposalID,
+				MigrationID:         f.draftID,
+				Revision:            1,
+				ActorID:             f.actorID,
+				Action:              executioncontract.Apply,
+				Direction:           executioncontract.Up,
+				Snapshot:            f.snapshot,
+				SnapshotHash:        f.hash,
+				ApprovalFingerprint: "fingerprint_replay",
+			}
 			first := req
 			first.RequestID = uuid.NewString()
 			second := first

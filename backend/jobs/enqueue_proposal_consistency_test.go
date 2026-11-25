@@ -145,6 +145,13 @@ func TestEnqueueTxBlocksDuplicateProposalExecution(t *testing.T) {
 	exec(`INSERT INTO app.migration_proposal_approvals(proposal_id,group_id,approval_round,leader_user_id) VALUES ($1,$2,2,$3)`, f.proposalID, group, f.actorID)
 	exec(`UPDATE app.migration_proposal_approvals SET status='approved' WHERE proposal_id=$1 AND group_id=$2 AND approval_round=2`, f.proposalID, group)
 	exec(`UPDATE app.migration_proposals SET status='approved' WHERE id=$1`, f.proposalID)
+	exec(`SAVEPOINT clean_failure`)
+	exec(`UPDATE app.jobs SET error_code='SQL_FAILED' WHERE id=$1`, first.JobID)
+	clean, err := svc.EnqueueTx(ctx, tx, other)
+	if err != nil || clean.Replayed || clean.JobID == first.JobID {
+		t.Fatalf("clean failure with new approval: result=%+v err=%v", clean, err)
+	}
+	exec(`ROLLBACK TO SAVEPOINT clean_failure`)
 	second, err := svc.EnqueueTx(ctx, tx, other)
 	if err != nil || second.Replayed || second.JobID == first.JobID {
 		t.Fatalf("new approval round: result=%+v err=%v", second, err)
@@ -152,6 +159,11 @@ func TestEnqueueTxBlocksDuplicateProposalExecution(t *testing.T) {
 	replay, err := svc.EnqueueTx(ctx, tx, req)
 	if err != nil || !replay.Replayed || replay.JobID != first.JobID {
 		t.Fatalf("original replay: result=%+v err=%v", replay, err)
+	}
+	changed := req
+	changed.Snapshot.Title = "different snapshot"
+	if _, err := svc.EnqueueTx(ctx, tx, changed); !errors.Is(err, executioncontract.ErrRequestConflict) {
+		t.Fatalf("changed snapshot replay: %v", err)
 	}
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM app.jobs WHERE proposal_id=$1`, f.proposalID).Scan(&count); err != nil || count != 2 {

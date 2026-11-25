@@ -79,6 +79,10 @@ func (s *Service) EnqueueTx(
 			direction = executioncontract.Up
 		}
 	}
+	snapshotBytes, err := json.Marshal(in.Snapshot)
+	if err != nil {
+		return executioncontract.EnqueueResult{}, fmt.Errorf("marshal snapshot: %w", err)
+	}
 
 	// Lock the connection before looking up the request: a missing job row cannot be locked.
 	var boundTarget sql.NullString
@@ -107,18 +111,19 @@ func (s *Service) EnqueueTx(
 		oldSnapshotHash        string
 		oldApprovalFingerprint *string
 		oldStatus              string
+		oldSnapshotMatches     bool
 	)
 
-	err := tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 		SELECT id, execution_id, proposal_id, database_id, target_id, actor_id,
 		       migration_id, revision, action, direction, source_execution_id,
-		       snapshot_hash, approval_fingerprint, status
+		       snapshot_hash, approval_fingerprint, status, snapshot = $3::jsonb
 		FROM app.jobs
 		WHERE database_id = $1 AND request_id = $2
-	`, in.DatabaseID, in.RequestID).Scan(
+	`, in.DatabaseID, in.RequestID, snapshotBytes).Scan(
 		&oldID, &oldExecutionID, &oldProposalID, &oldDatabaseID, &oldTargetID, &oldActorID,
 		&oldMigrationID, &oldRevision, &oldAction, &oldDirection, &oldSourceExecutionID,
-		&oldSnapshotHash, &oldApprovalFingerprint, &oldStatus,
+		&oldSnapshotHash, &oldApprovalFingerprint, &oldStatus, &oldSnapshotMatches,
 	)
 
 	if err == nil {
@@ -133,6 +138,7 @@ func (s *Service) EnqueueTx(
 			oldRevision != in.Revision ||
 			oldAction != string(in.Action) ||
 			oldDirection != string(direction) ||
+			!oldSnapshotMatches ||
 			oldSnapshotHash != in.SnapshotHash ||
 			oldFingerprint != in.ApprovalFingerprint ||
 			!sameID(oldSourceExecutionID, in.SourceExecutionID) {
@@ -196,33 +202,65 @@ func (s *Service) EnqueueTx(
 		return executioncontract.EnqueueResult{}, makeRequestConflict("request intent differs from proposal")
 	}
 
-	// Only a stale, pre-dispatch failure followed by a genuinely new approved
-	// round permits another job. Every other prior job remains a blocker.
+	// A new approved round may follow only a proven zero-commit failure.
 	var blocked bool
 	err = tx.QueryRowContext(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM app.jobs j
 			WHERE j.proposal_id = $1 AND (
 				j.status = 'failed' AND j.execution_status = 'failed'
-				AND j.error_code = 'REVIEW_STALE' AND NOT j.blocks_database
-				AND $2 = 'approved'
+				AND NOT j.blocks_database AND $2 = 'approved'
 				AND EXISTS (
 					SELECT 1 FROM app.migration_proposal_approvals a
 					WHERE a.proposal_id = j.proposal_id
 					  AND a.approval_round = (SELECT max(x.approval_round) FROM app.migration_proposal_approvals x WHERE x.proposal_id = j.proposal_id)
-					  AND a.created_at > j.created_at
+					  AND a.created_at > COALESCE(j.finished_at, j.created_at)
 				)
 				AND NOT EXISTS (
 					SELECT 1 FROM app.migration_proposal_approvals a
 					WHERE a.proposal_id = j.proposal_id
 					  AND a.approval_round = (SELECT max(x.approval_round) FROM app.migration_proposal_approvals x WHERE x.proposal_id = j.proposal_id)
-					  AND (a.status <> 'approved' OR a.created_at <= j.created_at)
+					  AND (a.status <> 'approved' OR a.created_at <= COALESCE(j.finished_at, j.created_at))
 				)
-				AND NOT EXISTS (SELECT 1 FROM app.job_dispatch_authorizations a WHERE a.job_id = j.id)
-				AND NOT EXISTS (SELECT 1 FROM app.job_batch_step_authorizations a WHERE a.job_id = j.id)
+				AND NOT EXISTS (SELECT 1 FROM app.job_commit_proofs p WHERE p.job_id = j.id)
+				AND NOT EXISTS (SELECT 1 FROM app.job_batch_commit_proofs p WHERE p.job_id = j.id)
+				AND NOT EXISTS (SELECT 1 FROM app.migration_history_entries h WHERE h.job_id = j.id AND h.is_complete)
 				AND NOT EXISTS (
 					SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
-					  AND (a.sql_entered OR EXISTS (SELECT 1 FROM app.job_statement_evidence e WHERE e.attempt_id = a.id))
+					  AND (a.status <> 'failed' OR EXISTS (
+					    SELECT 1 FROM app.job_statement_evidence e WHERE e.attempt_id = a.id AND e.outcome = 'unknown'
+					  ))
+				)
+				AND (
+					(j.error_code = 'REVIEW_STALE'
+					 AND NOT EXISTS (SELECT 1 FROM app.job_dispatch_authorizations a WHERE a.job_id = j.id)
+					 AND NOT EXISTS (SELECT 1 FROM app.job_batch_step_authorizations a WHERE a.job_id = j.id)
+					 AND NOT EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
+					   AND (a.sql_entered OR EXISTS (SELECT 1 FROM app.job_statement_evidence e WHERE e.attempt_id = a.id))))
+					OR
+					(j.error_code IS DISTINCT FROM 'REVIEW_STALE'
+					 AND NOT EXISTS (
+					   SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
+					     AND (a.sql_entered OR EXISTS (SELECT 1 FROM app.job_statement_evidence e WHERE e.attempt_id = a.id))
+					     AND NOT EXISTS (SELECT 1 FROM app.job_dispatch_authorizations d WHERE d.job_id = j.id AND d.attempt_id = a.id)
+					     AND NOT EXISTS (SELECT 1 FROM app.job_batch_step_authorizations b WHERE b.job_id = j.id AND b.attempt_id = a.id)
+					 )
+					 AND NOT EXISTS (
+					   SELECT 1 FROM app.job_batch_step_authorizations b
+					   WHERE b.job_id = j.id AND NOT EXISTS (
+					     SELECT 1 FROM app.job_statement_evidence e
+					     WHERE e.attempt_id = b.attempt_id AND e.ordinal = b.ordinal
+					       AND e.batch_index = b.batch_index AND e.outcome = 'failed'
+					   )
+					 )
+					 AND NOT EXISTS (
+					   SELECT 1 FROM app.job_attempts a JOIN app.job_statement_evidence e ON e.attempt_id = a.id
+					   WHERE a.job_id = j.id AND j.mode = 'batch' AND NOT EXISTS (
+					     SELECT 1 FROM app.job_batch_step_authorizations b
+					     WHERE b.job_id = j.id AND b.attempt_id = a.id
+					       AND b.ordinal = e.ordinal AND b.batch_index = e.batch_index
+					   )
+					 ))
 				)
 			) IS NOT TRUE
 		)
@@ -245,11 +283,6 @@ func (s *Service) EnqueueTx(
 	mode := in.Snapshot.Mode
 	if mode == "" {
 		mode = executioncontract.Standard
-	}
-
-	snapshotBytes, err := json.Marshal(in.Snapshot)
-	if err != nil {
-		return executioncontract.EnqueueResult{}, fmt.Errorf("marshal snapshot: %w", err)
 	}
 
 	title := in.Snapshot.Title
