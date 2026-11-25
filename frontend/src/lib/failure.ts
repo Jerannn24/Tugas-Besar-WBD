@@ -1,4 +1,4 @@
-import type { ApiFailure } from '../api/client'
+import { canonicalCode, type ApiFailure } from '../api/client'
 
 export type FailureKind = 'expired' | 'invalid' | 'forbidden' | 'not_found' | 'unavailable' | 'error'
 
@@ -57,8 +57,8 @@ export function classifyWorkflowFailure(failure: ApiFailure): WorkflowFailure {
   if (failure.kind === 'network') return { ...base, kind: 'network' }
   if (failure.kind === 'invalid_response') return { ...base, kind: 'invalid_response' }
 
-  const { code, field_errors } = failure.error
-  const http = { ...base, code, fieldErrors: field_errors }
+  const code = canonicalCode(failure.error.code)
+  const http = { ...base, code, fieldErrors: failure.error.field_errors }
   if (code === 'CSRF_INVALID' || code === 'CSRF_FAILED') return { ...http, kind: 'csrf' }
 
   switch (failure.status) {

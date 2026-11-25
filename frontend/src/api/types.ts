@@ -26,10 +26,13 @@ export type SessionView = {
 
 export type CsrfView = { csrf_token: string };
 
-export type Group = { 
-  id: ID; 
-  name: string 
+export type Group = {
+  id: ID;
+  name: string;
+  leader_user_id: ID | null;
 };
+
+export type LeaderInput = { user_id: ID };
 
 export type GroupMembers = { 
   group_id: ID; 
@@ -163,6 +166,10 @@ export type Execution = {
     code: string; 
     message: string 
   } | null;
+  attempt_id?: ID;
+  execution_id?: ID;
+  source_execution_id?: ID;
+  reverts_execution_id?: ID;
 };
 
 export type ApiErrorBody = ApiError['error'];
@@ -218,11 +225,6 @@ export type DraftPatchInput = {
   title: string; 
   sql: string; 
   revision: number 
-};
-
-export type ExecuteInput = { 
-  revision: number; 
-  request_id: string 
 };
 
 export type DecimalString = string;
@@ -329,6 +331,7 @@ export type JobAccepted = {
   database_id: ID;
   status: JobStatus;
   status_url: string;
+  replayed?: boolean;
 };
 
 export type JobView = JobAccepted & {
@@ -443,7 +446,11 @@ export type HistoryAttemptRow = {
   sql_entered: boolean | null;
   statements: HistoryStatement[];
   commit: HistoryEntry | null;
+  is_active_head: boolean;
+  allowed_actions: AllowedAction[];
 };
+
+export type HistoryPage = CursorPage<HistoryAttemptRow> & { active_head_execution_id: ID | null };
 
 export type DraftInputM2 = {
   title: string;
