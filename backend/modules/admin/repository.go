@@ -13,10 +13,11 @@ import (
 )
 
 var (
-	ErrInvalidInput = errors.New("invalid input")
-	ErrNotFound     = errors.New("not found")
-	ErrConflict     = errors.New("conflict")
-	ErrLastAdmin    = errors.New("last active admin")
+	ErrInvalidInput  = errors.New("invalid input")
+	ErrNotFound      = errors.New("not found")
+	ErrConflict      = errors.New("conflict")
+	ErrLastAdmin     = errors.New("last active admin")
+	ErrInvalidLeader = errors.New("leader must be an active group member")
 )
 
 type Repository struct{ db *pgxpool.Pool }
@@ -31,8 +32,9 @@ type User struct {
 }
 
 type Group struct {
-	ID   uuid.UUID `json:"id"`
-	Name string    `json:"name"`
+	ID           uuid.UUID  `json:"id"`
+	Name         string     `json:"name"`
+	LeaderUserID *uuid.UUID `json:"leader_user_id"`
 }
 
 type Grant struct {
@@ -163,6 +165,11 @@ func (r *Repository) UpdateUser(ctx context.Context, id uuid.UUID, username, pas
 	if err := revokeUsers(ctx, tx, id); err != nil {
 		return User{}, err
 	}
+	if !nextActive {
+		if _, err := tx.Exec(ctx, `UPDATE app.groups SET leader_user_id=NULL,updated_at=clock_timestamp() WHERE leader_user_id=$1`, id); err != nil {
+			return User{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return User{}, err
 	}
@@ -170,7 +177,7 @@ func (r *Repository) UpdateUser(ctx context.Context, id uuid.UUID, username, pas
 }
 
 func (r *Repository) ListGroups(ctx context.Context) ([]Group, error) {
-	rows, err := r.db.Query(ctx, `SELECT id,name FROM app.groups ORDER BY name,id`)
+	rows, err := r.db.Query(ctx, `SELECT id,name,leader_user_id FROM app.groups ORDER BY name,id`)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +185,7 @@ func (r *Repository) ListGroups(ctx context.Context) ([]Group, error) {
 	result := make([]Group, 0)
 	for rows.Next() {
 		var item Group
-		if err := rows.Scan(&item.ID, &item.Name); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.LeaderUserID); err != nil {
 			return nil, err
 		}
 		result = append(result, item)
@@ -191,8 +198,8 @@ func (r *Repository) CreateGroup(ctx context.Context, name string) (Group, error
 		return Group{}, ErrInvalidInput
 	}
 	var item Group
-	err := r.db.QueryRow(ctx, `INSERT INTO app.groups(id,name) VALUES($1,$2) RETURNING id,name`, uuid.New(), name).
-		Scan(&item.ID, &item.Name)
+	err := r.db.QueryRow(ctx, `INSERT INTO app.groups(id,name) VALUES($1,$2) RETURNING id,name,leader_user_id`, uuid.New(), name).
+		Scan(&item.ID, &item.Name, &item.LeaderUserID)
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate key") {
 			return Group{}, ErrConflict
@@ -207,8 +214,8 @@ func (r *Repository) UpdateGroup(ctx context.Context, id uuid.UUID, name string)
 		return Group{}, ErrInvalidInput
 	}
 	var item Group
-	err := r.db.QueryRow(ctx, `UPDATE app.groups SET name=$2,updated_at=clock_timestamp() WHERE id=$1 RETURNING id,name`, id, name).
-		Scan(&item.ID, &item.Name)
+	err := r.db.QueryRow(ctx, `UPDATE app.groups SET name=$2,updated_at=clock_timestamp() WHERE id=$1 RETURNING id,name,leader_user_id`, id, name).
+		Scan(&item.ID, &item.Name, &item.LeaderUserID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Group{}, ErrNotFound
 	}
@@ -216,6 +223,57 @@ func (r *Repository) UpdateGroup(ctx context.Context, id uuid.UUID, name string)
 		if strings.Contains(err.Error(), "duplicate key") {
 			return Group{}, ErrConflict
 		}
+		return Group{}, err
+	}
+	return item, nil
+}
+
+func (r *Repository) SetGroupLeader(ctx context.Context, id uuid.UUID, leaderID *uuid.UUID) (Group, error) {
+	if id == uuid.Nil {
+		return Group{}, ErrInvalidInput
+	}
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return Group{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM app.groups WHERE id=$1)`, id).Scan(&exists); err != nil {
+		return Group{}, err
+	}
+	if !exists {
+		return Group{}, ErrNotFound
+	}
+	if leaderID != nil {
+		if *leaderID == uuid.Nil {
+			return Group{}, ErrInvalidInput
+		}
+		var member bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1
+				FROM app.group_memberships m
+				JOIN app.users u ON u.id = m.user_id
+				WHERE m.group_id=$1 AND m.user_id=$2 AND u.is_active
+			)`, id, *leaderID).Scan(&member); err != nil {
+			return Group{}, err
+		}
+		if !member {
+			return Group{}, ErrInvalidLeader
+		}
+	}
+
+	var item Group
+	if err := tx.QueryRow(ctx, `
+		UPDATE app.groups
+		SET leader_user_id=$2,updated_at=clock_timestamp()
+		WHERE id=$1
+		RETURNING id,name,leader_user_id`, id, leaderID).
+		Scan(&item.ID, &item.Name, &item.LeaderUserID); err != nil {
+		return Group{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return Group{}, err
 	}
 	return item, nil
@@ -375,6 +433,17 @@ func (r *Repository) replaceSet(ctx context.Context, groupID uuid.UUID, userIDs 
 		if _, err := tx.Exec(ctx, `INSERT INTO app.group_memberships(group_id,user_id) VALUES($1,$2)`, groupID, id); err != nil {
 			return nil, err
 		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE app.groups
+		SET leader_user_id=NULL,updated_at=clock_timestamp()
+		WHERE id=$1
+		  AND leader_user_id IS NOT NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM app.group_memberships
+		      WHERE group_id=$1 AND user_id=app.groups.leader_user_id
+		  )`, groupID); err != nil {
+		return nil, err
 	}
 	removed, added := diffMembers(oldMembers, userIDs)
 	if err := revokeUsers(ctx, tx, removed...); err != nil {

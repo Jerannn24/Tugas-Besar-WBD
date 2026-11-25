@@ -19,6 +19,7 @@ type groupRepository struct {
 	group        Group
 	users        []uuid.UUID
 	grants       []Grant
+	leader       *uuid.UUID
 	called       string
 	receivedID   uuid.UUID
 	receivedName string
@@ -37,6 +38,13 @@ func (r *groupRepository) UpdateGroup(_ context.Context, id uuid.UUID, name stri
 	r.called = "update group"
 	r.receivedID = id
 	r.receivedName = name
+	return r.group, r.err
+}
+func (r *groupRepository) SetGroupLeader(_ context.Context, id uuid.UUID, leader *uuid.UUID) (Group, error) {
+	r.called = "set leader"
+	r.receivedID = id
+	r.leader = leader
+	r.group.LeaderUserID = leader
 	return r.group, r.err
 }
 func (r *groupRepository) DeleteGroup(_ context.Context, id uuid.UUID) error {
@@ -73,6 +81,7 @@ func groupApp(repo serviceRepository) *fiber.App {
 	app.Get("/groups", h.listGroups)
 	app.Post("/groups", h.createGroup)
 	app.Patch("/groups/:group_id", h.updateGroup)
+	app.Put("/groups/:group_id/leader", h.setGroupLeader)
 	app.Delete("/groups/:group_id", h.deleteGroup)
 	app.Get("/groups/:group_id/members", h.members)
 	app.Put("/groups/:group_id/members", h.replaceMembers)
@@ -105,7 +114,7 @@ func TestGroupHandlersSuccess(t *testing.T) {
 	for _, tc := range []struct {
 		name, method, suffix, body string
 		status                     int
-	}{{"list groups", "GET", "", "", 200}, {"create group", "POST", "", `{"name":"Editors"}`, 201}, {"update group", "PATCH", "/" + id.String(), `{"name":"Editors"}`, 200}, {"delete group", "DELETE", "/" + id.String(), "", 200}, {"members", "GET", "/" + id.String() + "/members", "", 200}, {"replace members", "PUT", "/" + id.String() + "/members", `{"user_ids":["` + user.String() + `"]}`, 200}, {"grants", "GET", "/" + id.String() + "/grants", "", 200}, {"replace grants", "PUT", "/" + id.String() + "/grants", `{"grants":[{"database_id":"` + database.String() + `","access":"edit"}]}`, 200}} {
+	}{{"list groups", "GET", "", "", 200}, {"create group", "POST", "", `{"name":"Editors"}`, 201}, {"update group", "PATCH", "/" + id.String(), `{"name":"Editors"}`, 200}, {"set leader", "PUT", "/" + id.String() + "/leader", `{"user_id":"` + user.String() + `"}`, 200}, {"delete group", "DELETE", "/" + id.String(), "", 200}, {"members", "GET", "/" + id.String() + "/members", "", 200}, {"replace members", "PUT", "/" + id.String() + "/members", `{"user_ids":["` + user.String() + `"]}`, 200}, {"grants", "GET", "/" + id.String() + "/grants", "", 200}, {"replace grants", "PUT", "/" + id.String() + "/grants", `{"grants":[{"database_id":"` + database.String() + `","access":"edit"}]}`, 200}} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := &groupRepository{group: Group{ID: id, Name: "Editors"}, users: []uuid.UUID{user}, grants: []Grant{{DatabaseID: database, Access: "edit"}}}
 			status, v, raw := adminRequest(t, groupApp(repo), tc.method, "/groups"+tc.suffix, tc.body)
@@ -124,6 +133,10 @@ func TestGroupHandlersSuccess(t *testing.T) {
 				}
 			case "create group", "update group":
 				if data["id"] != id.String() || data["name"] != "Editors" || repo.receivedName != "Editors" {
+					t.Fatal(raw)
+				}
+			case "set leader":
+				if data["id"] != id.String() || data["name"] != "Editors" || data["leader_user_id"] != user.String() || repo.leader == nil || *repo.leader != user {
 					t.Fatal(raw)
 				}
 			case "delete group":

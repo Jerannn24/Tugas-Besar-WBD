@@ -22,7 +22,7 @@ func main() {
 		}
 	}
 	app := server.New(db, cfg.JWTSecret)
-
+	
 	log.Printf("Server starting on port %s", cfg.Port)
 
 	if err := app.Listen(":" + cfg.Port); err != nil {

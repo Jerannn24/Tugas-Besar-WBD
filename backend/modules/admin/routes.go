@@ -10,6 +10,7 @@ func RegisterRoutes(r fiber.Router, handler *Handler, guard fiber.Handler, csrf 
 	admin.Get("/groups", handler.listGroups)
 	admin.Post("/groups", csrf, handler.createGroup)
 	admin.Patch("/groups/:group_id", csrf, handler.updateGroup)
+	admin.Put("/groups/:group_id/leader", csrf, handler.setGroupLeader)
 	admin.Delete("/groups/:group_id", csrf, handler.deleteGroup)
 	admin.Get("/groups/:group_id/members", handler.members)
 	admin.Put("/groups/:group_id/members", csrf, handler.replaceMembers)
