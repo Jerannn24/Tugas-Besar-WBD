@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +16,6 @@ import (
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/drafts"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/history"
-	"github.com/Jerannn24/Tugas-Besar-WBD.git/jobs"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/auth"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/databaseapi"
@@ -167,28 +167,60 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 	checkTarget(0, 0)
 
 	var proposal workflow.Proposal
-	edit.request(t, post, "/api/proposals", workflow.CreateInput{DatabaseID: databaseID, MigrationID: draft.ID, Action: string(executioncontract.Apply)}, http.StatusCreated, &proposal)
-	proposalPath := "/api/proposals/" + proposal.ProposalID
-	edit.request(t, post, proposalPath+"/submit", nil, http.StatusOK, &proposal)
+	edit.request(t, post, databasePath+"/proposals", workflow.CreateInput{MigrationID: draft.ID, Revision: updated.Revision, Action: string(executioncontract.Apply)}, http.StatusCreated, &proposal)
+	proposalPath := databasePath + "/proposals/" + proposal.ProposalID
+	if !strings.Contains(strings.Join(proposal.AllowedActions, ","), "submit_review") {
+		t.Fatalf("editor cannot submit draft: %+v", proposal.AllowedActions)
+	}
+	edit.request(t, post, proposalPath+"/submit-review", map[string]int{"revision": proposal.Revision}, http.StatusOK, &proposal)
 	if proposal.Status != string(executioncontract.PendingReview) {
 		t.Fatalf("submitted proposal status=%q, want pending_review", proposal.Status)
 	}
-	review.request(t, post, proposalPath+"/approve", workflow.ApproveInput{GroupID: groupID.String(), Revision: proposal.Revision}, http.StatusOK, &proposal)
+	var reviewView workflow.Proposal
+	review.request(t, get, proposalPath, nil, http.StatusOK, &reviewView)
+	if !strings.Contains(strings.Join(reviewView.AllowedActions, ","), "approve") {
+		t.Fatalf("leader cannot approve pending proposal: %+v", reviewView.AllowedActions)
+	}
+	review.request(t, post, proposalPath+"/approvals", workflow.ApproveInput{GroupID: groupID.String(), Revision: proposal.Revision}, http.StatusOK, &proposal)
 	if proposal.Status != string(executioncontract.Approved) || len(proposal.Approvals) != 1 || proposal.Approvals[0].Status != "approved" {
 		t.Fatalf("proposal not approved by required group: status=%q approvals=%+v", proposal.Status, proposal.Approvals)
 	}
+	if !strings.Contains(strings.Join(proposal.AllowedActions, ","), "enqueue") {
+		t.Fatalf("editor cannot enqueue approved proposal: %+v", proposal.AllowedActions)
+	}
 
-	queuePath := proposalPath + "/queue"
-	input := workflow.EnqueueInput{RequestID: uuid.NewString()}
+	queuePath := proposalPath + "/jobs"
+	input := workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: proposal.Revision}
+	const clientParent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	var responseParent string
+	edit.traceparent, edit.tracestate, edit.responseParent = clientParent, "vendor=value", &responseParent
 	var accepted workflow.EnqueueOutput
 	edit.request(t, post, queuePath, input, http.StatusAccepted, &accepted)
+	edit.traceparent, edit.tracestate, edit.responseParent = "", "", nil
+	var storedParent, storedState string
+	if err := pool.QueryRow(ctx, `SELECT traceparent, tracestate FROM app.jobs WHERE id=$1`, accepted.JobID).Scan(&storedParent, &storedState); err != nil {
+		t.Fatalf("read queued trace: %v", err)
+	}
+	if storedParent != responseParent || storedParent == clientParent || !strings.Contains(storedParent, "4bf92f3577b34da6a3ce929d0e0e4736") || storedState != "vendor=value" {
+		t.Fatalf("unexpected queued trace: parent=%q response=%q state=%q", storedParent, responseParent, storedState)
+	}
 	if accepted.Replayed || accepted.Status != executioncontract.Queued || accepted.JobID == "" || accepted.ExecutionID == "" {
 		t.Fatalf("expected newly queued job, got %+v", accepted)
 	}
-	edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: uuid.NewString()}, http.StatusConflict, nil)
-	job := waitForWorkflowJob(t, ctx, jobs.New(platform), databaseID, accepted.JobID, executioncontract.Succeeded)
+	changedRevision := proposal.Revision + 1
+	if code := edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: input.RequestID, Revision: changedRevision}, http.StatusConflict, nil); code != "REQUEST_CONFLICT" {
+		t.Fatalf("reused request with changed revision error=%q, want REQUEST_CONFLICT", code)
+	}
+	if code := edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: changedRevision}, http.StatusConflict, nil); code != "PROPOSAL_STALE" {
+		t.Fatalf("new request with stale revision error=%q, want PROPOSAL_STALE", code)
+	}
+	edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: proposal.Revision}, http.StatusConflict, nil)
+	job := waitForWorkflowJob(t, ctx, edit, accepted.StatusURL, executioncontract.Succeeded)
 	if job.ExecutionID != accepted.ExecutionID || job.ExecutionStatus != executioncontract.Succeeded || job.BlocksDatabase || job.AttemptNo != 1 || job.FinishedAt == nil || job.Error != nil {
 		t.Fatalf("unexpected completed job: %+v", job)
+	}
+	if !slices.Contains(job.AllowedActions, executioncontract.AllowedAction("propose_rollback")) {
+		t.Fatalf("editor cannot propose rollback for completed apply: %+v", job.AllowedActions)
 	}
 	patchInput["revision"] = updated.Revision
 	if code := edit.request(t, patch, draftPath, patchInput, http.StatusConflict, nil); code != "ALREADY_APPLIED" {
@@ -200,7 +232,7 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 	if !replay.Replayed || replay.JobAccepted != job.JobAccepted {
 		t.Fatalf("replay returned %+v, want original completed job %+v", replay, job.JobAccepted)
 	}
-	edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: uuid.NewString()}, http.StatusConflict, nil)
+	edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: proposal.Revision}, http.StatusConflict, nil)
 	checkTarget(1, 42)
 	var receiptCount, jobCount int
 	if err := receipts.QueryRow(ctx, `SELECT count(*) FROM wbd_auth.execution_receipts WHERE database_id=$1 AND execution_id=$2`, connection.ID, accepted.ExecutionID).Scan(&receiptCount); err != nil || receiptCount != 1 {
@@ -211,21 +243,38 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 	}
 
 	var list struct {
-		Items []history.Execution `json:"items"`
+		ActiveHeadExecutionID *string `json:"active_head_execution_id"`
+		Items                 []struct {
+			AttemptID      string           `json:"attempt_id"`
+			ExecutionID    string           `json:"execution_id"`
+			Status         string           `json:"status"`
+			IsActiveHead   bool             `json:"is_active_head"`
+			AllowedActions []string         `json:"allowed_actions"`
+			Actor          history.Executor `json:"actor"`
+			Statements  []struct {
+				SQL string `json:"sql"`
+			} `json:"statements"`
+			Commit *executioncontract.HistoryEntry `json:"commit"`
+		} `json:"items"`
 	}
-	edit.request(t, get, databasePath+"/migrations", nil, http.StatusOK, &list)
+	edit.request(t, get, databasePath+"/migrations?limit=20", nil, http.StatusOK, &list)
 	if len(list.Items) != 1 {
 		t.Fatalf("history entries=%d, want 1", len(list.Items))
 	}
 	entry := list.Items[0]
-	if entry.ID != accepted.ExecutionID || entry.DatabaseID != databaseID || entry.DraftID != draft.ID || entry.DraftRevision != proposal.Revision ||
-		entry.Status != string(executioncontract.Succeeded) || entry.Title != title || entry.SQL != up || entry.FinishedAt == nil || entry.Error != nil ||
-		entry.ExecutedBy.ID != editor.ID.String() || entry.ExecutedBy.Username != editor.Username {
+	if entry.AttemptID == "" || entry.ExecutionID != accepted.ExecutionID || entry.Status != string(executioncontract.Succeeded) ||
+		entry.Actor.ID != editor.ID.String() || entry.Actor.Username != editor.Username || entry.Commit == nil ||
+		entry.Commit.DatabaseID != databaseID || entry.Commit.DraftID != draft.ID || entry.Commit.DraftRevision != proposal.Revision ||
+		entry.Commit.Title != title || entry.Commit.SQL != up || entry.Commit.FinishedAt == nil {
 		t.Fatalf("unexpected committed history: %+v", entry)
 	}
-	var detail history.Execution
+	if list.ActiveHeadExecutionID == nil || *list.ActiveHeadExecutionID != accepted.ExecutionID ||
+		!entry.IsActiveHead || !slices.Contains(entry.AllowedActions, "propose_rollback") {
+		t.Fatalf("applied execution should be the active head and allow rollback: head=%v entry=%+v", list.ActiveHeadExecutionID, entry)
+	}
+	var detail executioncontract.HistoryEntry
 	edit.request(t, get, databasePath+"/migrations/"+accepted.ExecutionID, nil, http.StatusOK, &detail)
-	if detail.ID != entry.ID || detail.Status != entry.Status || detail.Version != entry.Version || detail.SQL != entry.SQL {
+	if detail.ID != entry.Commit.ID || detail.Status != entry.Commit.Status || detail.Version != entry.Commit.Version || detail.SQL != entry.Commit.SQL {
 		t.Fatalf("history detail does not match list entry: %+v", detail)
 	}
 	var projectedOnce bool
@@ -237,22 +286,22 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 		t.Fatalf("expected one complete job-linked history projection, matches=%t: %v", projectedOnce, err)
 	}
 
-	runApproved := func(migrationID string, action executioncontract.Action, source *string, want executioncontract.JobStatus) executioncontract.JobView {
+	runApproved := func(migrationID string, revision int, action executioncontract.Action, source *string, want executioncontract.JobStatus) executioncontract.JobView {
 		t.Helper()
 		var next workflow.Proposal
-		edit.request(t, post, "/api/proposals", workflow.CreateInput{
-			DatabaseID: databaseID, MigrationID: migrationID, Action: string(action), SourceExecutionID: source,
+		edit.request(t, post, databasePath+"/proposals", workflow.CreateInput{
+			MigrationID: migrationID, Revision: revision, Action: string(action), SourceExecutionID: source,
 		}, http.StatusCreated, &next)
-		path := "/api/proposals/" + next.ProposalID
-		edit.request(t, post, path+"/submit", nil, http.StatusOK, &next)
-		review.request(t, post, path+"/approve", workflow.ApproveInput{
+		path := databasePath + "/proposals/" + next.ProposalID
+		edit.request(t, post, path+"/submit-review", map[string]int{"revision": next.Revision}, http.StatusOK, &next)
+		review.request(t, post, path+"/approvals", workflow.ApproveInput{
 			GroupID: groupID.String(), Revision: next.Revision,
 		}, http.StatusOK, &next)
 		var queued workflow.EnqueueOutput
-		edit.request(t, post, path+"/queue", workflow.EnqueueInput{RequestID: uuid.NewString()}, http.StatusAccepted, &queued)
-		return waitForWorkflowJob(t, ctx, jobs.New(platform), databaseID, queued.JobID, want)
+		edit.request(t, post, path+"/jobs", workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: next.Revision}, http.StatusAccepted, &queued)
+		return waitForWorkflowJob(t, ctx, edit, queued.StatusURL, want)
 	}
-	rollback := runApproved(draft.ID, executioncontract.Rollback, &accepted.ExecutionID, executioncontract.Succeeded)
+	rollback := runApproved(draft.ID, updated.Revision, executioncontract.Rollback, &accepted.ExecutionID, executioncontract.Succeeded)
 	if rollback.Status != executioncontract.Succeeded {
 		t.Fatalf("rollback of job-backed apply did not succeed: %+v (error: %+v)", rollback, rollback.Error)
 	}
@@ -265,7 +314,17 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 		reverted == nil || *reverted != accepted.ExecutionID || head != nil {
 		t.Fatalf("rollback history should link the apply and clear the first head: reverts=%v, head=%v, err=%v", reverted, head, err)
 	}
-	forward := runApproved(draft.ID, executioncontract.Forward, &accepted.ExecutionID, executioncontract.Succeeded)
+	edit.request(t, get, databasePath+"/migrations?limit=20", nil, http.StatusOK, &list)
+	if list.ActiveHeadExecutionID != nil || len(list.Items) != 2 {
+		t.Fatalf("rolled-back history should have no active head and two rows: head=%v items=%+v", list.ActiveHeadExecutionID, list.Items)
+	}
+	for _, item := range list.Items {
+		if item.IsActiveHead || (item.ExecutionID == accepted.ExecutionID) != slices.Contains(item.AllowedActions, "propose_forward") ||
+			(item.ExecutionID != accepted.ExecutionID && item.ExecutionID != rollback.ExecutionID) {
+			t.Fatalf("only the reverted apply should allow forward, with no active head: %+v", list.Items)
+		}
+	}
+	forward := runApproved(draft.ID, updated.Revision, executioncontract.Forward, &accepted.ExecutionID, executioncontract.Succeeded)
 	if forward.Status != executioncontract.Succeeded || forward.ExecutionID == accepted.ExecutionID {
 		t.Fatalf("forward should succeed as a new execution: %+v (error: %+v)", forward, forward.Error)
 	}
@@ -275,14 +334,15 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 	edit.request(t, post, databasePath+"/drafts", map[string]string{
 		"title": "Fail on target constraint", "sql": failedSQL, "irreversible_reason": "Test only",
 	}, http.StatusCreated, &draft)
-	failed := runApproved(draft.ID, executioncontract.Apply, nil, executioncontract.Failed)
-	edit.request(t, get, databasePath+"/migrations?hide_rollback=true", nil, http.StatusOK, &list)
-	if len(list.Items) != 2 || list.Items[0].ExecutionID == nil || *list.Items[0].ExecutionID != failed.ExecutionID ||
-		list.Items[0].AttemptID == nil || list.Items[0].Status != "failed" || list.Items[0].SQL != failedSQL ||
-		list.Items[1].ID != forward.ExecutionID {
+	failed := runApproved(draft.ID, draft.Revision, executioncontract.Apply, nil, executioncontract.Failed)
+	edit.request(t, get, databasePath+"/migrations?limit=20&hide_rollback=true", nil, http.StatusOK, &list)
+	if len(list.Items) != 2 || list.Items[0].ExecutionID != failed.ExecutionID ||
+		list.Items[0].AttemptID == "" || list.Items[0].Status != "failed" ||
+		len(list.Items[0].Statements) == 0 || list.Items[0].Statements[0].SQL != failedSQL ||
+		list.Items[1].ExecutionID != forward.ExecutionID {
 		t.Fatalf("hide rollback must keep the failed attempt with its SQL and the forward: %+v", list.Items)
 	}
-	runApproved(forward.MigrationID, executioncontract.Rollback, &forward.ExecutionID, executioncontract.Succeeded)
+	runApproved(forward.MigrationID, forward.Revision, executioncontract.Rollback, &forward.ExecutionID, executioncontract.Succeeded)
 	checkTarget(0, 0)
 
 	if os.Getenv("BATCH_SCOPE_ISOLATED_TEST_TARGET") == "1" {
@@ -302,7 +362,7 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 			"title": "Batch approval smoke", "mode": executioncontract.Batch,
 			"sql":      "UPDATE managed.batch_items SET processed = TRUE WHERE id = ANY($1::bigint[]);",
 			"sql_down": "UPDATE managed.batch_items SET processed = FALSE WHERE id = ANY($1::bigint[]);",
-			"batch": executioncontract.BatchConfig{Schema: "managed", Table: "batch_items", CursorColumn: "id", BatchSize: 2},
+			"batch":    executioncontract.BatchConfig{Schema: "managed", Table: "batch_items", CursorColumn: "id", BatchSize: 2},
 		}, http.StatusCreated, &draft)
 		checkBatch := func(want int) {
 			t.Helper()
@@ -311,11 +371,17 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 				t.Fatalf("processed=%d, want %d: %v", got, want, err)
 			}
 		}
-		batch := runApproved(draft.ID, executioncontract.Apply, nil, executioncontract.Succeeded)
+		batch := runApproved(draft.ID, draft.Revision, executioncontract.Apply, nil, executioncontract.Succeeded)
 		checkBatch(3)
-		runApproved(draft.ID, executioncontract.Compensate, &batch.ExecutionID, executioncontract.Succeeded)
+		compensation := runApproved(draft.ID, draft.Revision, executioncontract.Compensate, &batch.ExecutionID, executioncontract.Succeeded)
 		checkBatch(0)
-		runApproved(draft.ID, executioncontract.Forward, &batch.ExecutionID, executioncontract.Succeeded)
+		edit.request(t, get, databasePath+"/migrations?limit=20&hide_rollback=true", nil, http.StatusOK, &list)
+		for _, item := range list.Items {
+			if item.ExecutionID == batch.ExecutionID || item.ExecutionID == compensation.ExecutionID {
+				t.Fatalf("fully compensated batch should be hidden: %+v", list.Items)
+			}
+		}
+		runApproved(draft.ID, draft.Revision, executioncontract.Forward, &batch.ExecutionID, executioncontract.Succeeded)
 		checkBatch(3)
 	}
 }
@@ -342,8 +408,10 @@ func workflowTargetConfig(t *testing.T, key string) *pgx.ConnConfig {
 }
 
 type workflowSmokeClient struct {
-	app     *fiber.App
-	cookies map[string]*http.Cookie
+	app                     *fiber.App
+	cookies                 map[string]*http.Cookie
+	traceparent, tracestate string
+	responseParent          *string
 }
 
 func (c workflowSmokeClient) request(t *testing.T, method, path string, input any, want int, output any) string {
@@ -358,6 +426,10 @@ func (c workflowSmokeClient) request(t *testing.T, method, path string, input an
 	}
 	req := httptest.NewRequest(method, path, body)
 	req.Header.Set("Content-Type", "application/json")
+	if c.traceparent != "" {
+		req.Header.Set("traceparent", c.traceparent)
+		req.Header.Set("tracestate", c.tracestate)
+	}
 	for _, cookie := range c.cookies {
 		req.AddCookie(cookie)
 	}
@@ -369,6 +441,9 @@ func (c workflowSmokeClient) request(t *testing.T, method, path string, input an
 		t.Fatalf("%s %s: %v", method, path, err)
 	}
 	defer res.Body.Close()
+	if c.responseParent != nil {
+		*c.responseParent = res.Header.Get("traceparent")
+	}
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -396,15 +471,13 @@ func (c workflowSmokeClient) request(t *testing.T, method, path string, input an
 	return envelope.Error.Code
 }
 
-func waitForWorkflowJob(t *testing.T, ctx context.Context, service *jobs.Service, databaseID, jobID string, want executioncontract.JobStatus) executioncontract.JobView {
+func waitForWorkflowJob(t *testing.T, ctx context.Context, client workflowSmokeClient, statusURL string, want executioncontract.JobStatus) executioncontract.JobView {
 	t.Helper()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		job, err := service.GetJob(ctx, databaseID, jobID)
-		if err != nil {
-			t.Fatalf("read queued job: %v", err)
-		}
+		var job executioncontract.JobView
+		client.request(t, http.MethodGet, statusURL, nil, http.StatusOK, &job)
 		if job.Status == want {
 			return job
 		}
