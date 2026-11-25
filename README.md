@@ -135,6 +135,8 @@ Saat volume pertama kali dibuat, `db/init/10-provision.sh` membuat role serta da
 docker compose ps postgres
 ```
 
+PostgreSQL development mengaktifkan `track_commit_timestamp` agar worker dapat memverifikasi waktu commit di database target. Target PostgreSQL eksternal juga perlu mengaktifkan pengaturan ini sebelum menjalankan migrasi.
+
 ### 3. Terapkan migrasi platform
 
 ```sh
@@ -158,6 +160,8 @@ Perintah ini membuat schema `managed` dan role `wbd_target_<a|b>_executor`, `_pr
 docker compose up -d backend
 docker compose logs -f backend   # tunggu "Server starting on port 8080", lalu Ctrl+C
 ```
+
+Backend memerlukan migrasi platform `014_linear_job_sources` sebelum membuka HTTP. Dua worker antrean memungkinkan target yang berbeda diproses bersamaan; eksekusi lama dengan hasil belum pasti tetap memblokir targetnya. Saat menerima `SIGTERM` (misalnya dari `docker compose stop backend`) atau `SIGINT`, backend berhenti menerima trafik, memberi pekerjaan aktif waktu untuk selesai, lalu menutup pool database. Pekerjaan persisten yang belum selesai diperiksa kembali saat backend menyala.
 
 ### 6. Buka aplikasi
 
@@ -194,7 +198,7 @@ Untuk menjalankan lagi di hari berikutnya, cukup `docker compose up -d postgres 
 2. **Admin → Users**: buat akun user.
 3. **Admin → Groups**: buat grup, tambahkan anggota, lalu beri grant ke database.
 4. **Databases**: lihat schema dan isi tabel.
-5. **Migrations**: buat draft migrasi, jalankan, dan lihat riwayat eksekusi.
+5. **Migrations**: buat draft dan lihat riwayat. Eksekusi baru wajib melalui proposal yang disetujui dan `POST /api/proposals/{proposal_id}/queue`; backend tidak lagi melayani `POST /api/databases/{database_id}/drafts/{draft_id}/execute`. Tombol execute lama pada frontend belum memakai alur proposal.
 
 ## Testing dan Quality Check
 

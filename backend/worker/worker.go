@@ -45,6 +45,7 @@ type Worker struct {
 	stopOnce         sync.Once
 	stopping         atomic.Bool
 	shutdownDone     chan struct{}
+	loopDone         chan struct{}
 	activeMu         sync.Mutex
 	activeWork       *activeWork
 	lastRecoveryTime time.Time
@@ -106,6 +107,7 @@ func New(jobsSvc *jobs.Service, deps jobs.ExecutionDeps, cfg Config) (*Worker, e
 		cfg:          cfg,
 		stopCh:       make(chan struct{}),
 		shutdownDone: make(chan struct{}),
+		loopDone:     make(chan struct{}),
 	}, nil
 }
 
@@ -133,7 +135,7 @@ func (w *Worker) unregisterActive(aw *activeWork) {
 	w.activeMu.Unlock()
 }
 
-// Run starts the worker loop until ctx is canceled or Stop() is called.
+// Run starts the worker loop until ctx is canceled or Stop is called. Call Run once.
 func (w *Worker) Run(ctx context.Context) error {
 	w.log("worker_started", map[string]any{
 		"worker_id":         w.cfg.WorkerID,
@@ -143,7 +145,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	})
 
 	// The loop retains caller values but execution is canceled only after draining.
-	go w.runLoop(context.WithoutCancel(ctx))
+	go func() {
+		defer close(w.loopDone)
+		w.runLoop(context.WithoutCancel(ctx))
+	}()
 	select {
 	case <-ctx.Done():
 		w.Stop()
@@ -153,6 +158,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.log("shutdown_complete", map[string]any{"worker_id": w.cfg.WorkerID})
 	return nil
 }
+
+// Done closes once the loop, including canceled execution and lease renewal, has exited.
+// Run can return first when a dependency does not respond to cancellation promptly.
+func (w *Worker) Done() <-chan struct{} { return w.loopDone }
 
 func (w *Worker) runLoop(ctx context.Context) {
 	startupRecCtx, cancelStartupRec := context.WithCancel(ctx)

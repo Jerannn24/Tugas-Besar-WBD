@@ -9,4 +9,4 @@ COPY . .
 
 EXPOSE 8080
 
-CMD ["go", "run", "."]
+CMD ["sh", "-c", "go build -o /tmp/wbd-backend . && exec /tmp/wbd-backend"]

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"os"
+	"time"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/routes"
 	"github.com/gofiber/fiber/v2"
@@ -10,9 +12,10 @@ import (
 
 var okBytes = []byte(`{"status":"ok"}`)
 
-func New(db *pgxpool.Pool, jwtSecret string) *fiber.App {
+func New(ctx context.Context, db *pgxpool.Pool, jwtSecret string) (*fiber.App, func() error, error) {
 	app := fiber.New(fiber.Config{
 		ErrorHandler: ErrorHandler,
+		ReadTimeout:  15 * time.Second,
 	})
 
 	app.Get("/health", func(c *fiber.Ctx) error {
@@ -22,10 +25,13 @@ func New(db *pgxpool.Pool, jwtSecret string) *fiber.App {
 
 	app.Use(Logging())
 
-	routes.Register(app, db, jwtSecret)
+	shutdown, err := routes.Register(ctx, app, db, jwtSecret)
+	if err != nil {
+		return nil, nil, err
+	}
 	Frontend(app, os.Getenv("FRONTEND_DIST"))
 
-	return app
+	return app, shutdown, nil
 }
 
 // Frontend menyajikan build multi-page FE (mis. dist/login/index.html) dari dir.

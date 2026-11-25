@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/drafts"
@@ -106,13 +105,6 @@ func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer
 	if err := historyHandler.Register(mux); err != nil {
 		return nil, err
 	}
-	mux.HandleFunc("GET /api/databases/{database_id}/drafts/{draft_id}/execute", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Allow", "POST")
-		writeWorkflowRouteFallback(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Migration execution is now queued through workflow")
-	})
-	mux.HandleFunc("POST /api/databases/{database_id}/drafts/{draft_id}/execute", func(w http.ResponseWriter, r *http.Request) {
-		writeWorkflowRouteFallback(w, http.StatusBadRequest, "INVALID_REQUEST", "Use the proposal queue endpoint")
-	})
 	policy, err := sqlpolicy.New("managed")
 	if err != nil {
 		return nil, err
@@ -127,7 +119,7 @@ func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer
 			return authorizeView(ctx, viewer.Actor{ID: a.ID}, id, viewer.Edit)
 		},
 		CheckCSRF: authz.CheckCSRF,
-		Acquire:   acquireLease(pools),
+		Acquire:   AcquireLease(pools),
 		Preflight: migration.NewPreflight(policy),
 		Timeout:   30 * time.Second,
 	})
@@ -141,7 +133,8 @@ func Register(router fiber.Router, platform *sql.DB, authorizer authz.Authorizer
 	return stop, nil
 }
 
-func acquireLease(pools *connections.PoolManager) func(context.Context, string) (*migration.TargetLease, error) {
+// AcquireLease adapts the shared role-aware pool manager to the migration executor.
+func AcquireLease(pools *connections.PoolManager) func(context.Context, string) (*migration.TargetLease, error) {
 	return func(ctx context.Context, id string) (*migration.TargetLease, error) {
 		databaseID, err := uuid.Parse(id)
 		if err != nil {
@@ -164,19 +157,11 @@ func (e httpError) Error() string   { return e.err.Error() }
 func (e httpError) Unwrap() error   { return e.err }
 func (e httpError) StatusCode() int { return e.status }
 
-func OpenPlatform() (*sql.DB, error) {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		return nil, errors.New("DATABASE_URL is required")
-	}
-	config, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		return nil, err
-	}
-	db := stdlib.OpenDB(*config.ConnConfig)
+func OpenPlatform(pool *pgxpool.Pool) *sql.DB {
+	db := stdlib.OpenDB(*pool.Config().ConnConfig)
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
-	return db, nil
+	return db
 }
 
 func mapAuthzError(err error) error {
@@ -197,18 +182,6 @@ func mapAuthzError(err error) error {
 type statusRecorder struct {
 	header http.Header
 	status int
-}
-
-func writeWorkflowRouteFallback(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{
-			"code": code, "message": message,
-			"field_errors": map[string]string{}, "retryable": false,
-		},
-	})
 }
 
 func (s *statusRecorder) Header() http.Header         { return s.header }

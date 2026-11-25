@@ -21,15 +21,15 @@ import (
 )
 
 type workerTestEnv struct {
-	platformDB        *sql.DB
-	ownerDB           *sql.DB
-	targetExecDB      *sql.DB
-	targetPrepDB      *sql.DB
-	targetCleanupDB   *sql.DB
-	physicalTargetID  string
-	targetExecDB_B    *sql.DB
-	targetPrepDB_B    *sql.DB
-	targetCleanupDB_B *sql.DB
+	platformDB         *sql.DB
+	ownerDB            *sql.DB
+	targetExecDB       *sql.DB
+	targetPrepDB       *sql.DB
+	targetCleanupDB    *sql.DB
+	physicalTargetID   string
+	targetExecDB_B     *sql.DB
+	targetPrepDB_B     *sql.DB
+	targetCleanupDB_B  *sql.DB
 	physicalTargetID_B string
 }
 
@@ -130,42 +130,16 @@ func setupWorkerTestEnv(t *testing.T) *workerTestEnv {
 			}
 		}
 	}
-	if ownerDB != nil {
-		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanCancel()
-		_, _ = ownerDB.ExecContext(cleanCtx, "DELETE FROM app.job_commit_proofs")
-		_, _ = ownerDB.ExecContext(cleanCtx, "DELETE FROM app.job_dispatch_authorizations")
-		_, _ = ownerDB.ExecContext(cleanCtx, "DELETE FROM app.job_batch_step_authorizations")
-		_, _ = ownerDB.ExecContext(cleanCtx, "DELETE FROM app.job_statement_evidence")
-		_, _ = ownerDB.ExecContext(cleanCtx, "DELETE FROM app.job_attempts")
-		_, _ = ownerDB.ExecContext(cleanCtx, "DELETE FROM app.jobs")
-		_, _ = ownerDB.ExecContext(cleanCtx, "UPDATE app.database_connections SET deleted_at = clock_timestamp() WHERE deleted_at IS NULL")
-	}
-	if targetCleanupDB != nil {
-		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanCancel()
-		_, _ = targetCleanupDB.ExecContext(cleanCtx, "DELETE FROM wbd_auth.execution_receipts")
-		_, _ = targetCleanupDB.ExecContext(cleanCtx, "DELETE FROM wbd_auth.execution_tickets")
-		_, _ = targetCleanupDB.ExecContext(cleanCtx, "DELETE FROM wbd_auth.batch_checkpoints")
-	}
-	if targetCleanupDB_B != nil {
-		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanCancel()
-		_, _ = targetCleanupDB_B.ExecContext(cleanCtx, "DELETE FROM wbd_auth.execution_receipts")
-		_, _ = targetCleanupDB_B.ExecContext(cleanCtx, "DELETE FROM wbd_auth.execution_tickets")
-		_, _ = targetCleanupDB_B.ExecContext(cleanCtx, "DELETE FROM wbd_auth.batch_checkpoints")
-	}
-
 	return &workerTestEnv{
-		platformDB:        platformDB,
-		ownerDB:           ownerDB,
-		targetExecDB:      targetExecDB,
-		targetPrepDB:      targetPrepDB,
-		targetCleanupDB:   targetCleanupDB,
-		physicalTargetID:  physicalTargetID,
-		targetExecDB_B:    targetExecDB_B,
-		targetPrepDB_B:    targetPrepDB_B,
-		targetCleanupDB_B: targetCleanupDB_B,
+		platformDB:         platformDB,
+		ownerDB:            ownerDB,
+		targetExecDB:       targetExecDB,
+		targetPrepDB:       targetPrepDB,
+		targetCleanupDB:    targetCleanupDB,
+		physicalTargetID:   physicalTargetID,
+		targetExecDB_B:     targetExecDB_B,
+		targetPrepDB_B:     targetPrepDB_B,
+		targetCleanupDB_B:  targetCleanupDB_B,
 		physicalTargetID_B: physicalTargetID_B,
 	}
 }
@@ -291,10 +265,6 @@ func enqueueStandardJob(t *testing.T, env *workerTestEnv, targetID, dbName, sqlU
 
 	targetKey := "tkey_" + suffix
 	connName := "conn_" + suffix
-	_, _ = env.platformDB.ExecContext(ctx, "UPDATE app.database_connections SET deleted_at = clock_timestamp() WHERE execution_target_id = $1 AND deleted_at IS NULL", targetID)
-	if env.ownerDB != nil {
-		_, _ = env.ownerDB.ExecContext(ctx, "DELETE FROM app.database_connections WHERE execution_target_id = $1", targetID)
-	}
 	_, err = env.platformDB.ExecContext(ctx, `
 		INSERT INTO app.database_connections
 			(id, name, host, port, database_name, username, password_ciphertext, credential_key_id, ssl_mode, target_key, execution_target_id)
@@ -437,10 +407,6 @@ func enqueueBatchJob(t *testing.T, env *workerTestEnv, targetID, dbName string, 
 
 	targetKey := "tkey_" + suffix
 	connName := "conn_" + suffix
-	_, _ = env.platformDB.ExecContext(ctx, "UPDATE app.database_connections SET deleted_at = clock_timestamp() WHERE execution_target_id = $1 AND deleted_at IS NULL", targetID)
-	if env.ownerDB != nil {
-		_, _ = env.ownerDB.ExecContext(ctx, "DELETE FROM app.database_connections WHERE execution_target_id = $1", targetID)
-	}
 	_, err = env.platformDB.ExecContext(ctx, `
 		INSERT INTO app.database_connections
 			(id, name, host, port, database_name, username, password_ciphertext, credential_key_id, ssl_mode, target_key, execution_target_id)
@@ -665,6 +631,12 @@ func TestWorker_StandardJob_Lifecycle(t *testing.T) {
 	}
 }
 
+type transactionalBatchGate struct{ executioncontract.FakeGate }
+
+func (g transactionalBatchGate) RevalidateTx(ctx context.Context, _ *sql.Tx, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+	return g.Revalidate(ctx, req)
+}
+
 func TestWorker_BatchJob_Lifecycle(t *testing.T) {
 	env := setupWorkerTestEnv(t)
 	svc := jobs.New(env.platformDB)
@@ -719,7 +691,7 @@ func TestWorker_BatchJob_Lifecycle(t *testing.T) {
 	}
 
 	w, err := New(svc, jobs.ExecutionDeps{
-		Gate:    gate,
+		Gate:    transactionalBatchGate{gate},
 		Acquire: env.makeAcquire(t),
 		Timeout: 10 * time.Second,
 	}, Config{
@@ -1147,9 +1119,10 @@ func TestWorker_Run_UncooperativeGateBounded(t *testing.T) {
 	_ = enqueueStandardJob(t, env, env.physicalTargetID, "target_a", "CREATE TABLE managed."+table+" (id bigint);", "")
 	entered := make(chan context.Context, 1)
 	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
 	finished := make(chan struct{})
 	t.Cleanup(func() {
-		close(release)
+		unblock()
 		select {
 		case <-finished:
 		case <-time.After(5 * time.Second):
@@ -1200,6 +1173,17 @@ func TestWorker_Run_UncooperativeGateBounded(t *testing.T) {
 	case <-finished:
 		t.Fatal("execution finished while gate was still blocked")
 	default:
+	}
+	select {
+	case <-w.Done():
+		t.Fatal("worker reported completion while its gate was still blocked")
+	default:
+	}
+	unblock()
+	select {
+	case <-w.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not finish after the gate was released")
 	}
 	if didWork, err := w.Step(context.Background()); didWork || err != nil {
 		t.Fatalf("stopped worker admitted another cycle: didWork=%v err=%v", didWork, err)
@@ -1977,7 +1961,7 @@ func TestWorker_StructuredLogs_DiscardSensitiveStrings(t *testing.T) {
 		Acquire: env.makeAcquire(t),
 		Timeout: 10 * time.Second,
 	}, Config{
-		Logger:        logger,
+		Logger:       logger,
 		PollInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
@@ -2066,7 +2050,7 @@ func TestWorker_TracePropagation(t *testing.T) {
 		Acquire: env.makeAcquire(t),
 		Timeout: 10 * time.Second,
 	}, Config{
-		Logger:        logger,
+		Logger:       logger,
 		PollInterval: 50 * time.Millisecond,
 	})
 	if err != nil {

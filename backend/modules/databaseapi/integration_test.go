@@ -240,8 +240,8 @@ func TestRoutingFallbacks(t *testing.T) {
 	}{
 		{"GET", base + "/nope", 404, "NOT_FOUND"},
 		{"DELETE", base + "/migrations", 405, "METHOD_NOT_ALLOWED"},
-		{"GET", base + "/drafts/" + testDraft + "/execute", 405, "METHOD_NOT_ALLOWED"},
-		{"POST", base + "/drafts/" + testDraft + "/execute", 400, "INVALID_REQUEST"},
+		{"GET", base + "/drafts/" + testDraft + "/execute", 404, "NOT_FOUND"},
+		{"POST", base + "/drafts/" + testDraft + "/execute", 404, "NOT_FOUND"},
 		{"POST", base + "/migrations", 405, "METHOD_NOT_ALLOWED"},
 	}
 	for _, tt := range tests {
