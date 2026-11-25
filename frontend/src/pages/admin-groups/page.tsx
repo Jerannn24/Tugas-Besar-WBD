@@ -1,6 +1,6 @@
 import { useCallback, useState, type ReactNode } from 'react'
 import { createGroup, deleteGroup, listConnections, listGroups, listUsers, updateGroup } from '../../api/endpoints'
-import type { ID } from '../../api/types'
+import type { Group, ID } from '../../api/types'
 import { Alert } from '../../components/Alert'
 import { Button } from '../../components/Button'
 import { ConfirmDialog } from '../../components/ConfirmDialog'
@@ -14,6 +14,7 @@ import { ADMIN_FORBIDDEN, useLoad, type LoadState } from '../../lib/load'
 import { describeFailure, type MutationFailure } from '../../lib/mutation'
 import { GrantEditor } from './GrantEditor'
 import { GroupName } from './GroupName'
+import { LeaderEditor } from './LeaderEditor'
 import { MemberEditor } from './MemberEditor'
 import { ListSkeleton } from '../../components/Skeleton'
 
@@ -65,12 +66,23 @@ function Groups() {
   const [deletePending, setDeletePending] = useState(false)
   const [deleteFailure, setDeleteFailure] = useState<MutationFailure | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [membersVersion, setMembersVersion] = useState(0)
 
   const dirty = memberDirty || grantDirty
   const onMemberDirty = useCallback((d: boolean) => setMemberDirty(d), [])
   const onGrantDirty = useCallback((d: boolean) => setGrantDirty(d), [])
 
   const groups = groupsLoad.state.status === 'ready' ? groupsLoad.state.data.items : []
+  const replaceGroup = useCallback(
+    (g: Group) => update((d) => ({ ...d, items: d.items.map((x) => (x.id === g.id ? g : x)) })),
+    [update],
+  )
+
+  const onMembersSaved = useCallback(async () => {
+    setMembersVersion((n) => n + 1)
+    const res = await listGroups()
+    if (res.ok) update((d) => ({ ...d, items: res.data.items }))
+  }, [update])
   const selected = groups.find((g) => g.id === selectedId) ?? null
 
   function select(id: ID | null) {
@@ -132,7 +144,7 @@ function Groups() {
                   submitLabel="Ganti nama"
                   failureTitle="Nama group gagal diganti"
                   submit={(name) => updateGroup(selected.id, { name })}
-                  onDone={(g) => update((d) => ({ ...d, items: d.items.map((x) => (x.id === g.id ? g : x)) }))}
+                  onDone={replaceGroup}
                 />
               </Panel>
               <Section
@@ -147,6 +159,23 @@ function Groups() {
                     group={selected}
                     users={data.items}
                     onDirtyChange={onMemberDirty}
+                    onSaved={() => void onMembersSaved()}
+                  />
+                )}
+              </Section>
+              <Section
+                state={usersLoad.state}
+                title="Leader group"
+                loadingLabel="Memuat daftar user…"
+                onRetry={() => void usersLoad.reload()}
+              >
+                {(data) => (
+                  <LeaderEditor
+                    key={`l-${selected.id}`}
+                    group={selected}
+                    users={data.items}
+                    membersVersion={membersVersion}
+                    onSaved={replaceGroup}
                   />
                 )}
               </Section>

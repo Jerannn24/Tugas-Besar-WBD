@@ -14,13 +14,14 @@ type Props = {
   group: Group
   users: User[]
   onDirtyChange: (dirty: boolean) => void
+  onSaved?: () => void
 }
 
 type LoadState = { status: 'loading' } | { status: 'ready' } | { status: 'failed'; failure: ApiFailure }
 
 const sameSet = (a: ID[], b: ID[]) => a.length === b.length && a.every((id) => b.includes(id))
 
-export function MemberEditor({ group, users, onDirtyChange }: Props) {
+export function MemberEditor({ group, users, onDirtyChange, onSaved }: Props) {
   const [load, setLoad] = useState<LoadState>({ status: 'loading' })
   const [saved, setSaved] = useState<ID[]>([])
   const [selected, setSelected] = useState<ID[]>([])
@@ -68,6 +69,7 @@ export function MemberEditor({ group, users, onDirtyChange }: Props) {
       setSaved(res.data.user_ids)
       setSelected(res.data.user_ids)
       setNotice(res.data.user_ids.length === 0 ? 'Semua anggota dihapus dari group.' : 'Anggota group tersimpan.')
+      onSaved?.()
       return
     }
     setFailure(describeFailure(res, 'Anggota gagal disimpan'))
