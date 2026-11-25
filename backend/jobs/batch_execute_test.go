@@ -180,27 +180,6 @@ func createBatchFixtureWithActorAndDuration(t *testing.T, platformDB, ownerDB *s
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit enqueue: %v", err)
 	}
-	if action != executioncontract.Resume {
-		var ver int64
-		if err := platformDB.QueryRowContext(ctx, `
-			UPDATE app.migration_target_state
-			SET next_version = next_version + 1
-			WHERE id = $1
-			RETURNING next_version - 1
-		`, targetID).Scan(&ver); err != nil {
-			t.Fatalf("advance target version: %v", err)
-		}
-
-		if _, err := platformDB.ExecContext(ctx, `
-			INSERT INTO app.migration_executions
-				(id, database_id, execution_target_id, draft_id, request_id, draft_revision, version,
-				 title, sql, sql_sha256, executed_by, executed_username, started_at, status)
-			SELECT $1, $2, $3, d.id, $5, d.revision, $7, d.title, d.sql, sha256(convert_to(d.sql, 'UTF8')), $6, u.username, clock_timestamp(), 'running'
-			FROM app.migration_drafts d JOIN app.users u ON u.id = $6 WHERE d.id = $4
-		`, enqRes.ExecutionID, dbID, targetID, draftID, reqUUID, actorID, ver); err != nil {
-			t.Fatalf("insert execution: %v", err)
-		}
-	}
 	leaseDur := 30 * time.Second
 	if leaseDuration > 0 {
 		leaseDur = leaseDuration
@@ -242,13 +221,6 @@ func TestClaimJob_BatchForwardFromSucceededSource(t *testing.T) {
 	if err != nil || out == nil || out.Status != executioncontract.Succeeded {
 		t.Fatalf("source outcome=%+v err=%v", out, err)
 	}
-	if _, err := platformDB.ExecContext(ctx, `
-		UPDATE app.migration_executions
-		SET status = 'succeeded', finished_at = clock_timestamp()
-		WHERE id = $1
-	`, source.executionID); err != nil {
-		t.Fatalf("finish source history fixture: %v", err)
-	}
 	if _, err := e.exec.ExecContext(ctx, "UPDATE managed.batch_items SET processed = false"); err != nil {
 		t.Fatalf("prepare row in reverted state: %v", err)
 	}
@@ -280,8 +252,16 @@ func makeBatchAcquire(t *testing.T, execDB, prepDB *sql.DB) func(ctx context.Con
 	}
 }
 
-func batchFakeGate(snapshot executioncontract.Draft) executioncontract.FakeGate {
-	return executioncontract.FakeGate{
+type transactionalBatchGate struct {
+	executioncontract.FakeGate
+}
+
+func (g transactionalBatchGate) RevalidateTx(ctx context.Context, _ *sql.Tx, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+	return g.Revalidate(ctx, req)
+}
+
+func batchFakeGate(snapshot executioncontract.Draft) transactionalBatchGate {
+	return transactionalBatchGate{executioncontract.FakeGate{
 		RevalidateFunc: func(ctx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
 			return executioncontract.ExecutionPlan{
 				Request:       req,
@@ -294,6 +274,55 @@ func batchFakeGate(snapshot executioncontract.Draft) executioncontract.FakeGate 
 		RecordCommitFunc: func(ctx context.Context, tx *sql.Tx, in executioncontract.CommitEvidence) error {
 			return nil
 		},
+	}}
+}
+
+type staleBatchGate struct {
+	transactionalBatchGate
+	stale *bool
+}
+
+func (g staleBatchGate) RevalidateTx(ctx context.Context, tx *sql.Tx, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+	if *g.stale {
+		return executioncontract.ExecutionPlan{}, executioncontract.ContractError{Code: "REVIEW_STALE", Message: "approval expired"}
+	}
+	return g.transactionalBatchGate.RevalidateTx(ctx, tx, req)
+}
+
+func (g staleBatchGate) ReturnToReviewTx(context.Context, *sql.Tx, executioncontract.RevalidationRequest) error {
+	return nil
+}
+
+func TestExecuteBatchJob_StaleApprovalAtDispatchFence(t *testing.T) {
+	e, platformDB, ownerDB := setupBatchTestEnv(t)
+	setupBatchItemsFixture(t, e)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := e.exec.ExecContext(ctx, "INSERT INTO managed.batch_items (id, processed) VALUES (1, false)"); err != nil {
+		t.Fatal(err)
+	}
+	fix := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Apply, nil)
+	cleanupBatchScope(t, e, fix.executionID)
+	stale := false
+	out, err := New(platformDB).ExecuteBatchJob(ctx, fix.claim, ExecutionDeps{
+		Gate: staleBatchGate{batchFakeGate(fix.snapshot), &stale},
+		Acquire: makeBatchAcquire(t, e.exec, e.prep),
+		Timeout: 10 * time.Second,
+		afterTicketReservation: func(context.Context, int) error { stale = true; return nil },
+	})
+	if err != nil || out == nil || out.Status != executioncontract.Failed || !stale {
+		t.Fatalf("outcome=%+v err=%v stale=%v", out, err, stale)
+	}
+	var processed bool
+	if err := e.exec.QueryRowContext(ctx, "SELECT processed FROM managed.batch_items WHERE id=1").Scan(&processed); err != nil || processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	var status, code string
+	var evidence int
+	if err := platformDB.QueryRowContext(ctx, `SELECT status, error_code,
+		(SELECT count(*) FROM app.job_statement_evidence WHERE attempt_id=$2)
+		FROM app.job_attempts WHERE id=$2 AND job_id=$1`, fix.claim.JobID, fix.claim.AttemptID).Scan(&status, &code, &evidence); err != nil || status != "failed" || code != "REVIEW_STALE" || evidence != 0 {
+		t.Fatalf("status=%s code=%s evidence=%d err=%v", status, code, evidence, err)
 	}
 }
 
@@ -846,7 +875,7 @@ func TestExecuteBatchJob_ResumeByDifferentActor_InterruptedCommit_ReconcilesOrig
 
 	// Interruption after target commit of batch 0, before platform finalization
 	deps1 := ExecutionDeps{
-		Gate:    gate1,
+		Gate:    transactionalBatchGate{gate1},
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 		afterBatchCommit: func(ctx context.Context, batchIndex int) error {
@@ -913,7 +942,7 @@ func TestExecuteBatchJob_ResumeByDifferentActor_InterruptedCommit_ReconcilesOrig
 	}
 
 	deps2 := ExecutionDeps{
-		Gate:    gate2,
+		Gate:    transactionalBatchGate{gate2},
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 		beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
@@ -1498,7 +1527,7 @@ func TestExecuteBatchJob_PlatformTxFailureAndRecovery(t *testing.T) {
 	}
 
 	outcome1, err := svc.ExecuteBatchJob(ctx, fix1.claim, ExecutionDeps{
-		Gate:    gate1,
+		Gate:    transactionalBatchGate{gate1},
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 	})
@@ -1534,7 +1563,7 @@ func TestExecuteBatchJob_PlatformTxFailureAndRecovery(t *testing.T) {
 		},
 	}
 	outcome2, err := svc.ExecuteBatchJob(ctx, fixResume.claim, ExecutionDeps{
-		Gate:    gate2,
+		Gate:    transactionalBatchGate{gate2},
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 	})
@@ -1582,7 +1611,7 @@ func TestExecuteBatchJob_GateDeniesNextChunkAfterFirstCommit_RetainsProgressAndB
 			mu.Lock()
 			defer mu.Unlock()
 			revalCount++
-			if revalCount > 2 {
+			if revalCount > 3 {
 				return executioncontract.ExecutionPlan{}, executioncontract.ContractError{
 					Code:    "REVIEW_STALE",
 					Message: "leader changed approval expired before chunk 2",
@@ -1602,7 +1631,7 @@ func TestExecuteBatchJob_GateDeniesNextChunkAfterFirstCommit_RetainsProgressAndB
 	}
 
 	outcome, err := svc.ExecuteBatchJob(ctx, fix.claim, ExecutionDeps{
-		Gate:    gate,
+		Gate:    transactionalBatchGate{gate},
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 	})
@@ -2124,7 +2153,7 @@ func TestExecuteBatchJob_Regression_HistoryCountsRemainOnceOnly(t *testing.T) {
 	}
 
 	deps1 := ExecutionDeps{
-		Gate:    gate1,
+		Gate:    transactionalBatchGate{gate1},
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 		beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
@@ -2163,7 +2192,7 @@ func TestExecuteBatchJob_Regression_HistoryCountsRemainOnceOnly(t *testing.T) {
 	}
 
 	depsResume1 := ExecutionDeps{
-		Gate:    gate2,
+		Gate:    transactionalBatchGate{gate2},
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 	}
@@ -2761,7 +2790,7 @@ func TestExecuteBatchJob_HardCrashRecovery(t *testing.T) {
 		}
 		sqlText, _ := selectSQL(plan, fix1.claim.Action, fix1.claim.Direction)
 		chunkIDs := []int64{1, 2}
-		if err := svc.authorizeBatchDispatch(ctx, fix1.claim, fix1.executionID, plan, sqlText, xid, 1, 1, 0, chunkIDs); err != nil {
+		if err := svc.authorizeBatchDispatch(ctx, fix1.claim, batchFakeGate(fix1.snapshot), fix1.executionID, plan, sqlText, xid, 1, 1, 0, chunkIDs); err != nil {
 			t.Fatalf("authorize dispatch: %v", err)
 		}
 
@@ -3254,7 +3283,7 @@ func TestExecuteBatchJob_Regression_ValidFinalCommitPendingProof_ExtraCheckpoint
 
 	var finalStepRecordCommitCalled bool
 	depsResume := ExecutionDeps{
-		Gate: executioncontract.FakeGate{
+		Gate: transactionalBatchGate{executioncontract.FakeGate{
 			RevalidateFunc: func(ctx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
 				return executioncontract.ExecutionPlan{
 					Request:       req,
@@ -3270,7 +3299,7 @@ func TestExecuteBatchJob_Regression_ValidFinalCommitPendingProof_ExtraCheckpoint
 				}
 				return nil
 			},
-		},
+		}},
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 	}
@@ -3399,7 +3428,7 @@ func TestExecuteBatchJob_Regression_RecoveredFinalCheckpoint_PartiallyCommittedE
 
 	var recordCommitFinalCount int
 	depsResume2 := ExecutionDeps{
-		Gate: executioncontract.FakeGate{
+		Gate: transactionalBatchGate{executioncontract.FakeGate{
 			RevalidateFunc: func(ctx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
 				return executioncontract.ExecutionPlan{
 					Request:       req,
@@ -3415,7 +3444,7 @@ func TestExecuteBatchJob_Regression_RecoveredFinalCheckpoint_PartiallyCommittedE
 				}
 				return nil
 			},
-		},
+		}},
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 	}

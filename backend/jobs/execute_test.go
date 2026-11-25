@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -13,7 +14,10 @@ import (
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/migration"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/workflow"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type p3TestEnv struct {
@@ -683,6 +687,131 @@ func TestExecuteStandardJob_RejectionBeforeSQL_StaleGate(t *testing.T) {
 	}
 }
 
+type afterWorkflowValidation struct {
+	*workflow.Gate
+	after func(executioncontract.ExecutionPlan)
+}
+
+func (g afterWorkflowValidation) Revalidate(ctx context.Context, in executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+	plan, err := g.Gate.Revalidate(ctx, in)
+	if err == nil {
+		g.after(plan)
+	}
+	return plan, err
+}
+
+func TestExecuteStandardJob_RealReviewChangesBeforeAuthorization(t *testing.T) {
+	env := setupP3TestEnv(t)
+	ctx := context.Background()
+	svc := New(env.platformDB)
+	table := "stale_review_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+	groupID := uuid.New()
+	t.Cleanup(func() {
+		if _, err := env.ownerDB.ExecContext(ctx, `DELETE FROM app.groups WHERE id=$1`, groupID); err != nil {
+			t.Error(err)
+		}
+	})
+	fix := createP3JobFixture(t, env, executioncontract.Apply, executioncontract.Up,
+		"CREATE TABLE managed."+table+" (id bigint);", "DROP TABLE managed."+table+";")
+	if err := svc.failJob(ctx, fix.claim, "FIXTURE", "Replace test-only proposal"); err != nil {
+		t.Fatal(err)
+	}
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := env.platformDB.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`UPDATE app.migration_proposals SET status='superseded' WHERE id=$1`, fix.proposalID)
+	exec(`INSERT INTO app.groups(id,name,leader_user_id) VALUES ($1,$2,$3)`, groupID, "Group "+table, fix.actorID)
+	t.Cleanup(func() {
+		for _, query := range []string{
+			`DELETE FROM app.group_database_grants WHERE group_id=$1`,
+			`DELETE FROM app.group_memberships WHERE group_id=$1`,
+		} {
+			if _, err := env.ownerDB.ExecContext(ctx, query, groupID); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	exec(`INSERT INTO app.group_memberships(group_id,user_id) VALUES ($1,$2)`, groupID, fix.actorID)
+	exec(`INSERT INTO app.group_database_grants(group_id,database_id,access) VALUES ($1,$2,'edit')`, groupID, fix.dbID)
+
+	platformURL := os.Getenv("MIGRATION_TEST_PLATFORM_URL")
+	if platformURL == "" {
+		platformURL = os.Getenv("HISTORY_TEST_DATABASE_URL")
+	}
+	pool, err := pgxpool.New(ctx, platformURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	reviews, err := workflow.NewService(pool, authz.NewService(authz.NewRepository(pool)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviews.SetJobs(svc)
+	reviews.SetPlatform(env.platformDB)
+	actor := uuid.MustParse(fix.actorID)
+	proposal, err := reviews.Create(ctx, actor, workflow.CreateInput{DatabaseID: fix.dbID, MigrationID: fix.draftID, Action: "apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposalID := uuid.MustParse(proposal.ProposalID)
+	if _, err := reviews.Submit(ctx, actor, proposalID); err != nil {
+		t.Fatal(err)
+	}
+	if approved, err := reviews.Approve(ctx, actor, proposalID, groupID, 1); err != nil || approved.Status != "approved" {
+		t.Fatalf("approve: status=%q err=%v", approved.Status, err)
+	}
+	job, err := reviews.Enqueue(ctx, actor, proposalID, workflow.EnqueueInput{RequestID: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := env.ownerDB.ExecContext(ctx, `DELETE FROM app.job_execution_versions WHERE execution_id=$1`, job.ExecutionID); err != nil {
+			t.Error(err)
+		}
+	})
+	claim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "stale-review-worker", LeaseDuration: 45 * time.Second})
+	if err != nil || claim == nil || claim.JobID != job.JobID {
+		t.Fatalf("claim approved job: claim=%+v err=%v", claim, err)
+	}
+	gate := workflow.NewGate(pool)
+	deps := ExecutionDeps{Acquire: env.makeAcquire(t), Timeout: 10 * time.Second, Gate: afterWorkflowValidation{
+		Gate: gate, after: func(plan executioncontract.ExecutionPlan) {
+			again, err := gate.Revalidate(ctx, claim.RevalidationRequest())
+			if err != nil || plan.Version == "" || plan.Version != again.Version {
+				t.Fatalf("revalidation should reuse a reserved target version: %q, %q, err=%v", plan.Version, again.Version, err)
+			}
+			exec(`UPDATE app.group_database_grants SET access='view' WHERE group_id=$1 AND database_id=$2`, groupID, fix.dbID)
+		},
+	}}
+	outcome, err := svc.ExecuteStandardJob(ctx, claim, deps)
+	if err != nil || outcome == nil || outcome.Status != executioncontract.Failed {
+		t.Fatalf("execute stale job: outcome=%+v err=%v", outcome, err)
+	}
+	var code, attemptStatus, approvalStatus string
+	var entered, authorized bool
+	err = env.platformDB.QueryRowContext(ctx, `
+		SELECT j.error_code, a.status, a.sql_entered, p.status,
+		       EXISTS (SELECT 1 FROM app.job_dispatch_authorizations d WHERE d.job_id=j.id)
+		FROM app.jobs j JOIN app.job_attempts a ON a.job_id=j.id
+		JOIN app.migration_proposals p ON p.id=j.proposal_id
+		WHERE j.id=$1 AND a.id=$2`, claim.JobID, claim.AttemptID).
+		Scan(&code, &attemptStatus, &entered, &approvalStatus, &authorized)
+	if err != nil || code != "REVIEW_STALE" || attemptStatus != "failed" || entered || authorized || approvalStatus != "pending_review" {
+		t.Fatalf("stale state: code=%s attempt=%s entered=%v authorized=%v review=%s err=%v", code, attemptStatus, entered, authorized, approvalStatus, err)
+	}
+	var exists bool
+	if err := env.targetExecDB.QueryRowContext(ctx, "SELECT to_regclass($1) IS NOT NULL", "managed."+table).Scan(&exists); err != nil || exists {
+		t.Fatalf("stale SQL must not run: table=%v err=%v", exists, err)
+	}
+	if approved, err := reviews.Approve(ctx, actor, proposalID, groupID, 1); err != nil || approved.Status != "approved" {
+		t.Fatalf("approve fresh round: status=%q err=%v", approved.Status, err)
+	}
+}
+
 // 5. Decisive test for rejection before SQL on preflight forbidden schema
 func TestExecuteStandardJob_RejectionBeforeSQL_PreflightForbidden(t *testing.T) {
 	env := setupP3TestEnv(t)
@@ -934,6 +1063,8 @@ func TestExecuteStandardJob_DistinctPhysicalTargets_ParallelExecution(t *testing
 	tableNameB := "items_p3_par_b_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
 	sqlUpB := "CREATE TABLE managed." + tableNameB + " (id bigint primary key);"
 	fixB := createP3JobFixtureFull(t, env, env.physicalTargetID_B, env.targetExecDB_B, env.targetCleanupDB_B, "target_b", "worker-par-b", nil, executioncontract.Apply, executioncontract.Up, sqlUpB, "")
+	// A target's ticket versions outlive tests that don't remove their audit rows.
+	version := strconv.FormatInt(time.Now().UnixNano(), 10)
 
 	fakeGate := func(snapshot executioncontract.Draft) executioncontract.FakeGate {
 		return executioncontract.FakeGate{
@@ -941,7 +1072,7 @@ func TestExecuteStandardJob_DistinctPhysicalTargets_ParallelExecution(t *testing
 				return executioncontract.ExecutionPlan{
 					Request:       req,
 					Snapshot:      snapshot,
-					Version:       "1",
+					Version:       version,
 					ActorUsername: "testactor",
 					ValidatedAt:   time.Now().UTC(),
 				}, nil

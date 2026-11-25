@@ -64,6 +64,19 @@ func downResumeLineage(candidateID, blocked string) string {
 	)`, candidateID, strings.ReplaceAll(validDownResumeSource, "j.", "candidate."), blocked)
 }
 
+func batchEvidenceScope(job string) string {
+	return fmt.Sprintf(`bsa.scope_execution_id = CASE
+		WHEN %[1]s.direction = 'up' THEN %[1]s.execution_id
+		WHEN %[1]s.action = 'compensate' THEN %[1]s.source_execution_id
+		WHEN %[1]s.action = 'resume' THEN (
+			SELECT origin.source_execution_id FROM app.jobs origin
+			WHERE origin.execution_id = %[1]s.source_execution_id AND origin.target_id = %[1]s.target_id
+			  AND origin.database_id = %[1]s.database_id AND origin.migration_id = %[1]s.migration_id
+			  AND origin.revision = %[1]s.revision AND origin.snapshot_hash = %[1]s.snapshot_hash
+			  AND origin.mode = 'batch' AND origin.action = 'compensate' AND origin.direction = 'down'
+		) END`, job)
+}
+
 type ClaimRequest struct {
 	WorkerID      string
 	LeaseDuration time.Duration
@@ -503,11 +516,12 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 	)
 
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, database_id, target_id, proposal_id, migration_id, revision,
-		       execution_id, actor_id, action, direction, mode, attempt_no,
-		       source_execution_id::text, snapshot_hash, approval_fingerprint,
-		       status, traceparent, tracestate
+		SELECT j.id, j.database_id, j.target_id, j.proposal_id, j.migration_id, j.revision,
+		       j.execution_id, j.actor_id, j.action, j.direction, j.mode, j.attempt_no,
+		       j.source_execution_id::text, j.snapshot_hash, j.approval_fingerprint,
+		       j.status, j.traceparent, j.tracestate
 		FROM app.jobs j
+		JOIN app.migration_target_state target ON target.id = j.target_id
 		WHERE ((j.status = 'queued' AND j.next_retry_at IS NULL
 		        AND (
 		            (j.mode = 'standard' AND NOT j.blocks_database)
@@ -635,6 +649,14 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		                 EXISTS (SELECT 1 FROM app.job_batch_step_authorizations bsa WHERE bsa.attempt_id = a.id))
 		        )))
 		  AND NOT EXISTS (
+		      SELECT 1 FROM app.migration_executions legacy
+		      WHERE legacy.execution_target_id = j.target_id AND legacy.status IN ('running', 'unknown')
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM app.jobs active
+		      WHERE active.target_id = j.target_id AND active.id <> j.id AND active.status = 'running'
+		  )
+		  AND NOT EXISTS (
 		      SELECT 1 FROM app.jobs blocked
 		      WHERE blocked.target_id = j.target_id AND blocked.id <> j.id
 		        AND (
@@ -713,7 +735,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		                                                   AND bsa.batch_index = unse.batch_index
 		                                                   AND bsa.physical_target_id = blocked.target_id
 		                                                   AND bsa.direction = blocked.direction
-		                                                   AND (bsa.scope_execution_id = blocked.execution_id OR (blocked.action = 'resume' AND bsa.scope_execution_id = blocked.source_execution_id))
+		                                                   AND ` + batchEvidenceScope("blocked") + `
 		                                             ))
 		                                             OR (unse.outcome = 'succeeded' AND EXISTS (
 		                                                 SELECT 1 FROM app.job_batch_step_authorizations bsa
@@ -728,7 +750,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		                                                   AND bsa.batch_index = unse.batch_index
 		                                                   AND bsa.physical_target_id = blocked.target_id
 		                                                   AND bsa.direction = blocked.direction
-		                                                   AND (bsa.scope_execution_id = blocked.execution_id OR (blocked.action = 'resume' AND bsa.scope_execution_id = blocked.source_execution_id))
+		                                                   AND ` + batchEvidenceScope("blocked") + `
 		                                             ))
 		                                         )
 		                                     )
@@ -758,7 +780,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		        )
 		ORDER BY j.created_at ASC
 		LIMIT 1
-		FOR UPDATE OF j SKIP LOCKED
+		FOR UPDATE OF j, target SKIP LOCKED
 	`, maxAttempts).Scan(
 		&jobID, &databaseID, &targetID, &proposalID, &migrationID, &revision,
 		&executionID, &actorID, &action, &direction, &mode, &attemptNo,
@@ -770,6 +792,19 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query claimable job: %w", err)
+	}
+
+	// The candidate snapshot may predate another claimant's commit.
+	var busy bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM app.jobs WHERE target_id = $1 AND id <> $2 AND status = 'running'
+	) OR EXISTS (
+		SELECT 1 FROM app.migration_executions WHERE execution_target_id = $1 AND status IN ('running', 'unknown')
+	)`, targetID, jobID).Scan(&busy); err != nil {
+		return nil, fmt.Errorf("recheck claim target: %w", err)
+	}
+	if busy {
+		return nil, nil
 	}
 
 	if in.afterLock != nil {

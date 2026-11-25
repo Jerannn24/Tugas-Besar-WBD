@@ -127,6 +127,10 @@ func TestClaimJob_RevalidationRequest(t *testing.T) {
 		f := createClaimFixture(t, platformDB, ownerDB)
 		if sourceID != nil {
 			createFixtureSource(t, ctx, platformDB, f, *sourceID)
+			if _, err := platformDB.ExecContext(ctx, `UPDATE app.migration_executions
+				SET status='succeeded', finished_at=clock_timestamp() WHERE id=$1`, *sourceID); err != nil {
+				t.Fatal(err)
+			}
 		}
 		proposalID := createFixtureProposal(t, ctx, platformDB, f, executioncontract.Rollback, sourceID)
 		req := executioncontract.EnqueueRequest{
@@ -1090,7 +1094,6 @@ func TestClaimJob_SourceEvidenceBlocksQueuedResume(t *testing.T) {
 
 	// Enqueue resume job referencing source execution
 	sourceExecID := claim1.ExecutionID
-	createFixtureSource(t, ctx, platformDB, f, sourceExecID)
 	resumeProposalID := createFixtureProposal(t, ctx, platformDB, f, executioncontract.Resume, &sourceExecID)
 	tx2, err := platformDB.BeginTx(ctx, nil)
 	if err != nil {
@@ -1823,5 +1826,128 @@ func TestReclaimExpiredJobsSkipsAmbiguousFirstCandidate(t *testing.T) {
 	}
 	if c, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "third"}); err != nil || c == nil || c.JobID != b.JobID {
 		t.Fatalf("eligible retry was not claimed: claim=%+v err=%v", c, err)
+	}
+}
+
+func TestClaimJobLegacyTargetAdmission(t *testing.T) {
+	db, owner := testDBs(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	svc := New(db)
+	blocked, other := createClaimFixture(t, db, owner), createClaimFixture(t, db, owner)
+	for _, f := range []fixture{blocked, other} {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = svc.EnqueueTx(ctx, tx, executioncontract.EnqueueRequest{
+			DatabaseID: f.dbID, TargetID: f.targetID, RequestID: uuid.NewString(),
+			ProposalID: f.proposalID, MigrationID: f.draftID, Revision: 1,
+			ActorID: f.actorID, Action: executioncontract.Apply, Direction: executioncontract.Up,
+			Snapshot: f.snapshot, SnapshotHash: f.hash, ApprovalFingerprint: "fp",
+		})
+		if err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source := uuid.NewString()
+	createFixtureSource(t, ctx, db, blocked, source)
+	for _, status := range []string{"running", "unknown"} {
+		if status == "unknown" {
+			if _, err := owner.ExecContext(ctx, `UPDATE app.migration_executions SET status='unknown' WHERE id=$1`, source); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = guardLegacyUnresolved(ctx, tx, blocked.targetID)
+		var contractErr executioncontract.ContractError
+		if !errors.As(err, &contractErr) || contractErr.Code != "TARGET_BLOCKED" {
+			t.Fatalf("%s guard: %v", status, err)
+		}
+		if err := guardLegacyUnresolved(ctx, tx, other.targetID); err != nil {
+			t.Fatalf("%s other target guard: %v", status, err)
+		}
+		tx.Rollback()
+		claim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "legacy-admission"})
+		if err != nil || (claim != nil && claim.TargetID == blocked.targetID) {
+			t.Fatalf("%s legacy claim: %+v, %v", status, claim, err)
+		}
+		if status == "running" && (claim == nil || claim.TargetID != other.targetID) {
+			t.Fatalf("other target not claimed: %+v, %v", claim, err)
+		}
+	}
+}
+
+func TestClaimJobSameTargetDoesNotOverlap(t *testing.T) {
+	db, owner := testDBs(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	svc := New(db)
+	f := createClaimFixture(t, db, owner)
+	sameTarget := f
+	sameTarget.draftID = uuid.NewString()
+	sameTarget.snapshot.MigrationID = sameTarget.draftID
+	if _, err := db.ExecContext(ctx, `INSERT INTO app.migration_drafts (id,database_id,title,sql,created_by)
+		SELECT $1,database_id,title,sql,created_by FROM app.migration_drafts WHERE id=$2`, sameTarget.draftID, f.draftID); err != nil {
+		t.Fatal(err)
+	}
+	sameTarget.proposalID = createFixtureProposal(t, ctx, db, sameTarget, executioncontract.Apply, nil)
+	other := createClaimFixture(t, db, owner)
+	for _, f := range []fixture{f, sameTarget, other} {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = svc.EnqueueTx(ctx, tx, executioncontract.EnqueueRequest{
+			DatabaseID: f.dbID, TargetID: f.targetID, RequestID: uuid.NewString(),
+			ProposalID: f.proposalID, MigrationID: f.draftID, Revision: 1,
+			ActorID: f.actorID, Action: executioncontract.Apply, Direction: executioncontract.Up,
+			Snapshot: f.snapshot, SnapshotHash: f.hash, ApprovalFingerprint: "fp",
+		})
+		if err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locked, release := make(chan struct{}), make(chan struct{})
+	type result struct {
+		claim *Claim
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		claim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "first", afterLock: func(context.Context) error {
+			close(locked)
+			<-release
+			return nil
+		}})
+		done <- result{claim, err}
+	}()
+	select {
+	case <-locked:
+	case <-ctx.Done():
+		close(release)
+		t.Fatal(ctx.Err())
+	}
+	second, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "second"})
+	close(release)
+	first := <-done
+	if err != nil || second == nil || second.TargetID != other.targetID ||
+		first.err != nil || first.claim == nil || first.claim.TargetID != f.targetID {
+		t.Fatalf("concurrent claims: first=%+v second=%+v err=%v", first, second, err)
+	}
+	second, err = svc.ClaimJob(ctx, ClaimRequest{WorkerID: "second"})
+	if err != nil || second != nil {
+		t.Fatalf("claim while first runs: %+v, %v", second, err)
 	}
 }

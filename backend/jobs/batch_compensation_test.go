@@ -300,34 +300,6 @@ func TestExecuteBatchJob_Compensation_FailureMidDown_ResumeRecoveryWithoutReplay
 	if batch2Processed {
 		t.Fatalf("expected batch 2 items to be reverted to false, but found processed=true")
 	}
-	// The test gate does not publish workflow history. The proposal references
-	// a legacy execution row, whose SQL must match the stored up draft.
-	if _, err := platformDB.ExecContext(ctx, `
-		UPDATE app.migration_executions
-		SET status = 'succeeded', finished_at = clock_timestamp()
-		WHERE id = $1
-	`, upFix.executionID); err != nil {
-		t.Fatalf("finish up history fixture: %v", err)
-	}
-	if _, err := platformDB.ExecContext(ctx, `
-		WITH next_version AS (
-			UPDATE app.migration_target_state
-			SET next_version = next_version + 1
-			WHERE id = $2
-			RETURNING next_version - 1 AS version
-		)
-		INSERT INTO app.migration_executions
-			(id, database_id, execution_target_id, draft_id, request_id, draft_revision,
-			 version, title, sql, sql_sha256, executed_by, executed_username, started_at, status)
-		SELECT $3, m.database_id, m.execution_target_id, m.draft_id, $4, m.draft_revision,
-		       v.version, m.title, m.sql, m.sql_sha256, m.executed_by,
-		       m.executed_username, clock_timestamp(), 'running'
-		FROM app.migration_executions m CROSS JOIN next_version v
-		WHERE m.id = $1
-	`, upFix.executionID, e.target, compFix1.executionID, uuid.NewString()); err != nil {
-		t.Fatalf("insert compensation history fixture: %v", err)
-	}
-
 	// Resume the interrupted compensation through the queue.
 	compFix2 := createDownFixture(t, platformDB, ownerDB, e.target, 2, &compFix1, executioncontract.Resume)
 

@@ -617,7 +617,7 @@ func (s *Service) checkBatchLeaseAndTargetBlock(ctx context.Context, claim *Clai
 			                                              AND bsa.batch_index = unse.batch_index
 			                                              AND bsa.physical_target_id = j.target_id
 			                                              AND bsa.direction = j.direction
-			                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+			                                              AND ` + batchEvidenceScope("j") + `
 			                                        ))
 			                                        OR (unse.outcome = 'succeeded' AND EXISTS (
 			                                            SELECT 1 FROM app.job_batch_step_authorizations bsa
@@ -632,7 +632,7 @@ func (s *Service) checkBatchLeaseAndTargetBlock(ctx context.Context, claim *Clai
 			                                              AND bsa.batch_index = unse.batch_index
 			                                              AND bsa.physical_target_id = j.target_id
 			                                              AND bsa.direction = j.direction
-			                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+			                                              AND ` + batchEvidenceScope("j") + `
 			                                        ))
 			                                    )
 			                                )
@@ -675,7 +675,7 @@ func (s *Service) checkBatchLeaseAndTargetBlock(ctx context.Context, claim *Clai
 	return nil
 }
 
-func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, scopeExecID string, plan executioncontract.ExecutionPlan, sqlText, xid string, version int64, ordinal, batchIndex int, chunkIDs []int64) error {
+func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, gate executioncontract.WorkflowGate, scopeExecID string, plan executioncontract.ExecutionPlan, sqlText, xid string, version int64, ordinal, batchIndex int, chunkIDs []int64) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("batch dispatch authorization aborted: %w", err)
 	}
@@ -802,7 +802,7 @@ func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, scop
 			                                              AND bsa.batch_index = unse.batch_index
 			                                              AND bsa.physical_target_id = j.target_id
 			                                              AND bsa.direction = j.direction
-			                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+			                                              AND ` + batchEvidenceScope("j") + `
 			                                        ))
 			                                        OR (unse.outcome = 'succeeded' AND EXISTS (
 			                                            SELECT 1 FROM app.job_batch_step_authorizations bsa
@@ -817,7 +817,7 @@ func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, scop
 			                                              AND bsa.batch_index = unse.batch_index
 			                                              AND bsa.physical_target_id = j.target_id
 			                                              AND bsa.direction = j.direction
-			                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+			                                              AND ` + batchEvidenceScope("j") + `
 			                                        ))
 			                                    )
 			                                )
@@ -853,6 +853,23 @@ func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, scop
 	if blocked {
 		return executioncontract.ContractError{Code: "TARGET_BLOCKED", Message: "target has an unresolved execution"}
 	}
+	if err := guardLegacyUnresolved(ctx, tx, claim.TargetID); err != nil {
+		return err
+	}
+	transactional, ok := gate.(interface {
+		RevalidateTx(context.Context, *sql.Tx, executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error)
+	})
+	if !ok {
+		return errors.New("batch dispatch requires transactional workflow revalidation")
+	}
+	current, err := transactional.RevalidateTx(ctx, tx, claim.RevalidationRequest())
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(current.Request, plan.Request) || !reflect.DeepEqual(current.Snapshot, plan.Snapshot) || current.Version != plan.Version {
+		return executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan changed before dispatch"}
+	}
+	plan = current
 
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
@@ -2554,11 +2571,7 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 
 	plan, err := deps.Gate.Revalidate(ctx, claim.RevalidationRequest())
 	if err != nil {
-		var cErr executioncontract.ContractError
-		if errors.As(err, &cErr) && cErr.Code == "REVIEW_STALE" {
-			return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", err)
-		}
-		return nil, fmt.Errorf("workflow revalidation failed: %w", err)
+		return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 	}
 	if !reflect.DeepEqual(plan.Request, claim.RevalidationRequest()) {
 		return nil, executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan request mismatch"}
@@ -2958,7 +2971,7 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 					}
 					return &ExecutionOutcome{Status: executioncontract.Partial, Error: err}, nil
 				}
-				return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", err)
+				return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 			}
 			if earlierCommitted {
 				if failErr := s.failPartialJob(ctx, claim, "GATE_DENIED", err.Error()); failErr != nil {
@@ -3090,12 +3103,18 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 
 		// Lease-fenced atomic persisted authorization and target block immediately before SQL
 		ordinal := batchIdx + 1
-		if err := s.authorizeBatchDispatch(ctx, claim, scopeExecID, chunkPlan, approvedSQLText, xid, version, ordinal, batchIdx, chunkIDs); err != nil {
+		if err := s.authorizeBatchDispatch(ctx, claim, deps.Gate, scopeExecID, chunkPlan, approvedSQLText, xid, version, ordinal, batchIdx, chunkIDs); err != nil {
 			clear(capability)
 			_ = session.Rollback()
 			var cErr executioncontract.ContractError
-			if errors.As(err, &cErr) && cErr.Code == "LEASE_MISMATCH" {
-				return nil, err
+			if errors.As(err, &cErr) && !cErr.Retryable && cErr.Code != "LEASE_MISMATCH" {
+				if earlierCommitted {
+					if failErr := s.failPartialJob(ctx, claim, cErr.Code, cErr.Message); failErr != nil {
+						return nil, errors.Join(err, failErr)
+					}
+					return &ExecutionOutcome{Status: executioncontract.Partial, Error: err}, nil
+				}
+				return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 			}
 			return nil, err
 		}
@@ -3919,11 +3938,7 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 
 	plan, err := deps.Gate.Revalidate(ctx, claim.RevalidationRequest())
 	if err != nil {
-		var cErr executioncontract.ContractError
-		if errors.As(err, &cErr) && cErr.Code == "REVIEW_STALE" {
-			return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", err)
-		}
-		return nil, fmt.Errorf("workflow revalidation failed: %w", err)
+		return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 	}
 	if !reflect.DeepEqual(plan.Request, claim.RevalidationRequest()) {
 		return nil, executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan request mismatch"}
@@ -4384,7 +4399,7 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 					_ = s.failPartiallyRevertedJob(ctx, claim, "REVIEW_STALE", err.Error())
 					return &ExecutionOutcome{Status: executioncontract.PartiallyReverted, Error: err}, nil
 				}
-				return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", err)
+				return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 			}
 			if earlierReverted {
 				_ = s.failPartiallyRevertedJob(ctx, claim, "GATE_DENIED", err.Error())
@@ -4488,12 +4503,18 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 		}
 
 		ordinal := batchesRevertedCount + 1
-		if err := s.authorizeBatchDispatch(ctx, claim, scopeExecID, chunkPlan, approvedSQLText, xid, version, ordinal, batchIdx, chunkIDs); err != nil {
+		if err := s.authorizeBatchDispatch(ctx, claim, deps.Gate, scopeExecID, chunkPlan, approvedSQLText, xid, version, ordinal, batchIdx, chunkIDs); err != nil {
 			clear(capability)
 			_ = session.Rollback()
 			var cErr executioncontract.ContractError
-			if errors.As(err, &cErr) && cErr.Code == "LEASE_MISMATCH" {
-				return nil, err
+			if errors.As(err, &cErr) && !cErr.Retryable && cErr.Code != "LEASE_MISMATCH" {
+				if earlierReverted {
+					if failErr := s.failPartiallyRevertedJob(ctx, claim, cErr.Code, cErr.Message); failErr != nil {
+						return nil, errors.Join(err, failErr)
+					}
+					return &ExecutionOutcome{Status: executioncontract.PartiallyReverted, Error: err}, nil
+				}
+				return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 			}
 			return nil, err
 		}
