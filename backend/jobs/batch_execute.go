@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"reflect"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
@@ -23,49 +22,6 @@ var (
 	chkPageLimit      = 20
 	recoveryPageLimit = 20
 )
-func validateAgreedBatchSQL(dir executioncontract.Direction, sqlText string) error {
-	normalized := strings.ToUpper(strings.Join(strings.Fields(strings.TrimRight(strings.TrimSpace(sqlText), ";")), " "))
-	if dir == executioncontract.Up {
-		if normalized != "UPDATE MANAGED.BATCH_ITEMS SET PROCESSED = TRUE WHERE ID = ANY($1::BIGINT[])" {
-			return executioncontract.ContractError{
-				Code:    "SQL_UNSUPPORTED",
-				Message: "batch SQL does not match agreed immutable UPDATE pattern",
-			}
-		}
-		return nil
-	}
-	if dir == executioncontract.Down {
-		if normalized != "UPDATE MANAGED.BATCH_ITEMS SET PROCESSED = FALSE WHERE ID = ANY($1::BIGINT[])" {
-			return executioncontract.ContractError{
-				Code:    "SQL_UNSUPPORTED",
-				Message: "batch SQL does not match agreed immutable UPDATE pattern",
-			}
-		}
-		return nil
-	}
-	return executioncontract.ContractError{
-		Code:    "INVALID_DIRECTION",
-		Message: "unsupported direction for batch execution",
-	}
-}
-
-func validateAgreedBatchConfig(cfg *executioncontract.BatchConfig) error {
-	if cfg == nil {
-		return executioncontract.ContractError{
-			Code:    "INVALID_BATCH_CONFIG",
-			Message: "batch configuration is required",
-		}
-	}
-	if cfg.Schema != "managed" || cfg.Table != "batch_items" || cfg.CursorColumn != "id" ||
-		cfg.BatchSize < 1 || cfg.BatchSize > 10000 {
-		return executioncontract.ContractError{
-			Code:    "INVALID_BATCH_CONFIG",
-			Message: "batch configuration must target managed.batch_items with cursor id and batch size 1..10000",
-		}
-	}
-	return nil
-}
-
 func (s *Service) failPartialJob(ctx context.Context, claim *Claim, code, msg string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
@@ -2095,7 +2051,7 @@ func (s *Service) scanAndReconcileBatchCheckpoints(
 				outc, outcErr := s.failedBlockedOutcome(ctx, claim, "TARGET_BLOCKED", errors.New("authorized step SQL sha256 mismatch"))
 				return nil, outc, outcErr
 			}
-			if err := validateAgreedBatchSQL(claim.Direction, step.bsaSQLText); err != nil {
+			if err := executioncontract.ValidateBatchSQL(claim.Direction, step.bsaSQLText); err != nil {
 				outc, outcErr := s.failedBlockedOutcome(ctx, claim, "TARGET_BLOCKED", fmt.Errorf("authorized step SQL invalid: %w", err))
 				return nil, outc, outcErr
 			}
@@ -2109,7 +2065,7 @@ func (s *Service) scanAndReconcileBatchCheckpoints(
 				outc, outcErr := s.failedBlockedOutcome(ctx, claim, "TARGET_BLOCKED", fmt.Errorf("decode step plan: %w", err))
 				return nil, outc, outcErr
 			}
-			if err := validateAgreedBatchConfig(stepPlan.Snapshot.Batch); err != nil {
+			if err := executioncontract.ValidateBatchConfig(stepPlan.Snapshot.Batch); err != nil {
 				outc, outcErr := s.failedBlockedOutcome(ctx, claim, "TARGET_BLOCKED", fmt.Errorf("authorized step batch config invalid: %w", err))
 				return nil, outc, outcErr
 			}
@@ -2560,11 +2516,11 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 	if !reflect.DeepEqual(plan.Request, claim.RevalidationRequest()) {
 		return nil, executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan request mismatch"}
 	}
-	if err := validateAgreedBatchConfig(plan.Snapshot.Batch); err != nil {
+	if err := executioncontract.ValidateBatchConfig(plan.Snapshot.Batch); err != nil {
 		return s.failedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", err)
 	}
 	sqlText, err := selectSQL(plan, claim.Action, claim.Direction)
-	if err != nil || validateAgreedBatchSQL(claim.Direction, sqlText) != nil {
+	if err != nil || executioncontract.ValidateBatchSQL(claim.Direction, sqlText) != nil {
 		return s.failedOutcome(ctx, claim, "SQL_UNSUPPORTED", errors.New("plan SQL does not match agreed batch pattern"))
 	}
 	approvedSnapBytes, err := json.Marshal(plan.Snapshot)
@@ -2993,7 +2949,7 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 			}
 			return nil, err
 		}
-		if err := validateAgreedBatchConfig(chunkPlan.Snapshot.Batch); err != nil ||
+		if err := executioncontract.ValidateBatchConfig(chunkPlan.Snapshot.Batch); err != nil ||
 			chunkPlan.Snapshot.Batch.BatchSize != approvedBatchConfig.BatchSize ||
 			chunkPlan.Snapshot.Batch.Schema != approvedBatchConfig.Schema ||
 			chunkPlan.Snapshot.Batch.Table != approvedBatchConfig.Table ||
@@ -3006,7 +2962,7 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 			return nil, err
 		}
 		chunkSQL, err := selectSQL(chunkPlan, claim.Action, claim.Direction)
-		if err != nil || chunkSQL != approvedSQLText || validateAgreedBatchSQL(claim.Direction, chunkSQL) != nil {
+		if err != nil || chunkSQL != approvedSQLText || executioncontract.ValidateBatchSQL(claim.Direction, chunkSQL) != nil {
 			err := executioncontract.ContractError{Code: "SQL_MISMATCH", Message: "workflow plan SQL changed"}
 			if earlierCommitted {
 				_ = s.failPartialJob(ctx, claim, "SQL_MISMATCH", err.Message)
@@ -3411,7 +3367,7 @@ func (s *Service) ReconcileBatchJob(ctx context.Context, claim *Claim, deps Exec
 	if draft.Batch == nil {
 		return s.failedBlockedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", errors.New("draft snapshot missing batch configuration"))
 	}
-	if err := validateAgreedBatchConfig(draft.Batch); err != nil {
+	if err := executioncontract.ValidateBatchConfig(draft.Batch); err != nil {
 		return s.failedBlockedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", err)
 	}
 	batchSize := draft.Batch.BatchSize
@@ -3928,11 +3884,11 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 	if !reflect.DeepEqual(plan.Request, claim.RevalidationRequest()) {
 		return nil, executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan request mismatch"}
 	}
-	if err := validateAgreedBatchConfig(plan.Snapshot.Batch); err != nil {
+	if err := executioncontract.ValidateBatchConfig(plan.Snapshot.Batch); err != nil {
 		return s.failedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", err)
 	}
 	sqlText, err := selectSQL(plan, claim.Action, claim.Direction)
-	if err != nil || validateAgreedBatchSQL(claim.Direction, sqlText) != nil {
+	if err != nil || executioncontract.ValidateBatchSQL(claim.Direction, sqlText) != nil {
 		return s.failedOutcome(ctx, claim, "SQL_UNSUPPORTED", errors.New("plan SQL does not match agreed batch pattern"))
 	}
 	approvedPlanVersion := plan.Version
@@ -4396,7 +4352,7 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 
 		if !reflect.DeepEqual(chunkPlan.Request, claim.RevalidationRequest()) ||
 			chunkPlan.Version != approvedPlanVersion ||
-			validateAgreedBatchConfig(chunkPlan.Snapshot.Batch) != nil {
+			executioncontract.ValidateBatchConfig(chunkPlan.Snapshot.Batch) != nil {
 			err := executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan changed"}
 			if earlierReverted {
 				_ = s.failPartiallyRevertedJob(ctx, claim, "PLAN_MISMATCH", err.Message)
@@ -4405,7 +4361,7 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 			return nil, err
 		}
 		chunkSQL, err := selectSQL(chunkPlan, claim.Action, claim.Direction)
-		if err != nil || chunkSQL != approvedSQLText || validateAgreedBatchSQL(claim.Direction, chunkSQL) != nil {
+		if err != nil || chunkSQL != approvedSQLText || executioncontract.ValidateBatchSQL(claim.Direction, chunkSQL) != nil {
 			err := executioncontract.ContractError{Code: "SQL_MISMATCH", Message: "workflow plan SQL changed"}
 			if earlierReverted {
 				_ = s.failPartiallyRevertedJob(ctx, claim, "SQL_MISMATCH", err.Message)
@@ -4730,7 +4686,7 @@ func (s *Service) reconcileBatchJobDown(ctx context.Context, claim *Claim, deps 
 	if draft.Batch == nil {
 		return s.failedBlockedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", errors.New("draft snapshot missing batch configuration"))
 	}
-	if err := validateAgreedBatchConfig(draft.Batch); err != nil {
+	if err := executioncontract.ValidateBatchConfig(draft.Batch); err != nil {
 		return s.failedBlockedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", err)
 	}
 	batchSize := draft.Batch.BatchSize

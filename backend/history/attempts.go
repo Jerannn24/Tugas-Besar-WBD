@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 )
 
 type historyCursor struct {
@@ -47,7 +49,7 @@ func (h *Handler) commit(ctx context.Context, database, execution string) (json.
 	return data, err
 }
 
-const attemptPageQuery = `WITH candidates AS (
+var attemptPageQuery = `WITH candidates AS (
  SELECT a.id AS attempt_id,a.execution_id,a.migration_id,a.revision,a.actor_id,u.username,
  j.action,j.direction,a.status,a.started_at,a.finished_at,j.source_execution_id,a.sql_entered,
  (SELECT h.target_version::text FROM app.migration_history_entries h WHERE h.database_id=a.database_id AND h.attempt_id=a.id ORDER BY h.version DESC LIMIT 1) AS version,
@@ -106,7 +108,10 @@ const attemptPageQuery = `WITH candidates AS (
  CASE WHEN app.workflow_source_valid(j.database_id,d.execution_target_id,j.migration_id,j.revision,'rollback',p.execution_id,j.mode)
    THEN 'propose_rollback' END,
  CASE WHEN app.workflow_source_valid(j.database_id,d.execution_target_id,j.migration_id,j.revision,'forward',p.execution_id,j.mode)
-   THEN 'propose_forward' END],NULL)) AS value
+   THEN 'propose_forward' END,
+ CASE WHEN app.workflow_source_valid(j.database_id,d.execution_target_id,j.migration_id,j.revision,'compensate',p.execution_id,j.mode)
+   AND ` + executioncontract.ReversibleSnapshotSQL("j") + `
+   THEN 'propose_compensate' END],NULL)) AS value
  FROM app.jobs j
  JOIN app.database_connections d ON d.id=j.database_id AND d.deleted_at IS NULL
  JOIN app.migration_drafts draft ON draft.id=j.migration_id AND draft.database_id=j.database_id
