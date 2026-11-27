@@ -4158,7 +4158,7 @@ func TestExecuteBatchJob_RestartRecovery_AutonomousDiscoveryAndReceiptRecovery(t
 		}
 
 		// 2. Natural clock lease expiry (no synthetic/manual state modification)
-		time.Sleep(650 * time.Millisecond)
+		waitLeaseExpiredByDB(t, platformDB, fix1.claim.JobID, 10*time.Second)
 
 		// 3. Process restart simulation: create fresh Service instance
 		restartSvc := New(platformDB)
@@ -4413,7 +4413,7 @@ func TestExecuteBatchJob_RestartRecovery_AutonomousDiscoveryAndReceiptRecovery(t
 		}
 
 		// 2. Natural lease expiry
-		time.Sleep(1100 * time.Millisecond)
+		waitLeaseExpiredByDB(t, platformDB, fix.claim.JobID, 10*time.Second)
 		// 3. Process restart simulation
 		restartSvc := New(platformDB)
 
@@ -4618,7 +4618,7 @@ func TestExecuteBatchJob_RestartRecovery_AutonomousDiscoveryAndReceiptRecovery(t
 			t.Fatalf("insert uncertain checkpoint: %v", err)
 		}
 		// 2. Natural lease expiry (process restart with no synthetic state modification)
-		time.Sleep(450 * time.Millisecond)
+		waitLeaseExpiredByDB(t, platformDB, fix.claim.JobID, 10*time.Second)
 
 		// 3. Process restart simulation: fresh Service instance
 		restartSvc := New(platformDB)
@@ -4713,7 +4713,7 @@ func TestExecuteBatchJob_RestartRecovery_AutonomousDiscoveryAndReceiptRecovery(t
 			t.Fatalf("expected crash before commit, got: %+v", outcome)
 		}
 
-		time.Sleep(150 * time.Millisecond)
+		waitLeaseExpiredByDB(t, platformDB, fix.claim.JobID, 10*time.Second)
 
 		if _, err := platformDB.ExecContext(ctx, "UPDATE app.jobs SET status = 'unknown', execution_status = 'unknown' WHERE id = $1", fix.claim.JobID); err != nil {
 			t.Fatalf("set job unknown: %v", err)
@@ -4817,7 +4817,7 @@ func TestExecuteBatchJob_RestartRecovery_AutonomousDiscoveryAndReceiptRecovery(t
 			t.Fatalf("expected crash during batch 1, got outcome=%+v", outcome)
 		}
 
-		time.Sleep(150 * time.Millisecond)
+		waitLeaseExpiredByDB(t, platformDB, fix.claim.JobID, 10*time.Second)
 
 		if _, err := platformDB.ExecContext(ctx, "UPDATE app.jobs SET status = 'unknown', execution_status = 'unknown' WHERE id = $1", fix.claim.JobID); err != nil {
 			t.Fatalf("set job unknown: %v", err)
@@ -5252,7 +5252,7 @@ func TestExecuteBatchJob_Regression_LaterResumeRecoveringPreviousFinalCommitWith
 	if err == nil {
 		t.Fatalf("expected crash on job 1, got outcome=%+v", outcome1)
 	}
-	time.Sleep(150 * time.Millisecond)
+	waitLeaseExpiredByDB(t, platformDB, fix1.claim.JobID, 10*time.Second)
 
 	recOutcome1, err := svc.ReconcileBatchJobByID(ctx, fix1.claim.JobID, ExecutionDeps{
 		Gate:    batchFakeGate(fix1.snapshot),
@@ -5283,7 +5283,7 @@ func TestExecuteBatchJob_Regression_LaterResumeRecoveringPreviousFinalCommitWith
 	if err == nil {
 		t.Fatalf("expected crash on job 2, got outcome=%+v", outcome2)
 	}
-	time.Sleep(300 * time.Millisecond)
+	waitLeaseExpiredByDB(t, platformDB, fix2.claim.JobID, 10*time.Second)
 
 	recOutcome2, err := svc.ReconcileBatchJobByID(ctx, fix2.claim.JobID, ExecutionDeps{
 		Gate:    batchFakeGate(fix2.snapshot),
@@ -5314,7 +5314,7 @@ func TestExecuteBatchJob_Regression_LaterResumeRecoveringPreviousFinalCommitWith
 	if err == nil {
 		t.Fatalf("expected crash on job 3, got outcome=%+v", outcome3)
 	}
-	time.Sleep(150 * time.Millisecond)
+	waitLeaseExpiredByDB(t, platformDB, fix3.claim.JobID, 10*time.Second)
 	if _, err := platformDB.ExecContext(ctx, "UPDATE app.migration_proposals SET status = 'superseded' WHERE id = $1", fix3.proposalID); err != nil {
 		t.Fatalf("supersede proposal 3: %v", err)
 	}
@@ -5411,7 +5411,7 @@ func TestExecuteBatchJob_Regression_AbortedResumeAfterPriorCheckpoint_DurableDis
 	if err == nil {
 		t.Fatalf("expected crash on job 1, got outcome=%+v", outcome1)
 	}
-	time.Sleep(300 * time.Millisecond)
+	waitLeaseExpiredByDB(t, platformDB, fix1.claim.JobID, 10*time.Second)
 
 	recOutcome1, err := svc.ReconcileBatchJobByID(ctx, fix1.claim.JobID, ExecutionDeps{
 		Gate:    batchFakeGate(fix1.snapshot),
@@ -5439,7 +5439,7 @@ func TestExecuteBatchJob_Regression_AbortedResumeAfterPriorCheckpoint_DurableDis
 	if err == nil {
 		t.Fatalf("expected crash on job 2, got outcome=%+v", outcome2)
 	}
-	time.Sleep(150 * time.Millisecond)
+	waitLeaseExpiredByDB(t, platformDB, fix2.claim.JobID, 10*time.Second)
 
 	// Verify attempt 2 committed 0 proofs
 	var committedProofs int
@@ -5587,10 +5587,15 @@ func TestExecuteBatchJob_Regression_LineageBlockers_MissingOrInconsistentAuthori
 	}
 
 	// Job C: Inconsistent physical target
-	var otherTargetID string
-	if err := platformDB.QueryRowContext(ctx, "SELECT id::text FROM app.migration_target_state WHERE id <> $1 LIMIT 1", e.target).Scan(&otherTargetID); err != nil {
-		t.Fatalf("query other target: %v", err)
+	// Own the other target instead of relying on rows left by other tests.
+	otherTargetID := uuid.NewString()
+	if _, err := ownerDB.ExecContext(ctx, "INSERT INTO app.migration_target_state (id, next_version) VALUES ($1, 1)", otherTargetID); err != nil {
+		t.Fatalf("insert other target: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = ownerDB.ExecContext(context.Background(), "DELETE FROM app.job_batch_step_authorizations WHERE physical_target_id = $1", otherTargetID)
+		_, _ = ownerDB.ExecContext(context.Background(), "DELETE FROM app.migration_target_state WHERE id = $1", otherTargetID)
+	})
 	jobCID := uuid.NewString()
 	attCID := uuid.NewString()
 	authCID := uuid.NewString()
@@ -5764,7 +5769,7 @@ func TestExecuteBatchJob_Regression_ManyJobClosureBound_BoundedMemoryAndCancella
 	`, attIDs[0], "UPDATE managed.batch_items SET processed = true WHERE id = ANY($1::bigint[]);"); err != nil {
 		t.Fatalf("insert statement evidence: %v", err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	waitLeaseExpiredByDB(t, platformDB, fix1.claim.JobID, 10*time.Second)
 
 	restartSvc := New(platformDB)
 	// Phase 1: Test cancellation on page 1 (second page of attempts)
@@ -5881,7 +5886,7 @@ func TestExecuteBatchJob_Regression_Terra1_ExtraUnknownStatementRetainsBlockAndT
 	if err == nil {
 		t.Fatalf("expected crash on job 1, got outcome=%+v", outcome1)
 	}
-	time.Sleep(150 * time.Millisecond)
+	waitLeaseExpiredByDB(t, platformDB, fix1.claim.JobID, 10*time.Second)
 
 	// Reconcile job 1 to partial
 	recOutcome1, err := svc.ReconcileBatchJobByID(ctx, fix1.claim.JobID, ExecutionDeps{
@@ -6378,7 +6383,7 @@ func TestExecuteBatchJob_Regression_Terra4_BoundInconsistentStatementMemoryAndRe
 			t.Fatalf("insert statement 2: %v", err)
 		}
 
-		time.Sleep(150 * time.Millisecond)
+		waitLeaseExpiredByDB(t, platformDB, fix.claim.JobID, 10*time.Second)
 
 		recOutcome, err := svc.ReconcileBatchJobByID(ctx, fix.claim.JobID, ExecutionDeps{
 			Gate:    batchFakeGate(fix.snapshot),
@@ -6468,7 +6473,7 @@ func TestExecuteBatchJob_Regression_Terra4_BoundInconsistentStatementMemoryAndRe
 			t.Fatalf("insert mismatched statement: %v", err)
 		}
 
-		time.Sleep(150 * time.Millisecond)
+		waitLeaseExpiredByDB(t, platformDB, fix.claim.JobID, 10*time.Second)
 
 		recOutcome, err := svc.ReconcileBatchJobByID(ctx, fix.claim.JobID, ExecutionDeps{
 			Gate:    batchFakeGate(fix.snapshot),
@@ -6650,7 +6655,7 @@ func TestExecuteBatchJob_Regression_Terra5_AbortedXIDWithMalformedStatement_Reta
 	}
 
 	// Let job lease expire naturally
-	time.Sleep(300 * time.Millisecond)
+	waitLeaseExpiredByDB(t, platformDB, fix.claim.JobID, 10*time.Second)
 	recOutcome, err := svc.ReconcileBatchJobByID(ctx, fix.claim.JobID, ExecutionDeps{
 		Gate:    batchFakeGate(fix.snapshot),
 		Acquire: acquire,
@@ -6914,5 +6919,28 @@ func TestExecuteBatchJob_ResumeFailsClosedWhenPriorCommitUncertain(t *testing.T)
 	}
 	if p3 || p4 {
 		t.Fatalf("target rows changed while blocked: 3=%t 4=%t", p3, p4)
+	}
+}
+
+// waitLeaseExpiredByDB waits until Postgres itself sees the job lease as expired, so expiry stays natural.
+func waitLeaseExpiredByDB(t *testing.T, db *sql.DB, jobID string, timeout time.Duration) {
+	t.Helper()
+	start := time.Now()
+	for {
+		var expired sql.NullBool
+		var dbNow, lease sql.NullTime
+		err := db.QueryRow(`SELECT clock_timestamp() > lease_expires_at, clock_timestamp(), lease_expires_at
+			FROM app.jobs WHERE id = $1`, jobID).Scan(&expired, &dbNow, &lease)
+		if err != nil {
+			t.Fatalf("read lease of job %s: %v", jobID, err)
+		}
+		if !lease.Valid || expired.Bool {
+			return
+		}
+		if time.Since(start) > timeout {
+			t.Fatalf("lease of job %s not expired by Postgres after %v: db_now=%v lease=%v go_now=%v",
+				jobID, time.Since(start), dbNow.Time, lease.Time, time.Now().UTC())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

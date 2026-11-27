@@ -531,6 +531,37 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM app.migration_proposals WHERE migration_id=$1 AND action='compensate'`, irreversibleDraft.ID).Scan(&irreversibleProposals); err != nil || irreversibleProposals != 0 {
 			t.Fatalf("rejected compensation must not create a proposal: count=%d err=%v", irreversibleProposals, err)
 		}
+
+		var emptyDraft drafts.Draft
+		edit.request(t, post, databasePath+"/drafts", map[string]any{
+			"title": "Batch with empty scope", "mode": executioncontract.Batch,
+			"sql":      "UPDATE managed.batch_items SET processed = TRUE WHERE id = ANY($1::bigint[]);",
+			"sql_down": "UPDATE managed.batch_items SET processed = FALSE WHERE id = ANY($1::bigint[]);",
+			"batch":    batchConfig,
+		}, http.StatusCreated, &emptyDraft)
+		empty := runApproved(emptyDraft.ID, emptyDraft.Revision, executioncontract.Apply, nil, executioncontract.Succeeded)
+		if empty.Progress == nil || empty.Progress.TotalRows == nil || *empty.Progress.TotalRows != "0" || empty.Progress.BatchesCommitted != "0" {
+			t.Fatalf("empty batch scope should report zero progress: %+v", empty.Progress)
+		}
+		edit.request(t, get, databasePath+"/migrations?limit=20", nil, http.StatusOK, &list)
+		var emptyRows int
+		for _, item := range list.Items {
+			if item.ExecutionID != empty.ExecutionID {
+				continue
+			}
+			emptyRows++
+			if item.AttemptID == "" || item.Status != string(executioncontract.Succeeded) || item.Commit != nil ||
+				item.IsActiveHead || len(item.AllowedActions) != 0 || len(item.Statements) != 0 {
+				t.Fatalf("empty batch attempt should be listed as succeeded without commit evidence: %+v", item)
+			}
+		}
+		if emptyRows != 1 || list.ActiveHeadExecutionID == nil || *list.ActiveHeadExecutionID != irreversible.ExecutionID {
+			t.Fatalf("empty batch should add one attempt row and keep the active head: rows=%d head=%v", emptyRows, list.ActiveHeadExecutionID)
+		}
+		var emptyEntries int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM app.migration_history_entries WHERE execution_id=$1`, empty.ExecutionID).Scan(&emptyEntries); err != nil || emptyEntries != 0 {
+			t.Fatalf("empty batch must not fabricate commit evidence: entries=%d err=%v", emptyEntries, err)
+		}
 	}
 }
 
