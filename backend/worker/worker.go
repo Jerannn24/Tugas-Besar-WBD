@@ -2,10 +2,11 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,7 +100,7 @@ func New(jobsSvc *jobs.Service, deps jobs.ExecutionDeps, cfg Config) (*Worker, e
 		deps.Timeout = 30 * time.Second
 	}
 	if cfg.Logger == nil {
-		cfg.Logger = defaultLogger
+		cfg.Logger = slogLogger(telemetry.DefaultLogger())
 	}
 
 	return &Worker{
@@ -370,7 +371,7 @@ func (w *Worker) ReconcileUnresolved(ctx context.Context) (int, error) {
 		if ctx.Err() != nil || w.stopping.Load() {
 			return reconciledCount, ctx.Err()
 		}
-		outcome, rerr := w.jobs.ReconcileStandardJobByID(ctx, id, w.deps)
+		outcome, rerr := w.jobs.ReconcileStandardJobByID(telemetry.WithLogAttrs(ctx, slog.String("job_id", id)), id, w.deps)
 		if rerr != nil {
 			w.log("reconcile_standard_job_failed", map[string]any{
 				"worker_id":  w.cfg.WorkerID,
@@ -415,7 +416,7 @@ func (w *Worker) ReconcileUnresolved(ctx context.Context) (int, error) {
 		if ctx.Err() != nil || w.stopping.Load() {
 			return reconciledCount, ctx.Err()
 		}
-		outcome, rerr := w.jobs.ReconcileBatchJobByID(ctx, id, w.deps)
+		outcome, rerr := w.jobs.ReconcileBatchJobByID(telemetry.WithLogAttrs(ctx, slog.String("job_id", id)), id, w.deps)
 		if rerr != nil {
 			w.log("reconcile_batch_job_failed", map[string]any{
 				"worker_id":  w.cfg.WorkerID,
@@ -469,6 +470,14 @@ func prepareJobTrace(ctx context.Context, claim *jobs.Claim) (context.Context, t
 }
 
 func addJobTraceFields(fields map[string]any, claim *jobs.Claim, trace telemetry.Trace, hasPersistedTrace bool) {
+	if claim != nil {
+		if claim.ActorID != "" {
+			fields["actor_id"] = claim.ActorID
+		}
+		if claim.MigrationID != "" {
+			fields["migration_id"] = claim.MigrationID
+		}
+	}
 	if trace.TraceID != "" {
 		fields["trace_id"] = trace.TraceID
 	}
@@ -504,7 +513,7 @@ func (w *Worker) executeWithRenewal(ctx context.Context, claim *jobs.Claim) (*jo
 }
 
 func (w *Worker) executeWithRenewalWithTrace(ctx context.Context, claim *jobs.Claim, workerTrace telemetry.Trace, hasPersistedTrace bool) (*jobs.ExecutionOutcome, error) {
-	execCtx, cancelExec := context.WithCancel(ctx)
+	execCtx, cancelExec := context.WithCancel(jobLogContext(ctx, claim))
 	defer cancelExec()
 
 	aw, ok := w.registerActive("exec", cancelExec)
@@ -637,15 +646,60 @@ func (w *Worker) log(event string, fields map[string]any) {
 	}
 }
 
-func defaultLogger(event string, fields map[string]any) {
-	b, err := json.Marshal(map[string]any{
-		"time":   time.Now().UTC().Format(time.RFC3339Nano),
-		"event":  event,
-		"fields": fields,
-	})
-	if err == nil {
-		_, _ = os.Stderr.Write(append(b, '\n'))
+// slogLogger writes worker events as flat JSON attributes with a level derived from the event.
+func slogLogger(l *telemetry.Logger) func(event string, fields map[string]any) {
+	return func(event string, fields map[string]any) {
+		keys := make([]string, 0, len(fields))
+		for k := range fields {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		attrs := make([]slog.Attr, 0, len(keys))
+		for _, k := range keys {
+			attrs = append(attrs, slog.Any(k, fields[k]))
+		}
+		l.Log(context.Background(), eventLevel(event, fields), event, attrs...)
 	}
+}
+
+func eventLevel(event string, fields map[string]any) slog.Level {
+	switch event {
+	case "job_finished_partial", "job_execution_partial",
+		"lease_renewal_failed", "shutdown_drain_timeout_canceling":
+		return slog.LevelWarn
+	case "job_claimed":
+		if n, ok := fields["attempt_no"].(int); ok && n > 1 {
+			return slog.LevelWarn
+		}
+		return slog.LevelInfo
+	case "job_finished_unknown", "job_execution_unknown",
+		"job_finished_partially_reverted", "job_execution_partially_reverted",
+		"shutdown_drain_abandoned":
+		return slog.LevelError
+	}
+	switch {
+	case strings.HasPrefix(event, "shutdown_cancel_active_"), strings.HasSuffix(event, "_unresolved"):
+		return slog.LevelWarn
+	case strings.HasSuffix(event, "_failed"), strings.HasSuffix(event, "_error"):
+		return slog.LevelError
+	}
+	return slog.LevelInfo
+}
+
+// jobLogContext carries job correlation IDs into SQL logs emitted during execution.
+func jobLogContext(ctx context.Context, claim *jobs.Claim) context.Context {
+	if claim == nil {
+		return ctx
+	}
+	return telemetry.WithLogAttrs(ctx,
+		slog.String("job_id", claim.JobID),
+		slog.String("execution_id", claim.ExecutionID),
+		slog.String("migration_id", claim.MigrationID),
+		slog.String("attempt_id", claim.AttemptID),
+		slog.Int("attempt_no", claim.AttemptNo),
+		slog.String("actor_id", claim.ActorID),
+		slog.String("database_id", claim.DatabaseID),
+	)
 }
 
 func classifyError(err error) string {

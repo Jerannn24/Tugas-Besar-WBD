@@ -35,8 +35,41 @@ func (l *Logger) emit(ctx context.Context, level slog.Level, event string, attrs
 			slog.String("correlation_id", trace.CorrelationID),
 		)
 	}
+	fields = append(fields, LogAttrsFromContext(ctx)...)
 	fields = append(fields, attrs...)
 	l.logger.LogAttrs(ctx, level, event, fields...)
+}
+
+type logAttrsKey struct{}
+
+func WithLogAttrs(ctx context.Context, attrs ...slog.Attr) context.Context {
+	merged := append([]slog.Attr(nil), LogAttrsFromContext(ctx)...)
+	for _, a := range attrs {
+		replaced := false
+		for i := range merged {
+			if merged[i].Key == a.Key {
+				merged[i] = a
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			merged = append(merged, a)
+		}
+	}
+	return context.WithValue(ctx, logAttrsKey{}, merged)
+}
+
+func LogAttrsFromContext(ctx context.Context) []slog.Attr {
+	if ctx == nil {
+		return nil
+	}
+	attrs, _ := ctx.Value(logAttrsKey{}).([]slog.Attr)
+	return attrs
+}
+
+func (l *Logger) Log(ctx context.Context, level slog.Level, event string, attrs ...slog.Attr) {
+	l.emit(ctx, level, event, attrs...)
 }
 
 func (l *Logger) Debug(ctx context.Context, event string, attrs ...slog.Attr) {

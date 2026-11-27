@@ -6821,3 +6821,98 @@ func TestExecuteBatchJob_Regression_Terra5_ConfirmedZeroCheckpointReturn_Matches
 		}
 	})
 }
+
+func TestExecuteBatchJob_ResumeFailsClosedWhenPriorCommitUncertain(t *testing.T) {
+	e, platformDB, ownerDB := setupBatchTestEnv(t)
+	setupBatchItemsFixture(t, e)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := e.exec.ExecContext(ctx, "INSERT INTO managed.batch_items (id, processed) VALUES (1, false), (2, false), (3, false), (4, false)"); err != nil {
+		t.Fatalf("insert items: %v", err)
+	}
+	svc := New(platformDB)
+	acquire := makeBatchAcquire(t, e.exec, e.prep)
+
+	other := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Apply, nil)
+	if _, err := ownerDB.ExecContext(ctx, `UPDATE app.job_attempts SET status = 'failed', finished_at = clock_timestamp() WHERE id = $1`, other.claim.AttemptID); err != nil {
+		t.Fatalf("park other attempt: %v", err)
+	}
+	if _, err := ownerDB.ExecContext(ctx, `
+		UPDATE app.jobs SET status = 'failed', execution_status = 'failed', blocks_database = false,
+		       claimed_by = NULL, claimed_at = NULL, lease_token = NULL, lease_expires_at = NULL, finished_at = clock_timestamp()
+		WHERE id = $1`, other.claim.JobID); err != nil {
+		t.Fatalf("park other job: %v", err)
+	}
+
+	source := createBatchFixtureOnConnection(t, platformDB, ownerDB, e.target, 2, &other)
+	cleanupBatchScope(t, e, source.executionID)
+	out, err := svc.ExecuteBatchJob(ctx, source.claim, ExecutionDeps{
+		Gate: batchFakeGate(source.snapshot), Acquire: acquire, Timeout: 10 * time.Second,
+		afterTicketReservation: func(_ context.Context, batchIndex int) error {
+			if batchIndex == 1 {
+				return errors.New("simulated batch 1 failure")
+			}
+			return nil
+		},
+	})
+	if err != nil || out == nil || out.Status != executioncontract.Partial {
+		t.Fatalf("source outcome=%+v err=%v", out, err)
+	}
+
+	resume := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Resume, &source)
+	cleanupBatchScope(t, e, resume.executionID)
+	if _, err := ownerDB.ExecContext(ctx, `DELETE FROM app.job_attempts WHERE id = $1`, resume.claim.AttemptID); err != nil {
+		t.Fatalf("drop resume attempt: %v", err)
+	}
+	if _, err := ownerDB.ExecContext(ctx, `
+		UPDATE app.jobs SET status = 'queued', execution_status = 'queued',
+		       claimed_by = NULL, claimed_at = NULL, lease_token = NULL, lease_expires_at = NULL
+		WHERE id = $1`, resume.claim.JobID); err != nil {
+		t.Fatalf("requeue resume: %v", err)
+	}
+
+	if _, err := ownerDB.ExecContext(ctx, `UPDATE app.job_attempts SET sql_entered = true WHERE id = $1`, other.claim.AttemptID); err != nil {
+		t.Fatalf("mark other sql entered: %v", err)
+	}
+	if _, err := ownerDB.ExecContext(ctx, `UPDATE app.jobs SET status = 'unknown', execution_status = 'unknown', blocks_database = true WHERE id = $1`, other.claim.JobID); err != nil {
+		t.Fatalf("mark other unknown: %v", err)
+	}
+
+	if blocked, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-guard", LeaseDuration: 30 * time.Second, MaxAttempts: 3}); err != nil || blocked != nil {
+		t.Fatalf("claim guard should refuse the resume: claim=%+v err=%v", blocked, err)
+	}
+	claim := forceP3Claim(t, ownerDB, resume.claim.JobID, "worker-forced")
+
+	dispatched := 0
+	outcome, err := svc.ExecuteBatchJob(ctx, claim, ExecutionDeps{
+		Gate: batchFakeGate(resume.snapshot), Acquire: acquire, Timeout: 10 * time.Second,
+		afterTicketReservation: func(context.Context, int) error { dispatched++; return nil },
+		afterBatchUpdate:       func(context.Context, int) error { dispatched++; return nil },
+	})
+	if err != nil || outcome == nil || outcome.Status == executioncontract.Succeeded {
+		t.Fatalf("resume must fail closed, got outcome=%+v err=%v", outcome, err)
+	}
+	var cErr executioncontract.ContractError
+	if !errors.As(outcome.Error, &cErr) || cErr.Code != "TARGET_BLOCKED" {
+		t.Fatalf("expected TARGET_BLOCKED, got %v", outcome.Error)
+	}
+	if dispatched != 0 {
+		t.Fatalf("resume reached target dispatch %d times while target was blocked", dispatched)
+	}
+	var evidence, auths int
+	if err := platformDB.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM app.job_statement_evidence WHERE attempt_id = $1),
+		(SELECT count(*) FROM app.job_batch_step_authorizations WHERE attempt_id = $1)`, claim.AttemptID).Scan(&evidence, &auths); err != nil {
+		t.Fatalf("count resume evidence: %v", err)
+	}
+	if evidence != 0 || auths != 0 {
+		t.Fatalf("resume left SQL evidence=%d authorizations=%d", evidence, auths)
+	}
+	var p3, p4 bool
+	if err := e.exec.QueryRowContext(ctx, "SELECT (SELECT processed FROM managed.batch_items WHERE id = 3), (SELECT processed FROM managed.batch_items WHERE id = 4)").Scan(&p3, &p4); err != nil {
+		t.Fatalf("query items: %v", err)
+	}
+	if p3 || p4 {
+		t.Fatalf("target rows changed while blocked: 3=%t 4=%t", p3, p4)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/migration"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 )
 var (
 	chkPageLimit      = 20
@@ -2879,6 +2881,7 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 
 	// Execute remaining chunks sequentially
 	for batchIdx := nextBatchIndex; batchIdx < totalBatches; batchIdx++ {
+		ctx := telemetry.WithLogAttrs(ctx, slog.Int("batch_index", batchIdx))
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -4313,6 +4316,7 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 
 	startBatchIdx := N_up - 1 - batchesRevertedCount
 	for batchIdx := startBatchIdx; batchIdx >= 0; batchIdx-- {
+		ctx := telemetry.WithLogAttrs(ctx, slog.Int("batch_index", batchIdx))
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
