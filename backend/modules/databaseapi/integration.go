@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/drafts"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/history"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/migration"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
@@ -202,7 +203,14 @@ func AcquireLease(pools *connections.PoolManager) func(context.Context, string) 
 		if err != nil {
 			return nil, err
 		}
+		started := time.Now()
 		lease, err := pools.Acquire(ctx, databaseID)
+		result := executioncontract.ValueSuccess
+		if err != nil {
+			result = executioncontract.ValueFailure
+		}
+		telemetry.DefaultRegistry().Observe(ctx, executioncontract.HistogramPoolWait, time.Since(started).Seconds(),
+			executioncontract.MetricLabels{executioncontract.LabelResult: result})
 		if err != nil {
 			return nil, err
 		}

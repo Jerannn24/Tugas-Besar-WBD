@@ -326,6 +326,40 @@ func (m *PoolManager) Quiesce(id uuid.UUID) (func(bool), error) {
 	}, nil
 }
 
+func (m *PoolManager) ConnectionStats() (active, idle int64) {
+	m.mu.Lock()
+	pools := make(map[*sql.DB]struct{})
+	for _, e := range m.entries {
+		if e.viewer != nil {
+			pools[e.viewer] = struct{}{}
+		}
+		if e.current != nil {
+			if e.current.pools.executor != nil {
+				pools[e.current.pools.executor] = struct{}{}
+			}
+			if e.current.pools.preparer != nil {
+				pools[e.current.pools.preparer] = struct{}{}
+			}
+		}
+		for generation := range e.retired {
+			if generation.pools.executor != nil {
+				pools[generation.pools.executor] = struct{}{}
+			}
+			if generation.pools.preparer != nil {
+				pools[generation.pools.preparer] = struct{}{}
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	for pool := range pools {
+		stats := pool.Stats()
+		active += int64(stats.InUse)
+		idle += int64(stats.Idle)
+	}
+	return active, idle
+}
+
 // ActiveLeases reports leases and in-flight reservations for id.
 func (m *PoolManager) ActiveLeases(id uuid.UUID) int {
 	m.mu.Lock()

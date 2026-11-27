@@ -277,7 +277,7 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 			IsActiveHead   bool             `json:"is_active_head"`
 			AllowedActions []string         `json:"allowed_actions"`
 			Actor          history.Executor `json:"actor"`
-			Statements  []struct {
+			Statements     []struct {
 				SQL string `json:"sql"`
 			} `json:"statements"`
 			Commit *executioncontract.HistoryEntry `json:"commit"`

@@ -287,6 +287,7 @@ type Claim struct {
 	LeaseExpiresAt      time.Time                   `json:"lease_expires_at"`
 	Traceparent         string                      `json:"traceparent,omitempty"`
 	Tracestate          string                      `json:"tracestate,omitempty"`
+	QueueWaitSeconds    float64                     `json:"-"`
 }
 
 func (c Claim) RevalidationRequest() executioncontract.RevalidationRequest {
@@ -346,7 +347,7 @@ func (s *Service) reclaimOneExpiredJob(ctx context.Context, maxAttempts int, ret
 		                AND src.snapshot_hash = j.snapshot_hash
 		                AND src.mode = 'batch'
 		                AND src.status <> 'succeeded'
-		                AND ` + validDownResumeSource + `
+		                AND `+validDownResumeSource+`
 		          )) OR
 		          (j.action = 'compensate' AND j.direction = 'down' AND j.source_execution_id IS NOT NULL AND EXISTS (
 		              SELECT 1 FROM app.jobs src
@@ -496,7 +497,7 @@ func (s *Service) reclaimOneExpiredJob(ctx context.Context, maxAttempts int, ret
 					  AND src.mode = 'batch'
 					  AND src.direction = j.direction
 					  AND src.status <> 'succeeded'
-					  AND ` + validDownResumeSource + `
+					  AND `+validDownResumeSource+`
 				)
 				FROM app.jobs j WHERE j.id = $1
 			`, jobID).Scan(&srcValid)
@@ -691,6 +692,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		snapshotHash        string
 		approvalFingerprint sql.NullString
 		currentStatus       string
+		queueWaitSeconds    float64
 		traceparent         sql.NullString
 		tracestate          sql.NullString
 	)
@@ -699,7 +701,8 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		SELECT j.id, j.database_id, j.target_id, j.proposal_id, j.migration_id, j.revision,
 		       j.execution_id, j.actor_id, j.action, j.direction, j.mode, j.attempt_no,
 		       j.source_execution_id::text, j.snapshot_hash, j.approval_fingerprint,
-		       j.status, j.traceparent, j.tracestate
+		       j.status, j.traceparent, j.tracestate,
+		       GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - j.created_at)))
 		FROM app.jobs j
 		JOIN app.migration_target_state target ON target.id = j.target_id
 		WHERE ((j.status = 'queued' AND j.next_retry_at IS NULL
@@ -730,7 +733,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		                      AND src.mode = 'batch'
 		                      AND src.direction = j.direction
 		                      AND src.status <> 'succeeded'
-		                      AND ` + validDownResumeSource + `
+		                      AND `+validDownResumeSource+`
 		                ))
 		                OR
 		                (j.action = 'compensate' AND j.mode = 'batch' AND j.direction = 'down' AND j.source_execution_id IS NOT NULL AND EXISTS (
@@ -790,7 +793,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		                      AND src.mode = 'batch'
 		                      AND src.direction = j.direction
 		                      AND src.status <> 'succeeded'
-		                      AND ` + validDownResumeSource + `
+		                      AND `+validDownResumeSource+`
 		                ))
 		                OR
 		                (j.action = 'compensate' AND j.mode = 'batch' AND j.direction = 'down' AND j.source_execution_id IS NOT NULL AND EXISTS (
@@ -858,14 +861,14 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		                         OR (blocked.action IN ('resume', 'compensate') AND blocked.source_execution_id IS NOT DISTINCT FROM j.source_execution_id)
 		                     ))
 		                 )
-		                 ) OR ` + downResumeLineage("j.id", "blocked") + `
+		                 ) OR `+downResumeLineage("j.id", "blocked")+`
 		             )
 		             AND (
 		                 blocked.blocks_database
 		                 OR (
 		                     (blocked.status IN ('unknown', 'partial', 'partially_reverted')
 		                      OR blocked.execution_status IN ('unknown', 'partial', 'partially_reverted'))
-		                     AND NOT ` + resolvedBlocker("blocked") + `
+		                     AND NOT `+resolvedBlocker("blocked")+`
 		                 )
 		                 OR EXISTS (SELECT 1 FROM app.job_attempts a
 		                            WHERE a.job_id = blocked.id
@@ -906,7 +909,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		                                                   AND bsa.batch_index = unse.batch_index
 		                                                   AND bsa.physical_target_id = blocked.target_id
 		                                                   AND bsa.direction = blocked.direction
-		                                                   AND ` + batchEvidenceScope("blocked") + `
+		                                                   AND `+batchEvidenceScope("blocked")+`
 		                                             ))
 		                                             OR (unse.outcome = 'succeeded' AND EXISTS (
 		                                                 SELECT 1 FROM app.job_batch_step_authorizations bsa
@@ -921,7 +924,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		                                                   AND bsa.batch_index = unse.batch_index
 		                                                   AND bsa.physical_target_id = blocked.target_id
 		                                                   AND bsa.direction = blocked.direction
-		                                                   AND ` + batchEvidenceScope("blocked") + `
+		                                                   AND `+batchEvidenceScope("blocked")+`
 		                                             ))
 		                                         )
 		                                     )
@@ -941,7 +944,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		                     blocked.execution_id IS NOT DISTINCT FROM j.source_execution_id
 		                     OR (blocked.action = 'resume' AND blocked.source_execution_id IS NOT DISTINCT FROM j.source_execution_id)
 		                 )
-		                 ) OR ` + downResumeLineage("j.id", "blocked") + `
+		                 ) OR `+downResumeLineage("j.id", "blocked")+`
 		             )
 		             AND (
 		                 (blocked.status = 'running' AND blocked.lease_expires_at > clock_timestamp())
@@ -956,7 +959,7 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		&jobID, &databaseID, &targetID, &proposalID, &migrationID, &revision,
 		&executionID, &actorID, &action, &direction, &mode, &attemptNo,
 		&sourceExecutionID, &snapshotHash, &approvalFingerprint, &currentStatus,
-		&traceparent, &tracestate,
+		&traceparent, &tracestate, &queueWaitSeconds,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1069,5 +1072,6 @@ func (s *Service) ClaimJob(ctx context.Context, in ClaimRequest) (*Claim, error)
 		LeaseExpiresAt:      leaseExpiresAt,
 		Traceparent:         traceparent.String,
 		Tracestate:          tracestate.String,
+		QueueWaitSeconds:    queueWaitSeconds,
 	}, nil
 }

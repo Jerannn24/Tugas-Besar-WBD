@@ -45,7 +45,7 @@ func NewRegistry() *Registry {
 	r.descriptors[string(executioncontract.CounterBatches)] = metricDescriptor{kind: counterKind, labels: []executioncontract.MetricLabel{executioncontract.LabelDirection}}
 	r.descriptors[string(executioncontract.CounterRows)] = metricDescriptor{kind: counterKind, labels: []executioncontract.MetricLabel{executioncontract.LabelDirection}}
 	r.descriptors[string(executioncontract.HistogramQueueWait)] = metricDescriptor{kind: histogramKind, labels: []executioncontract.MetricLabel{executioncontract.LabelMode}, buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}}
-	r.descriptors[string(executioncontract.HistogramLockWait)] = metricDescriptor{kind: histogramKind, labels: []executioncontract.MetricLabel{executioncontract.LabelMode}, buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5}}
+	r.descriptors[string(executioncontract.HistogramLockWait)] = metricDescriptor{kind: histogramKind, labels: []executioncontract.MetricLabel{executioncontract.LabelResult}, buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5}}
 	r.descriptors[string(executioncontract.HistogramDuration)] = metricDescriptor{kind: histogramKind, labels: []executioncontract.MetricLabel{executioncontract.LabelAction, executioncontract.LabelResult}, buckets: []float64{.01, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120, 300}}
 	r.descriptors[string(executioncontract.HistogramPoolWait)] = metricDescriptor{kind: histogramKind, labels: []executioncontract.MetricLabel{executioncontract.LabelResult}, buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5}}
 	return r

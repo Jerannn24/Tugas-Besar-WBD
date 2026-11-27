@@ -42,7 +42,8 @@ func Register(ctx context.Context, app *fiber.App, db *pgxpool.Pool, jwtSecret s
 		return nil, errors.New("platform migration 014_linear_job_sources is required")
 	}
 
-	protected, authorizer := registerAPI(app, db, jwtSecret)
+	metricsRegistry := telemetry.DefaultRegistry()
+	protected, authorizer := registerAPI(app, db, jwtSecret, metricsRegistry)
 	connectionRepository := connections.NewRepository(db, jwtSecret)
 	connectionPools := connections.NewPoolManager(connectionRepository)
 	connectionService := connections.NewService(connectionRepository, connectionPools)
@@ -79,11 +80,19 @@ func Register(ctx context.Context, app *fiber.App, db *pgxpool.Pool, jwtSecret s
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("initialize database API: %w", err), shutdown())
 	}
+	stopPoolMetrics := telemetry.StartPoolMetrics(ctx, db, metricsRegistry, 5*time.Second, func() (int64, int64) {
+		platformStats := platform.Stats()
+		targetActive, targetIdle := connectionPools.ConnectionStats()
+		return int64(platformStats.InUse) + targetActive, int64(platformStats.Idle) + targetIdle
+	})
+	stopJobMetrics := telemetry.StartJobMetrics(ctx, platform, metricsRegistry, 5*time.Second)
 	for _, queueWorker := range queueWorkers {
 		go queueWorker.Run(context.WithoutCancel(ctx))
 	}
 
 	return sync.OnceValue(func() error {
+		stopJobMetrics()
+		stopPoolMetrics()
 		for _, queueWorker := range queueWorkers {
 			queueWorker.Stop()
 		}
@@ -101,7 +110,7 @@ func Register(ctx context.Context, app *fiber.App, db *pgxpool.Pool, jwtSecret s
 	}), nil
 }
 
-func registerAPI(app *fiber.App, db *pgxpool.Pool, jwtSecret string) (fiber.Router, authz.Authorizer) {
+func registerAPI(app *fiber.App, db *pgxpool.Pool, jwtSecret string, metricsRegistry *telemetry.Registry) (fiber.Router, authz.Authorizer) {
 	api := app.Group("/api")
 	api.Use(func(c *fiber.Ctx) error {
 		c.Set("Cache-Control", "no-store")
@@ -118,7 +127,6 @@ func registerAPI(app *fiber.App, db *pgxpool.Pool, jwtSecret string) (fiber.Rout
 		})
 	})
 
-	metricsRegistry := telemetry.NewRegistry()
 	telemetry.RegisterRoutes(api, metricsRegistry)
 
 	authRepo := auth.NewRepository(db)

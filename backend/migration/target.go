@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/history"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 )
@@ -97,6 +98,12 @@ FROM pg_catalog.pg_roles r WHERE rolname=session_user`).Scan(&executorDB, &sessi
 	lockCtx, lockTrace := telemetry.ChildTrace(ctx)
 	lockStart := time.Now()
 	_, lockErr := lease.Executor.ExecContext(lockCtx, `SELECT pg_catalog.pg_advisory_lock($1)`, s.key)
+	lockResult := executioncontract.ValueSuccess
+	if lockErr != nil {
+		lockResult = executioncontract.ValueFailure
+	}
+	telemetry.DefaultRegistry().Observe(ctx, executioncontract.HistogramLockWait, time.Since(lockStart).Seconds(),
+		executioncontract.MetricLabels{executioncontract.LabelResult: lockResult})
 	telemetry.ExportSpan(context.Background(), telemetry.Span{
 		TraceID: lockTrace.TraceID, SpanID: lockTrace.SpanID, ParentSpanID: lockTrace.ParentSpanID,
 		Name: "target.lock", Kind: 1, StartedAt: lockStart, EndedAt: time.Now(), Failed: lockErr != nil,

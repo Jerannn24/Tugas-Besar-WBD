@@ -74,3 +74,22 @@ func TestQueryLogCarriesCorrelationAttrsFlatAndMasked(t *testing.T) {
 		}
 	}
 }
+
+func TestLoggerRedactsSensitiveAttributes(t *testing.T) {
+	var output bytes.Buffer
+	logger := NewLogger(&output, slog.LevelInfo)
+	logger.Info(context.Background(), "auth.event",
+		slog.String("session_id", "private-session"),
+		slog.String("authorization", "Bearer private-token"),
+		slog.String("username", "junior"),
+	)
+	line := output.String()
+	for _, secret := range []string{"private-session", "private-token"} {
+		if strings.Contains(line, secret) {
+			t.Fatalf("sensitive value %q leaked in log: %s", secret, line)
+		}
+	}
+	if !strings.Contains(line, `"username":"junior"`) {
+		t.Fatalf("non-sensitive field should remain available: %s", line)
+	}
+}

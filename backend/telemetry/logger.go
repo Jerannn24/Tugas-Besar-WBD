@@ -37,7 +37,31 @@ func (l *Logger) emit(ctx context.Context, level slog.Level, event string, attrs
 	}
 	fields = append(fields, LogAttrsFromContext(ctx)...)
 	fields = append(fields, attrs...)
+	fields = sanitizeLogAttrs(fields)
 	l.logger.LogAttrs(ctx, level, event, fields...)
+	ExportLogRecord(ctx, level, event, fields)
+}
+
+func sanitizeLogAttrs(attrs []slog.Attr) []slog.Attr {
+	safe := make([]slog.Attr, 0, len(attrs))
+	for _, attr := range attrs {
+		key := strings.ToLower(attr.Key)
+		if strings.Contains(key, "password") || strings.Contains(key, "passwd") ||
+			strings.Contains(key, "token") || strings.Contains(key, "secret") ||
+			strings.Contains(key, "session") || strings.Contains(key, "cookie") ||
+			strings.Contains(key, "authorization") || strings.Contains(key, "credential") ||
+			strings.Contains(key, "api_key") || strings.Contains(key, "private_key") {
+			safe = append(safe, slog.String(attr.Key, "[REDACTED]"))
+			continue
+		}
+		value := attr.Value.Resolve()
+		if value.Kind() == slog.KindString {
+			safe = append(safe, slog.String(attr.Key, MaskSecrets(value.String())))
+		} else {
+			safe = append(safe, attr)
+		}
+	}
+	return safe
 }
 
 type logAttrsKey struct{}

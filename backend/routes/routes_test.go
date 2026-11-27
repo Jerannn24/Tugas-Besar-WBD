@@ -7,12 +7,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/gofiber/fiber/v2"
 )
 
 func TestHealthRoute(t *testing.T) {
 	app := fiber.New()
-	registerAPI(app, nil, "test-secret")
+	registerAPI(app, nil, "test-secret", telemetry.NewRegistry())
 
 	req := httptest.NewRequest("GET", "/api/health", nil)
 
@@ -51,7 +52,7 @@ func TestHealthRoute(t *testing.T) {
 
 func TestAPIResponsesAreNoStore(t *testing.T) {
 	app := fiber.New()
-	registerAPI(app, nil, "test-secret")
+	registerAPI(app, nil, "test-secret", telemetry.NewRegistry())
 
 	for _, path := range []string{"/api/health", "/api/csrf", "/api/does-not-exist"} {
 		resp, err := app.Test(httptest.NewRequest("GET", path, nil))
@@ -67,7 +68,7 @@ func TestAPIResponsesAreNoStore(t *testing.T) {
 
 func TestUnknownAPIRouteReturnsJSONError(t *testing.T) {
 	app := fiber.New()
-	registerAPI(app, nil, "test-secret")
+	registerAPI(app, nil, "test-secret", telemetry.NewRegistry())
 
 	resp, err := app.Test(httptest.NewRequest("GET", "/api/does-not-exist", nil))
 	if err != nil {
