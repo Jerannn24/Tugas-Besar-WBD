@@ -51,6 +51,14 @@ func createBatchFixtureWithActor(t *testing.T, platformDB, ownerDB *sql.DB, targ
 }
 
 func createBatchFixtureWithActorAndDuration(t *testing.T, platformDB, ownerDB *sql.DB, targetID string, batchSize int, action executioncontract.Action, existingFixture *batchJobFixture, customActorID string, leaseDuration time.Duration) batchJobFixture {
+	return createBatchFixtureCore(t, platformDB, ownerDB, targetID, batchSize, action, existingFixture, customActorID, leaseDuration, nil)
+}
+
+func createBatchFixtureOnConnection(t *testing.T, platformDB, ownerDB *sql.DB, targetID string, batchSize int, shared *batchJobFixture) batchJobFixture {
+	return createBatchFixtureCore(t, platformDB, ownerDB, targetID, batchSize, executioncontract.Apply, nil, "", 0, shared)
+}
+
+func createBatchFixtureCore(t *testing.T, platformDB, ownerDB *sql.DB, targetID string, batchSize int, action executioncontract.Action, existingFixture *batchJobFixture, customActorID string, leaseDuration time.Duration, shared *batchJobFixture) batchJobFixture {
 	t.Helper()
 	ctx := context.Background()
 
@@ -68,6 +76,16 @@ func createBatchFixtureWithActorAndDuration(t *testing.T, platformDB, ownerDB *s
 		}
 		draftID = existingFixture.draftID
 		sourceExecutionID = &existingFixture.executionID
+	} else if shared != nil {
+		dbID = shared.dbID
+		actorID = shared.actorID
+		draftID = uuid.NewString()
+		if _, err := platformDB.ExecContext(ctx, `
+			INSERT INTO app.migration_drafts (id, database_id, revision, title, sql, sql_down, created_by)
+			VALUES ($1, $2, 1, $3, $4, $5, $6)
+		`, draftID, dbID, title, sqlUp, sqlDown, actorID); err != nil {
+			t.Fatalf("insert draft: %v", err)
+		}
 	} else {
 		dbID = uuid.NewString()
 		actorID = uuid.NewString()
@@ -2460,6 +2478,76 @@ func TestExecuteBatchJob_AtomicRollback_PostDispatchFailure(t *testing.T) {
 	})
 }
 
+func recoverCrashedBatchJob(t *testing.T, ctx context.Context, platformDB *sql.DB, jobID string, snapshot executioncontract.Draft, acquire func(context.Context, string) (*migration.TargetLease, error)) *ExecutionOutcome {
+	t.Helper()
+	return recoverCrashedBatchJobWith(t, ctx, platformDB, jobID, ExecutionDeps{Gate: batchFakeGate(snapshot), Acquire: acquire, Timeout: 10 * time.Second})
+}
+
+func recoverCrashedBatchJobWith(t *testing.T, ctx context.Context, platformDB *sql.DB, jobID string, deps ExecutionDeps) *ExecutionOutcome {
+	t.Helper()
+	svc := New(platformDB)
+	found, cursor := false, ""
+	for !found {
+		ids, err := svc.ListUnresolvedBatchJobIDs(ctx, 100, cursor)
+		if err != nil {
+			t.Fatalf("list unresolved batch jobs: %v", err)
+		}
+		if len(ids) == 0 {
+			t.Fatalf("recovery did not discover crashed job %s", jobID)
+		}
+		for _, id := range ids {
+			found = found || id == jobID
+		}
+		cursor = ids[len(ids)-1]
+	}
+	outcome, err := svc.ReconcileBatchJobByID(ctx, jobID, deps)
+	if err != nil || outcome == nil {
+		t.Fatalf("reconcile crashed job %s: outcome=%+v err=%v", jobID, outcome, err)
+	}
+	return outcome
+}
+
+func requireRecoveryKeepsBlock(t *testing.T, ctx context.Context, platformDB *sql.DB, targetID string, origin *batchJobFixture, outcome *ExecutionOutcome) {
+	t.Helper()
+	var cErr executioncontract.ContractError
+	if outcome.Reconciled || outcome.Status == executioncontract.Succeeded || !errors.As(outcome.Error, &cErr) || cErr.Code != "TARGET_BLOCKED" {
+		t.Fatalf("recovery must fail closed with TARGET_BLOCKED, got %+v", outcome)
+	}
+	var blocked bool
+	if err := platformDB.QueryRowContext(ctx, "SELECT blocks_database FROM app.jobs WHERE id = $1", origin.claim.JobID).Scan(&blocked); err != nil || !blocked {
+		t.Fatalf("origin job must keep blocking the target: blocked=%t err=%v", blocked, err)
+	}
+	svc := New(platformDB)
+	tx, err := platformDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	proposalID := uuid.NewString()
+	hashBytes := sha256.Sum256([]byte(origin.snapshot.SQLUp))
+	snapshotBytes, _ := json.Marshal(origin.snapshot)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO app.migration_proposals (id, database_id, migration_id, revision, action, source_execution_id, status, snapshot, snapshot_hash, created_by)
+		VALUES ($1, $2, $3, 1, 'resume', $4, 'draft', $5::jsonb, $6, $7)
+	`, proposalID, origin.dbID, origin.draftID, origin.executionID, string(snapshotBytes), hashBytes[:], origin.actorID); err != nil {
+		t.Fatalf("insert resume proposal: %v", err)
+	}
+	if _, err := svc.EnqueueTx(ctx, tx, executioncontract.EnqueueRequest{
+		TargetID: targetID, RequestID: uuid.NewString(), ActorID: origin.actorID, DatabaseID: origin.dbID,
+		ProposalID: proposalID, MigrationID: origin.draftID, Revision: 1, Action: executioncontract.Resume,
+		Direction: executioncontract.Up, SourceExecutionID: &origin.executionID, Snapshot: origin.snapshot,
+		SnapshotHash: hex.EncodeToString(hashBytes[:]),
+	}); err != nil {
+		t.Fatalf("enqueue resume: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if claim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-blocked-resume", LeaseDuration: 30 * time.Second}); err != nil || claim != nil {
+		t.Fatalf("resume must not be claimable while the origin is unresolved: claim=%+v err=%v", claim, err)
+	}
+}
+
 func TestExecuteBatchJob_HardCrashRecovery(t *testing.T) {
 	t.Run("HardCrashAfterAuthorizationBeforeCheckpoint_ProvedAbortedTx_ResumeSucceedsWithoutReplay", func(t *testing.T) {
 		e, platformDB, ownerDB := setupBatchTestEnv(t)
@@ -2543,6 +2631,7 @@ func TestExecuteBatchJob_HardCrashRecovery(t *testing.T) {
 
 		// 3. Natural clock lease expiry (no manual rewriting of job/attempt)
 		time.Sleep(3000 * time.Millisecond)
+		recoverCrashedBatchJob(t, ctx, platformDB, fix1.claim.JobID, fix1.snapshot, acquire)
 		// 4. Enqueue and claim Resume job
 		fixResume := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Resume, &fix1)
 
@@ -2686,6 +2775,8 @@ func TestExecuteBatchJob_HardCrashRecovery(t *testing.T) {
 			t.Fatalf("expire job: %v", err)
 		}
 
+		recoverCrashedBatchJob(t, ctx, platformDB, fix1.claim.JobID, fix1.snapshot, acquire)
+
 		// Resume execution
 		fixResume := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Resume, &fix1)
 
@@ -2797,29 +2888,8 @@ func TestExecuteBatchJob_HardCrashRecovery(t *testing.T) {
 		// Wait for lease to expire
 		time.Sleep(150 * time.Millisecond)
 
-		// Resume execution
-		fixResume := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Resume, &fix1)
-		acquire := makeBatchAcquire(t, e.exec, e.prep)
-		depsResume := ExecutionDeps{
-			Gate:    batchFakeGate(fixResume.snapshot),
-			Acquire: acquire,
-			Timeout: 10 * time.Second,
-		}
-
-		outcome, err := svc.ExecuteBatchJob(ctx, fixResume.claim, depsResume)
-		if outcome == nil || outcome.Status != executioncontract.Failed {
-			t.Fatalf("expected Failed blocked outcome, got outcome=%+v err=%v", outcome, err)
-		}
-		var cErr executioncontract.ContractError
-		if !errors.As(outcome.Error, &cErr) || cErr.Code != "TARGET_BLOCKED" {
-			t.Fatalf("expected TARGET_BLOCKED error, got: %v", outcome.Error)
-		}
-
-		// Target remains blocked: blocks_database = true
-		var blocked bool
-		if err := platformDB.QueryRowContext(ctx, "SELECT blocks_database FROM app.jobs WHERE id = $1", fixResume.claim.JobID).Scan(&blocked); err != nil || !blocked {
-			t.Fatalf("expected resume job to remain blocked: blocked=%t err=%v", blocked, err)
-		}
+		outcome := recoverCrashedBatchJob(t, ctx, platformDB, fix1.claim.JobID, fix1.snapshot, makeBatchAcquire(t, e.exec, e.prep))
+		requireRecoveryKeepsBlock(t, ctx, platformDB, e.target, &fix1, outcome)
 	})
 }
 
@@ -3277,17 +3347,13 @@ func TestExecuteBatchJob_Regression_ValidFinalCommitPendingProof_ExtraCheckpoint
 		t.Fatalf("set attempt running: %v", err)
 	}
 
-	// Create resume job
-	fixResume := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Resume, &fix1)
-	cleanupBatchScope(t, e, fixResume.executionID)
-
 	var finalStepRecordCommitCalled bool
-	depsResume := ExecutionDeps{
+	recoveryDeps := ExecutionDeps{
 		Gate: transactionalBatchGate{executioncontract.FakeGate{
 			RevalidateFunc: func(ctx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
 				return executioncontract.ExecutionPlan{
 					Request:       req,
-					Snapshot:      fixResume.snapshot,
+					Snapshot:      fix1.snapshot,
 					Version:       "1",
 					ActorUsername: "testactor",
 					ValidatedAt:   time.Now().UTC(),
@@ -3303,31 +3369,12 @@ func TestExecuteBatchJob_Regression_ValidFinalCommitPendingProof_ExtraCheckpoint
 		Acquire: acquire,
 		Timeout: 10 * time.Second,
 	}
+	outcome := recoverCrashedBatchJobWith(t, ctx, platformDB, fix1.claim.JobID, recoveryDeps)
 
-	outcomeResume, err := svc.ExecuteBatchJob(ctx, fixResume.claim, depsResume)
-	if outcomeResume == nil || outcomeResume.Status != executioncontract.Failed {
-		t.Fatalf("expected Failed blocked outcome for extra checkpoint after final commit, got outcome=%+v err=%v", outcomeResume, err)
-	}
-	var cErr executioncontract.ContractError
-	if !errors.As(outcomeResume.Error, &cErr) || cErr.Code != "TARGET_BLOCKED" {
-		t.Fatalf("expected TARGET_BLOCKED, got: %v", outcomeResume.Error)
-	}
-
-	// Decisive checks:
-	// 1. No terminal success
-	if outcomeResume.Status == executioncontract.Succeeded {
-		t.Fatalf("must produce no terminal success")
-	}
-	// 2. No final RecordCommitTx
+	requireRecoveryKeepsBlock(t, ctx, platformDB, e.target, &fix1, outcome)
 	if finalStepRecordCommitCalled {
 		t.Fatalf("must produce no final RecordCommitTx call")
 	}
-	// 3. No dropped block: resume job retains blocks_database=true
-	var resumeBlocked bool
-	if err := platformDB.QueryRowContext(ctx, "SELECT blocks_database FROM app.jobs WHERE id = $1", fixResume.claim.JobID).Scan(&resumeBlocked); err != nil || !resumeBlocked {
-		t.Fatalf("resume job must retain blocks_database=true, got blocked=%t, err=%v", resumeBlocked, err)
-	}
-	// 4. Batch 1 proof must NOT have been inserted
 	var b1FinalProofCount int
 	if err := platformDB.QueryRowContext(ctx, `
 		SELECT count(*) FROM app.job_batch_commit_proofs
@@ -3385,6 +3432,8 @@ func TestExecuteBatchJob_Regression_RecoveredFinalCheckpoint_PartiallyCommittedE
 		t.Fatalf("set attempt 1 running: %v", err)
 	}
 
+	recoverCrashedBatchJob(t, ctx, platformDB, fix1.claim.JobID, fix1.snapshot, acquire)
+
 	// Step 3: Resume job 1 executes batch 1, commits on target, but crashes before platform proof.
 	fixResume1 := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Resume, &fix1)
 	cleanupBatchScope(t, e, fixResume1.executionID)
@@ -3422,32 +3471,38 @@ func TestExecuteBatchJob_Regression_RecoveredFinalCheckpoint_PartiallyCommittedE
 		t.Fatalf("supersede resume 1 proposal: %v", err)
 	}
 
+	// Recovery and resume share one counter: the final step must be published exactly once overall.
+	var recordCommitFinalCount int
+	countingDeps := func(snapshot executioncontract.Draft) ExecutionDeps {
+		return ExecutionDeps{
+			Gate: transactionalBatchGate{executioncontract.FakeGate{
+				RevalidateFunc: func(ctx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+					return executioncontract.ExecutionPlan{
+						Request:       req,
+						Snapshot:      snapshot,
+						Version:       "1",
+						ActorUsername: "testactor",
+						ValidatedAt:   time.Now().UTC(),
+					}, nil
+				},
+				RecordCommitFunc: func(ctx context.Context, tx *sql.Tx, in executioncontract.CommitEvidence) error {
+					if in.FinalStep {
+						recordCommitFinalCount++
+					}
+					return nil
+				},
+			}},
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+		}
+	}
+	recoverCrashedBatchJobWith(t, ctx, platformDB, fixResume1.claim.JobID, countingDeps(fixResume1.snapshot))
+
 	// Step 4: Resume job 2 recovers the final checkpoint.
 	fixResume2 := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Resume, &fix1)
 	cleanupBatchScope(t, e, fixResume2.executionID)
 
-	var recordCommitFinalCount int
-	depsResume2 := ExecutionDeps{
-		Gate: transactionalBatchGate{executioncontract.FakeGate{
-			RevalidateFunc: func(ctx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
-				return executioncontract.ExecutionPlan{
-					Request:       req,
-					Snapshot:      fixResume2.snapshot,
-					Version:       "1",
-					ActorUsername: "testactor",
-					ValidatedAt:   time.Now().UTC(),
-				}, nil
-			},
-			RecordCommitFunc: func(ctx context.Context, tx *sql.Tx, in executioncontract.CommitEvidence) error {
-				if in.FinalStep {
-					recordCommitFinalCount++
-				}
-				return nil
-			},
-		}},
-		Acquire: acquire,
-		Timeout: 10 * time.Second,
-	}
+	depsResume2 := countingDeps(fixResume2.snapshot)
 
 	outcome, err := svc.ExecuteBatchJob(ctx, fixResume2.claim, depsResume2)
 	if err != nil || outcome == nil || outcome.Status != executioncontract.Succeeded {
@@ -5264,6 +5319,8 @@ func TestExecuteBatchJob_Regression_LaterResumeRecoveringPreviousFinalCommitWith
 		t.Fatalf("supersede proposal 3: %v", err)
 	}
 
+	recoverCrashedBatchJob(t, ctx, platformDB, fix3.claim.JobID, fix3.snapshot, acquire)
+
 	// 4. Job 4 (Resume 3): new worker executes normal execution recovery for the scope!
 	fix4 := createBatchFixtureWithDuration(t, platformDB, ownerDB, e.target, 1, executioncontract.Resume, &fix1, 30*time.Second)
 	svc4 := New(platformDB)
@@ -5951,6 +6008,12 @@ func TestExecuteBatchJob_Regression_Terra1_ExtraUnknownStatementRetainsBlockAndT
 	}
 	if claimed != nil && claimed.JobID == queuedJobID {
 		t.Fatalf("claim must not bypass target block from Job X with extra unknown statement")
+	}
+	if _, err := platformDB.ExecContext(ctx, `UPDATE app.jobs SET status = 'failed', execution_status = 'failed', finished_at = clock_timestamp() WHERE id IN ($1, $2)`, unrelatedJobID, queuedJobID); err != nil {
+		t.Fatalf("close probe jobs: %v", err)
+	}
+	if _, err := platformDB.ExecContext(ctx, `UPDATE app.job_attempts SET status = 'failed', finished_at = clock_timestamp() WHERE id = $1`, unrelatedAttemptID); err != nil {
+		t.Fatalf("close probe attempt: %v", err)
 	}
 	// 3. Final Resume executes to completion (commits remaining batch 1)
 	fixFinal := createBatchFixtureWithDuration(t, platformDB, ownerDB, e.target, 1, executioncontract.Resume, &fix1, 30*time.Second)

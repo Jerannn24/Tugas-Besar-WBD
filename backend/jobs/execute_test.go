@@ -354,7 +354,7 @@ func createP3JobFixtureFull(t *testing.T, env *p3TestEnv, targetID string, targe
 	if err != nil {
 		t.Fatalf("begin enq tx: %v", err)
 	}
-	_, err = svc.EnqueueTx(ctx, ptx, enqReq)
+	enqRes, err := svc.EnqueueTx(ctx, ptx, enqReq)
 	if err != nil {
 		ptx.Rollback()
 		t.Fatalf("enqueue tx: %v", err)
@@ -363,12 +363,20 @@ func createP3JobFixtureFull(t *testing.T, env *p3TestEnv, targetID string, targe
 		t.Fatalf("commit enq tx: %v", err)
 	}
 
-	claim, err := svc.ClaimJob(ctx, ClaimRequest{
-		WorkerID:      workerID,
-		LeaseDuration: 45 * time.Second,
-	})
-	if err != nil || claim == nil {
-		t.Fatalf("claim job: claim=%+v err=%v", claim, err)
+	var claim *Claim
+	if shared != nil {
+		if busy, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: workerID, LeaseDuration: 45 * time.Second}); err != nil || busy != nil {
+			t.Fatalf("claim must refuse a busy target: claim=%+v err=%v", busy, err)
+		}
+		claim = forceP3Claim(t, env.ownerDB, enqRes.JobID, workerID)
+	} else {
+		claim, err = svc.ClaimJob(ctx, ClaimRequest{
+			WorkerID:      workerID,
+			LeaseDuration: 45 * time.Second,
+		})
+		if err != nil || claim == nil {
+			t.Fatalf("claim job: claim=%+v err=%v", claim, err)
+		}
 	}
 
 	return p3JobFixture{
@@ -381,6 +389,64 @@ func createP3JobFixtureFull(t *testing.T, env *p3TestEnv, targetID string, targe
 		snapshot:   snapshot,
 		claim:      claim,
 	}
+}
+
+// insertP3Migration adds another draft and proposal on fix's connection.
+func insertP3Migration(t *testing.T, env *p3TestEnv, fix p3JobFixture, action executioncontract.Action, sqlUp string) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	draftID, proposalID := uuid.NewString(), uuid.NewString()
+	if _, err := env.platformDB.ExecContext(ctx, `
+		INSERT INTO app.migration_drafts (id, database_id, revision, title, sql, created_by)
+		VALUES ($1, $2, 1, $3, $4, $5)
+	`, draftID, fix.dbID, "P3 Migration "+draftID[:8], sqlUp, fix.actorID); err != nil {
+		t.Fatalf("insert draft: %v", err)
+	}
+	hash := sha256.Sum256([]byte(sqlUp))
+	if _, err := env.platformDB.ExecContext(ctx, `
+		INSERT INTO app.migration_proposals (
+			id, database_id, migration_id, revision, action, status,
+			snapshot, snapshot_hash, created_by
+		) VALUES ($1, $2, $3, 1, $4, 'draft', '{}'::jsonb, $5, $6)
+	`, proposalID, fix.dbID, draftID, string(action), hash[:], fix.actorID); err != nil {
+		t.Fatalf("insert proposal: %v", err)
+	}
+	return draftID, proposalID
+}
+
+// forceP3Claim applies the same state change as ClaimJob without its target guard.
+func forceP3Claim(t *testing.T, db *sql.DB, jobID, workerID string) *Claim {
+	t.Helper()
+	ctx := context.Background()
+	c := Claim{JobID: jobID, ClaimedBy: workerID, LeaseToken: uuid.NewString(), AttemptNo: 1}
+	var source sql.NullString
+	var fingerprint sql.NullString
+	err := db.QueryRowContext(ctx, `
+		UPDATE app.jobs
+		SET status = 'running', execution_status = 'running', claimed_by = $2, claimed_at = clock_timestamp(),
+		    lease_token = $3, lease_expires_at = clock_timestamp() + interval '45 seconds',
+		    started_at = COALESCE(started_at, clock_timestamp()), updated_at = clock_timestamp()
+		WHERE id = $1 AND status = 'queued'
+		RETURNING execution_id, database_id, target_id, proposal_id, migration_id, revision, actor_id,
+		          action, direction, mode, source_execution_id::text, snapshot_hash, approval_fingerprint, lease_expires_at
+	`, jobID, workerID, c.LeaseToken).Scan(&c.ExecutionID, &c.DatabaseID, &c.TargetID, &c.ProposalID, &c.MigrationID,
+		&c.Revision, &c.ActorID, &c.Action, &c.Direction, &c.Mode, &source, &c.SnapshotHash, &fingerprint, &c.LeaseExpiresAt)
+	if err != nil {
+		t.Fatalf("force claim job: %v", err)
+	}
+	if source.Valid {
+		c.SourceExecutionID = &source.String
+	}
+	c.ApprovalFingerprint = fingerprint.String
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO app.job_attempts (job_id, execution_id, database_id, migration_id, revision,
+			actor_id, attempt_no, status, sql_entered, started_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, 1, 'running', false, clock_timestamp(), clock_timestamp())
+		RETURNING id
+	`, jobID, c.ExecutionID, c.DatabaseID, c.MigrationID, c.Revision, c.ActorID).Scan(&c.AttemptID); err != nil {
+		t.Fatalf("force claim attempt: %v", err)
+	}
+	return &c
 }
 
 func TestExecuteStandardJob_StatementFailureRollsBack(t *testing.T) {
@@ -816,7 +882,7 @@ func TestExecuteStandardJob_RealReviewChangesBeforeAuthorization(t *testing.T) {
 	}
 	different = input
 	different.RequestID = uuid.NewString()
-	if _, err := reviews.Enqueue(ctx, actor, proposalID, different); !errors.Is(err, workflow.ErrConflict) {
+	if _, err := reviews.Enqueue(ctx, actor, proposalID, different); !errors.Is(err, workflow.ErrPendingApprovals) {
 		t.Fatalf("pending review admitted a new request: %v", err)
 	}
 	if err := env.platformDB.QueryRowContext(ctx, `SELECT status FROM app.migration_proposals WHERE id=$1`, proposalID).Scan(&approvalStatus); err != nil || approvalStatus != "pending_review" {
@@ -975,17 +1041,18 @@ func TestExecuteStandardJob_TargetAdvisoryLockProtection(t *testing.T) {
 
 	tableName2 := "items_p3_lock2_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
 	sqlUp2 := "CREATE TABLE managed." + tableName2 + " (id bigint primary key);"
+	draft2, proposal2 := insertP3Migration(t, env, fix1, executioncontract.Apply, sqlUp2)
 	enqReq2 := executioncontract.EnqueueRequest{
 		DatabaseID:          fix1.dbID,
 		TargetID:            fix1.targetID,
 		RequestID:           uuid.NewString(),
-		ProposalID:          fix1.proposalID,
-		MigrationID:         fix1.draftID,
+		ProposalID:          proposal2,
+		MigrationID:         draft2,
 		Revision:            1,
 		ActorID:             fix1.actorID,
 		Action:              executioncontract.Apply,
 		Direction:           executioncontract.Up,
-		Snapshot:            executioncontract.Draft{MigrationID: fix1.draftID, DatabaseID: fix1.dbID, Revision: 1, SQLUp: sqlUp2, Mode: executioncontract.Standard},
+		Snapshot:            executioncontract.Draft{MigrationID: draft2, DatabaseID: fix1.dbID, Revision: 1, SQLUp: sqlUp2, Mode: executioncontract.Standard},
 		SnapshotHash:        "hash2_" + tableName2,
 		ApprovalFingerprint: "fingerprint2",
 	}
@@ -993,7 +1060,7 @@ func TestExecuteStandardJob_TargetAdvisoryLockProtection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = svc.EnqueueTx(ctx, ptx2, enqReq2)
+	enqRes2, err := svc.EnqueueTx(ctx, ptx2, enqReq2)
 	if err != nil {
 		ptx2.Rollback()
 		t.Fatal(err)
@@ -1001,10 +1068,10 @@ func TestExecuteStandardJob_TargetAdvisoryLockProtection(t *testing.T) {
 	if err := ptx2.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	claim2, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-lock-2", LeaseDuration: 45 * time.Second})
-	if err != nil || claim2 == nil {
-		t.Fatalf("claim job 2: %v", err)
+	if claim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-lock-2", LeaseDuration: 45 * time.Second}); err != nil || claim != nil {
+		t.Fatalf("claim must refuse a busy target: claim=%+v err=%v", claim, err)
 	}
+	claim2 := forceP3Claim(t, env.ownerDB, enqRes2.JobID, "worker-lock-2")
 	fakeGate := func(snapshot executioncontract.Draft) executioncontract.FakeGate {
 		return executioncontract.FakeGate{
 			RevalidateFunc: func(ctx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {

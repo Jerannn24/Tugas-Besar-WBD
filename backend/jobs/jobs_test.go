@@ -196,6 +196,20 @@ func createFixtureProposal(t *testing.T, ctx context.Context, db fixtureExecer, 
 	return id
 }
 
+// createFixtureMigration adds another draft with its own proposal on f's connection.
+func createFixtureMigration(t *testing.T, ctx context.Context, db fixtureExecer, f fixture) fixture {
+	t.Helper()
+	g := f
+	g.draftID = uuid.NewString()
+	g.snapshot.MigrationID = g.draftID
+	if _, err := db.ExecContext(ctx, `INSERT INTO app.migration_drafts (id, database_id, revision, title, sql, created_by)
+		SELECT $1, database_id, revision, title, sql, created_by FROM app.migration_drafts WHERE id = $2`, g.draftID, f.draftID); err != nil {
+		t.Fatalf("insert fixture draft: %v", err)
+	}
+	g.proposalID = createFixtureProposal(t, ctx, db, g, executioncontract.Apply, nil)
+	return g
+}
+
 func TestEnqueueTx_PersistAndGetJob(t *testing.T) {
 	platformDB, ownerDB := testDBs(t)
 	f := createFixture(t, platformDB, ownerDB)

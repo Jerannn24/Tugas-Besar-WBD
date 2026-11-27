@@ -1310,7 +1310,7 @@ func TestExecuteBatchJob_Compensation_ClaimUnblocksOnlyProvenLineage(t *testing.
 			t.Fatalf("expected compA succeeded, got %+v err=%v", compAOutcome, err)
 		}
 
-		upB := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Apply, nil)
+		upB := createBatchFixtureOnConnection(t, platformDB, ownerDB, e.target, 2, &upA)
 		cleanupBatchScope(t, e, upB.executionID)
 
 		upBOutcome, err := svc.ExecuteBatchJob(ctx, upB.claim, ExecutionDeps{

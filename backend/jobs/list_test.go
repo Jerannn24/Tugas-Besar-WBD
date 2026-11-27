@@ -61,12 +61,16 @@ func TestListsScopedStablePages(t *testing.T) {
 	ctx := context.Background()
 	var jobs, attempts []string
 	for i := 0; i < 3; i++ {
+		g := f
+		if i > 0 {
+			g = createFixtureMigration(t, ctx, platform, f)
+		}
 		tx, err := platform.BeginTx(ctx, nil)
 		if err != nil { t.Fatal(err) }
 		res, err := svc.EnqueueTx(ctx, tx, executioncontract.EnqueueRequest{
-			DatabaseID: f.dbID, TargetID: f.targetID, RequestID: uuid.NewString(), ProposalID: f.proposalID,
-			MigrationID: f.draftID, Revision: 1, ActorID: f.actorID, Action: executioncontract.Apply,
-			Direction: executioncontract.Up, Snapshot: f.snapshot, SnapshotHash: f.hash,
+			DatabaseID: f.dbID, TargetID: f.targetID, RequestID: uuid.NewString(), ProposalID: g.proposalID,
+			MigrationID: g.draftID, Revision: 1, ActorID: f.actorID, Action: executioncontract.Apply,
+			Direction: executioncontract.Up, Snapshot: g.snapshot, SnapshotHash: f.hash,
 		})
 		if err != nil { tx.Rollback(); t.Fatal(err) }
 		if err := tx.Commit(); err != nil { t.Fatal(err) }
@@ -77,7 +81,7 @@ func TestListsScopedStablePages(t *testing.T) {
 		id := uuid.NewString()
 		_, err = owner.ExecContext(ctx, `INSERT INTO app.job_attempts
 			(id, job_id, execution_id, database_id, migration_id, revision, actor_id, attempt_no, status, error_code, error_message, error_retryable, started_at)
-			VALUES ($1,$2,$3,$4,$5,1,$6,1,'failed','TEST','failure',true,$7)`, id, res.JobID, res.ExecutionID, f.dbID, f.draftID, f.actorID, at)
+			VALUES ($1,$2,$3,$4,$5,1,$6,1,'failed','TEST','failure',true,$7)`, id, res.JobID, res.ExecutionID, f.dbID, g.draftID, f.actorID, at)
 		if err != nil { t.Fatal(err) }
 		attempts = append(attempts, id)
 	}
