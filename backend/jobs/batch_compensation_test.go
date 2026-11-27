@@ -300,34 +300,6 @@ func TestExecuteBatchJob_Compensation_FailureMidDown_ResumeRecoveryWithoutReplay
 	if batch2Processed {
 		t.Fatalf("expected batch 2 items to be reverted to false, but found processed=true")
 	}
-	// The test gate does not publish workflow history. The proposal references
-	// a legacy execution row, whose SQL must match the stored up draft.
-	if _, err := platformDB.ExecContext(ctx, `
-		UPDATE app.migration_executions
-		SET status = 'succeeded', finished_at = clock_timestamp()
-		WHERE id = $1
-	`, upFix.executionID); err != nil {
-		t.Fatalf("finish up history fixture: %v", err)
-	}
-	if _, err := platformDB.ExecContext(ctx, `
-		WITH next_version AS (
-			UPDATE app.migration_target_state
-			SET next_version = next_version + 1
-			WHERE id = $2
-			RETURNING next_version - 1 AS version
-		)
-		INSERT INTO app.migration_executions
-			(id, database_id, execution_target_id, draft_id, request_id, draft_revision,
-			 version, title, sql, sql_sha256, executed_by, executed_username, started_at, status)
-		SELECT $3, m.database_id, m.execution_target_id, m.draft_id, $4, m.draft_revision,
-		       v.version, m.title, m.sql, m.sql_sha256, m.executed_by,
-		       m.executed_username, clock_timestamp(), 'running'
-		FROM app.migration_executions m CROSS JOIN next_version v
-		WHERE m.id = $1
-	`, upFix.executionID, e.target, compFix1.executionID, uuid.NewString()); err != nil {
-		t.Fatalf("insert compensation history fixture: %v", err)
-	}
-
 	// Resume the interrupted compensation through the queue.
 	compFix2 := createDownFixture(t, platformDB, ownerDB, e.target, 2, &compFix1, executioncontract.Resume)
 
@@ -914,4 +886,460 @@ func TestExecuteBatchJob_Compensation_Regression_PreservingUnrelatedBlocks(t *te
 	if !unrelBlocked || unrelStatus != "failed" {
 		t.Fatalf("expected unrelated job to preserve block and status (blocked=true status=failed), got blocked=%t status=%s", unrelBlocked, unrelStatus)
 	}
+}
+
+func enqueueUnrelatedBatchApply(t *testing.T, ctx context.Context, platformDB *sql.DB, svc *Service, dbID, targetID, actorID string, batchSize int) (string, executioncontract.Draft) {
+	t.Helper()
+	draftID := uuid.NewString()
+	proposalID := uuid.NewString()
+	sqlUp := "UPDATE managed.batch_items SET processed = TRUE WHERE id = ANY($1::bigint[]);"
+	sqlDown := "UPDATE managed.batch_items SET processed = FALSE WHERE id = ANY($1::bigint[]);"
+	if _, err := platformDB.ExecContext(ctx, `
+		INSERT INTO app.migration_drafts (id, database_id, revision, title, sql, sql_down, created_by)
+		VALUES ($1, $2, 1, 'Unrelated Next Migration', $3, $4, $5)
+	`, draftID, dbID, sqlUp, sqlDown, actorID); err != nil {
+		t.Fatalf("insert unrelated draft: %v", err)
+	}
+	snapshot := executioncontract.Draft{
+		MigrationID: draftID,
+		DatabaseID:  dbID,
+		Revision:    1,
+		Title:       "Unrelated Next Migration",
+		SQLUp:       sqlUp,
+		SQLDown:     &sqlDown,
+		Mode:        executioncontract.Batch,
+		Batch: &executioncontract.BatchConfig{
+			Schema:       "managed",
+			Table:        "batch_items",
+			CursorColumn: "id",
+			BatchSize:    batchSize,
+		},
+	}
+	hashBytes := sha256.Sum256([]byte(sqlUp))
+	snapJSON, _ := json.Marshal(snapshot)
+	if _, err := platformDB.ExecContext(ctx, `
+		INSERT INTO app.migration_proposals (id, database_id, migration_id, revision, action, status, snapshot, snapshot_hash, created_by)
+		VALUES ($1, $2, $3, 1, 'apply', 'draft', $4::jsonb, $5, $6)
+	`, proposalID, dbID, draftID, string(snapJSON), hashBytes[:], actorID); err != nil {
+		t.Fatalf("insert unrelated proposal: %v", err)
+	}
+	tx, err := platformDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback()
+	res, err := svc.EnqueueTx(ctx, tx, executioncontract.EnqueueRequest{
+		TargetID:     targetID,
+		RequestID:    uuid.NewString(),
+		ActorID:      actorID,
+		DatabaseID:   dbID,
+		ProposalID:   proposalID,
+		MigrationID:  draftID,
+		Revision:     1,
+		Action:       executioncontract.Apply,
+		Direction:    executioncontract.Up,
+		Snapshot:     snapshot,
+		SnapshotHash: hex.EncodeToString(hashBytes[:]),
+	})
+	if err != nil {
+		t.Fatalf("enqueue unrelated apply: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit unrelated apply: %v", err)
+	}
+	return res.JobID, snapshot
+}
+
+func TestExecuteBatchJob_Compensation_ClaimUnblocksOnlyProvenLineage(t *testing.T) {
+	e, platformDB, ownerDB := setupBatchTestEnv(t)
+	acquire := makeBatchAcquire(t, e.exec, e.prep)
+	svc := New(platformDB)
+
+	t.Run("partial_up_then_proven_compensation_unblocks_next_job", func(t *testing.T) {
+		setupBatchItemsFixture(t, e)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if _, err := e.exec.ExecContext(ctx, `
+			INSERT INTO managed.batch_items (id, processed)
+			VALUES (1, false), (2, false), (3, false), (4, false)
+		`); err != nil {
+			t.Fatalf("insert batch items: %v", err)
+		}
+
+		upFix := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Apply, nil)
+		cleanupBatchScope(t, e, upFix.executionID)
+
+		upOutcome, err := svc.ExecuteBatchJob(ctx, upFix.claim, ExecutionDeps{
+			Gate:    batchFakeGate(upFix.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+			beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
+				if batchIndex == 1 {
+					return errors.New("simulated failure on batch 1")
+				}
+				return nil
+			},
+		})
+		if upOutcome == nil || upOutcome.Status != executioncontract.Partial {
+			t.Fatalf("expected partial up outcome, got %+v err=%v", upOutcome, err)
+		}
+
+		nextJobID, nextSnap := enqueueUnrelatedBatchApply(t, ctx, platformDB, svc, upFix.dbID, e.target, upFix.actorID, 2)
+		blockedClaim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-blocked-before-comp", LeaseDuration: 30 * time.Second})
+		if err != nil || blockedClaim != nil {
+			t.Fatalf("expected claim blocked before compensation, got claim=%+v err=%v", blockedClaim, err)
+		}
+
+		compFix := createCompensateFixture(t, platformDB, ownerDB, e.target, 2, &upFix)
+		compOutcome, err := svc.ExecuteBatchJob(ctx, compFix.claim, ExecutionDeps{
+			Gate:    batchFakeGate(compFix.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+		})
+		if err != nil || compOutcome == nil || compOutcome.Status != executioncontract.Succeeded {
+			t.Fatalf("expected compensation succeeded, got %+v err=%v", compOutcome, err)
+		}
+
+		nextClaim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-after-comp", LeaseDuration: 30 * time.Second})
+		if err != nil || nextClaim == nil || nextClaim.JobID != nextJobID {
+			t.Fatalf("expected next job %s claimed after compensation, got claim=%+v err=%v", nextJobID, nextClaim, err)
+		}
+		cleanupBatchScope(t, e, nextClaim.ExecutionID)
+
+		nextOutcome, err := svc.ExecuteBatchJob(ctx, nextClaim, ExecutionDeps{
+			Gate:    batchFakeGate(nextSnap),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+		})
+		if err != nil || nextOutcome == nil || nextOutcome.Status != executioncontract.Succeeded {
+			t.Fatalf("expected next job succeeded, got %+v err=%v", nextOutcome, err)
+		}
+
+		var trueCount int
+		if err := e.exec.QueryRowContext(ctx, "SELECT count(*) FROM managed.batch_items WHERE processed = true").Scan(&trueCount); err != nil {
+			t.Fatalf("query processed items: %v", err)
+		}
+		if trueCount != 4 {
+			t.Fatalf("expected 4 processed items after next job, got %d", trueCount)
+		}
+
+		var upStatus string
+		var upBlocked bool
+		var upProofs, downProofs int
+		if err := platformDB.QueryRowContext(ctx, "SELECT status, blocks_database FROM app.jobs WHERE id = $1", upFix.claim.JobID).Scan(&upStatus, &upBlocked); err != nil {
+			t.Fatalf("query up job: %v", err)
+		}
+		if upStatus != "partial" || upBlocked {
+			t.Fatalf("expected up job historical status='partial' and blocks_database=false, got status=%s blocked=%t", upStatus, upBlocked)
+		}
+		if err := platformDB.QueryRowContext(ctx, "SELECT count(*) FROM app.job_batch_commit_proofs WHERE scope_execution_id = $1 AND direction = 'up'", upFix.executionID).Scan(&upProofs); err != nil {
+			t.Fatalf("query up proofs: %v", err)
+		}
+		if err := platformDB.QueryRowContext(ctx, "SELECT count(*) FROM app.job_batch_commit_proofs WHERE scope_execution_id = $1 AND direction = 'down'", upFix.executionID).Scan(&downProofs); err != nil {
+			t.Fatalf("query down proofs: %v", err)
+		}
+		if upProofs != 1 || downProofs != 1 {
+			t.Fatalf("expected 1 up proof and 1 down proof preserved without replay, got up=%d down=%d", upProofs, downProofs)
+		}
+	})
+
+	t.Run("partial_up_then_interrupted_comp_then_down_resume_unblocks_next_job", func(t *testing.T) {
+		setupBatchItemsFixture(t, e)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if _, err := e.exec.ExecContext(ctx, `
+			INSERT INTO managed.batch_items (id, processed)
+			VALUES (1, false), (2, false), (3, false), (4, false), (5, false), (6, false)
+		`); err != nil {
+			t.Fatalf("insert batch items: %v", err)
+		}
+
+		upFix := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Apply, nil)
+		cleanupBatchScope(t, e, upFix.executionID)
+
+		upOutcome, err := svc.ExecuteBatchJob(ctx, upFix.claim, ExecutionDeps{
+			Gate:    batchFakeGate(upFix.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+			beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
+				if batchIndex == 2 {
+					return errors.New("simulated failure on batch 2")
+				}
+				return nil
+			},
+		})
+		if upOutcome == nil || upOutcome.Status != executioncontract.Partial {
+			t.Fatalf("expected partial up outcome, got %+v err=%v", upOutcome, err)
+		}
+
+		compFix1 := createCompensateFixture(t, platformDB, ownerDB, e.target, 2, &upFix)
+		comp1Outcome, err := svc.ExecuteBatchJob(ctx, compFix1.claim, ExecutionDeps{
+			Gate:    batchFakeGate(compFix1.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+			beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
+				if batchIndex == 0 {
+					return errors.New("simulated failure mid-down on batch 0")
+				}
+				return nil
+			},
+		})
+		if comp1Outcome == nil || comp1Outcome.Status != executioncontract.PartiallyReverted {
+			t.Fatalf("expected partially_reverted outcome, got %+v err=%v", comp1Outcome, err)
+		}
+
+		nextJobID, nextSnap := enqueueUnrelatedBatchApply(t, ctx, platformDB, svc, upFix.dbID, e.target, upFix.actorID, 2)
+		blockedClaim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-blocked-mid-down", LeaseDuration: 30 * time.Second})
+		if err != nil || blockedClaim != nil {
+			t.Fatalf("expected claim blocked while partially_reverted, got claim=%+v err=%v", blockedClaim, err)
+		}
+
+		compFix2 := createDownFixture(t, platformDB, ownerDB, e.target, 2, &compFix1, executioncontract.Resume)
+		var resumedDownBatches []int
+		comp2Outcome, err := svc.ExecuteBatchJob(ctx, compFix2.claim, ExecutionDeps{
+			Gate:    batchFakeGate(compFix2.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+			beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
+				resumedDownBatches = append(resumedDownBatches, batchIndex)
+				return nil
+			},
+		})
+		if err != nil || comp2Outcome == nil || comp2Outcome.Status != executioncontract.Succeeded {
+			t.Fatalf("expected down resume succeeded, got %+v err=%v", comp2Outcome, err)
+		}
+		if len(resumedDownBatches) != 1 || resumedDownBatches[0] != 0 {
+			t.Fatalf("expected down resume to dispatch only [0] without replaying batch 1, got %v", resumedDownBatches)
+		}
+
+		nextClaim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-after-down-resume", LeaseDuration: 30 * time.Second})
+		if err != nil || nextClaim == nil || nextClaim.JobID != nextJobID {
+			t.Fatalf("expected next job %s claimed after down resume, got claim=%+v err=%v", nextJobID, nextClaim, err)
+		}
+		cleanupBatchScope(t, e, nextClaim.ExecutionID)
+
+		nextOutcome, err := svc.ExecuteBatchJob(ctx, nextClaim, ExecutionDeps{
+			Gate:    batchFakeGate(nextSnap),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+		})
+		if err != nil || nextOutcome == nil || nextOutcome.Status != executioncontract.Succeeded {
+			t.Fatalf("expected next job succeeded, got %+v err=%v", nextOutcome, err)
+		}
+
+		var trueCount int
+		if err := e.exec.QueryRowContext(ctx, "SELECT count(*) FROM managed.batch_items WHERE processed = true").Scan(&trueCount); err != nil {
+			t.Fatalf("query processed items: %v", err)
+		}
+		if trueCount != 6 {
+			t.Fatalf("expected 6 processed items after next job, got %d", trueCount)
+		}
+
+		var upStatus, comp1Status string
+		var upBlocked, comp1Blocked bool
+		if err := platformDB.QueryRowContext(ctx, "SELECT status, blocks_database FROM app.jobs WHERE id = $1", upFix.claim.JobID).Scan(&upStatus, &upBlocked); err != nil {
+			t.Fatalf("query up job: %v", err)
+		}
+		if err := platformDB.QueryRowContext(ctx, "SELECT status, blocks_database FROM app.jobs WHERE id = $1", compFix1.claim.JobID).Scan(&comp1Status, &comp1Blocked); err != nil {
+			t.Fatalf("query comp1 job: %v", err)
+		}
+		if upStatus != "partial" || upBlocked || comp1Status != "partially_reverted" || comp1Blocked {
+			t.Fatalf("expected historical statuses preserved and blocks cleared, up=(%s,%t) comp1=(%s,%t)", upStatus, upBlocked, comp1Status, comp1Blocked)
+		}
+	})
+
+	t.Run("status_only_down_without_proofs_still_blocks", func(t *testing.T) {
+		setupBatchItemsFixture(t, e)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if _, err := e.exec.ExecContext(ctx, "INSERT INTO managed.batch_items (id, processed) VALUES (1, false), (2, false), (3, false), (4, false)"); err != nil {
+			t.Fatalf("insert batch items: %v", err)
+		}
+
+		upFix := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Apply, nil)
+		cleanupBatchScope(t, e, upFix.executionID)
+
+		upOutcome, err := svc.ExecuteBatchJob(ctx, upFix.claim, ExecutionDeps{
+			Gate:    batchFakeGate(upFix.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+			beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
+				if batchIndex == 1 {
+					return errors.New("simulated failure on batch 1")
+				}
+				return nil
+			},
+		})
+		if upOutcome == nil || upOutcome.Status != executioncontract.Partial {
+			t.Fatalf("expected partial up outcome, got %+v err=%v", upOutcome, err)
+		}
+
+		compFix := createCompensateFixture(t, platformDB, ownerDB, e.target, 2, &upFix)
+		if _, err := ownerDB.ExecContext(ctx, `
+			UPDATE app.jobs SET status = 'succeeded', execution_status = 'succeeded', blocks_database = false, finished_at = clock_timestamp()
+			WHERE id = $1
+		`, compFix.claim.JobID); err != nil {
+			t.Fatalf("fabricate comp status: %v", err)
+		}
+		if _, err := ownerDB.ExecContext(ctx, `
+			UPDATE app.job_attempts SET status = 'succeeded', finished_at = clock_timestamp() WHERE id = $1
+		`, compFix.claim.AttemptID); err != nil {
+			t.Fatalf("fabricate comp attempt status: %v", err)
+		}
+		if _, err := ownerDB.ExecContext(ctx, `
+			UPDATE app.jobs SET blocks_database = false WHERE id = $1
+		`, upFix.claim.JobID); err != nil {
+			t.Fatalf("clear up blocks_database: %v", err)
+		}
+
+		enqueueUnrelatedBatchApply(t, ctx, platformDB, svc, upFix.dbID, e.target, upFix.actorID, 2)
+		claim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-unproven-down", LeaseDuration: 30 * time.Second})
+		if err != nil || claim != nil {
+			t.Fatalf("expected status-only down without proofs to keep target blocked, got claim=%+v err=%v", claim, err)
+		}
+	})
+
+	t.Run("incomplete_down_resume_missing_proof_still_blocks", func(t *testing.T) {
+		setupBatchItemsFixture(t, e)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if _, err := e.exec.ExecContext(ctx, `
+			INSERT INTO managed.batch_items (id, processed)
+			VALUES (1, false), (2, false), (3, false), (4, false), (5, false), (6, false)
+		`); err != nil {
+			t.Fatalf("insert batch items: %v", err)
+		}
+
+		upFix := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Apply, nil)
+		cleanupBatchScope(t, e, upFix.executionID)
+
+		upOutcome, err := svc.ExecuteBatchJob(ctx, upFix.claim, ExecutionDeps{
+			Gate:    batchFakeGate(upFix.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+			beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
+				if batchIndex == 2 {
+					return errors.New("simulated failure on batch 2")
+				}
+				return nil
+			},
+		})
+		if upOutcome == nil || upOutcome.Status != executioncontract.Partial {
+			t.Fatalf("expected partial up outcome, got %+v err=%v", upOutcome, err)
+		}
+
+		compFix1 := createCompensateFixture(t, platformDB, ownerDB, e.target, 2, &upFix)
+		comp1Outcome, err := svc.ExecuteBatchJob(ctx, compFix1.claim, ExecutionDeps{
+			Gate:    batchFakeGate(compFix1.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+			beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
+				if batchIndex == 0 {
+					return errors.New("simulated failure mid-down on batch 0")
+				}
+				return nil
+			},
+		})
+		if comp1Outcome == nil || comp1Outcome.Status != executioncontract.PartiallyReverted {
+			t.Fatalf("expected partially_reverted outcome, got %+v err=%v", comp1Outcome, err)
+		}
+
+		compFix2 := createDownFixture(t, platformDB, ownerDB, e.target, 2, &compFix1, executioncontract.Resume)
+		if _, err := ownerDB.ExecContext(ctx, `
+			UPDATE app.jobs SET status = 'succeeded', execution_status = 'succeeded', blocks_database = false, finished_at = clock_timestamp()
+			WHERE id = $1
+		`, compFix2.claim.JobID); err != nil {
+			t.Fatalf("fabricate down resume status: %v", err)
+		}
+		if _, err := ownerDB.ExecContext(ctx, `
+			UPDATE app.job_attempts SET status = 'succeeded', finished_at = clock_timestamp() WHERE id = $1
+		`, compFix2.claim.AttemptID); err != nil {
+			t.Fatalf("fabricate down resume attempt status: %v", err)
+		}
+		if _, err := ownerDB.ExecContext(ctx, `
+			UPDATE app.jobs SET blocks_database = false WHERE id IN ($1, $2)
+		`, upFix.claim.JobID, compFix1.claim.JobID); err != nil {
+			t.Fatalf("clear lineage blocks_database: %v", err)
+		}
+
+		enqueueUnrelatedBatchApply(t, ctx, platformDB, svc, upFix.dbID, e.target, upFix.actorID, 2)
+		claim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-incomplete-down-resume", LeaseDuration: 30 * time.Second})
+		if err != nil || claim != nil {
+			t.Fatalf("expected down resume missing batch 0 proof to keep target blocked, got claim=%+v err=%v", claim, err)
+		}
+	})
+
+	t.Run("proven_compensation_does_not_unblock_separate_unresolved_job", func(t *testing.T) {
+		setupBatchItemsFixture(t, e)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if _, err := e.exec.ExecContext(ctx, "INSERT INTO managed.batch_items (id, processed) VALUES (1, false), (2, false), (3, false), (4, false)"); err != nil {
+			t.Fatalf("insert batch items: %v", err)
+		}
+
+		upA := createBatchFixture(t, platformDB, ownerDB, e.target, 2, executioncontract.Apply, nil)
+		cleanupBatchScope(t, e, upA.executionID)
+
+		upAOutcome, err := svc.ExecuteBatchJob(ctx, upA.claim, ExecutionDeps{
+			Gate:    batchFakeGate(upA.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+			beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
+				if batchIndex == 1 {
+					return errors.New("simulated failure on batch 1")
+				}
+				return nil
+			},
+		})
+		if upAOutcome == nil || upAOutcome.Status != executioncontract.Partial {
+			t.Fatalf("expected partial upA outcome, got %+v err=%v", upAOutcome, err)
+		}
+
+		compA := createCompensateFixture(t, platformDB, ownerDB, e.target, 2, &upA)
+		compAOutcome, err := svc.ExecuteBatchJob(ctx, compA.claim, ExecutionDeps{
+			Gate:    batchFakeGate(compA.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+		})
+		if err != nil || compAOutcome == nil || compAOutcome.Status != executioncontract.Succeeded {
+			t.Fatalf("expected compA succeeded, got %+v err=%v", compAOutcome, err)
+		}
+
+		upB := createBatchFixtureOnConnection(t, platformDB, ownerDB, e.target, 2, &upA)
+		cleanupBatchScope(t, e, upB.executionID)
+
+		upBOutcome, err := svc.ExecuteBatchJob(ctx, upB.claim, ExecutionDeps{
+			Gate:    batchFakeGate(upB.snapshot),
+			Acquire: acquire,
+			Timeout: 10 * time.Second,
+			beforeBatchDispatch: func(ctx context.Context, batchIndex int) error {
+				if batchIndex == 1 {
+					return errors.New("simulated failure on batch 1")
+				}
+				return nil
+			},
+		})
+		if upBOutcome == nil || upBOutcome.Status != executioncontract.Partial {
+			t.Fatalf("expected partial upB outcome, got %+v err=%v", upBOutcome, err)
+		}
+
+		enqueueUnrelatedBatchApply(t, ctx, platformDB, svc, upA.dbID, e.target, upA.actorID, 2)
+		claim, err := svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-other-unresolved", LeaseDuration: 30 * time.Second})
+		if err != nil || claim != nil {
+			t.Fatalf("expected separate unresolved partial job to keep target blocked, got claim=%+v err=%v", claim, err)
+		}
+
+		if _, err := ownerDB.ExecContext(ctx, "UPDATE app.jobs SET blocks_database = false WHERE id = $1", upB.claim.JobID); err != nil {
+			t.Fatalf("clear upB blocks_database: %v", err)
+		}
+		claim, err = svc.ClaimJob(ctx, ClaimRequest{WorkerID: "worker-other-unresolved-2", LeaseDuration: 30 * time.Second})
+		if err != nil || claim != nil {
+			t.Fatalf("expected separate unresolved partial status to keep target blocked, got claim=%+v err=%v", claim, err)
+		}
+	})
 }

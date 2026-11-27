@@ -24,11 +24,10 @@ const (
 type Dependencies struct {
 	Platform *sql.DB
 	Actor    func(*http.Request) (Actor, error)
-	// Authorize menolak akses selain view/edit sebelum koneksi target dibuka.
 	Authorize func(context.Context, Actor, string, Access) error
-	// OpenTarget mengembalikan pool role VIEWER milik provider; handler tidak menutupnya.
 	OpenTarget func(context.Context, string) (*sql.DB, error)
 	Timeout    time.Duration
+	Recorder Recorder
 }
 
 type Handler struct{ d Dependencies }
@@ -39,6 +38,9 @@ func New(d Dependencies) (*Handler, error) {
 	}
 	if d.Timeout <= 0 {
 		return nil, errors.New("viewer timeout is required")
+	}
+	if d.Recorder == nil {
+		d.Recorder = NewSlogRecorder(nil)
 	}
 	return &Handler{d}, nil
 }
@@ -61,12 +63,16 @@ func (h *Handler) databases(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), h.d.Timeout)
 	defer cancel()
-	rows, err := h.d.Platform.QueryContext(ctx, `SELECT c.id::text,c.name, CASE WHEN bool_or(g.access='edit') THEN 'edit' ELSE 'view' END AS access
-FROM app.database_connections c JOIN app.group_database_grants g ON g.database_id=c.id
-JOIN app.group_memberships m ON m.group_id=g.group_id
-WHERE m.user_id=$1 AND c.deleted_at IS NULL
-GROUP BY c.id,c.name ORDER BY c.name,c.id`, a.ID)
+	ctx = withScope(ctx, scope{actor: a.ID, correlationID: correlationID(r)})
+	const q = `SELECT c.id::text,c.name, CASE WHEN bool_or(g.access='edit') THEN 'edit' ELSE 'view' END AS access
+				FROM app.database_connections c JOIN app.group_database_grants g ON g.database_id=c.id
+				JOIN app.group_memberships m ON m.group_id=g.group_id
+				WHERE m.user_id=$1 AND c.deleted_at IS NULL
+				GROUP BY c.id,c.name ORDER BY c.name,c.id`
+	end := h.track(ctx, "sql.query", "databases.list", q, a.ID)
+	rows, err := h.d.Platform.QueryContext(ctx, q, a.ID)
 	if err != nil {
+		end(0, err)
 		internal(w)
 		return
 	}
@@ -75,15 +81,18 @@ GROUP BY c.id,c.name ORDER BY c.name,c.id`, a.ID)
 	for rows.Next() {
 		var id, name, access string
 		if rows.Scan(&id, &name, &access) != nil {
+			end(len(items), errScan)
 			internal(w)
 			return
 		}
 		items = append(items, map[string]string{"id": id, "name": name, "access": access})
 	}
-	if rows.Err() != nil {
+	if err := rows.Err(); err != nil {
+		end(len(items), err)
 		internal(w)
 		return
 	}
+	end(len(items), nil)
 	success(w, map[string]any{"items": items})
 }
 
@@ -111,7 +120,10 @@ func (h *Handler) open(w http.ResponseWriter, r *http.Request) (*sql.Tx, context
 		apiError(w, 502, "TARGET_UNAVAILABLE", "Target database is unavailable")
 		return nil, nil, nil, false
 	}
+	ctx = withScope(ctx, scope{actor: a.ID, databaseID: strings.ToLower(id), correlationID: correlationID(r)})
+	end := h.track(ctx, "sql.begin", "tx.begin_read_only", "")
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	end(0, err)
 	if err != nil {
 		cancel()
 		apiError(w, 502, "TARGET_UNAVAILABLE", "Target database is unavailable")
@@ -127,11 +139,14 @@ func (h *Handler) schemas(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer cancel()
-	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT n.nspname,c.relname FROM pg_catalog.pg_namespace n LEFT JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relkind IN ('r','p') AND has_table_privilege(c.oid,'SELECT')
-WHERE has_schema_privilege(n.oid,'USAGE') AND n.nspname NOT IN ('information_schema','wbd_auth') AND left(n.nspname,3)<>'pg_'
-ORDER BY n.nspname,c.relname`)
+	defer h.rollback(ctx, tx)
+	const q = `SELECT n.nspname,c.relname FROM pg_catalog.pg_namespace n LEFT JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relkind IN ('r','p') AND has_table_privilege(c.oid,'SELECT')
+				WHERE has_schema_privilege(n.oid,'USAGE') AND n.nspname NOT IN ('information_schema','wbd_auth') AND left(n.nspname,3)<>'pg_'
+				ORDER BY n.nspname,c.relname`
+	end := h.track(ctx, "sql.query", "schemas.list", q)
+	rows, err := tx.QueryContext(ctx, q)
 	if err != nil {
+		end(0, err)
 		targetError(w)
 		return
 	}
@@ -141,10 +156,13 @@ ORDER BY n.nspname,c.relname`)
 		Tables []map[string]string `json:"tables"`
 	}
 	by := map[string]*schema{}
+	n := 0
 	for rows.Next() {
+		n++
 		var s string
 		var t sql.NullString
 		if rows.Scan(&s, &t) != nil {
+			end(n, errScan)
 			targetError(w)
 			return
 		}
@@ -155,10 +173,12 @@ ORDER BY n.nspname,c.relname`)
 			by[s].Tables = append(by[s].Tables, map[string]string{"name": t.String})
 		}
 	}
-	if rows.Err() != nil {
+	if err := rows.Err(); err != nil {
+		end(n, err)
 		targetError(w)
 		return
 	}
+	end(n, nil)
 	out := make([]schema, 0, len(by))
 	for _, s := range by {
 		out = append(out, *s)
@@ -202,8 +222,8 @@ func (h *Handler) table(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer cancel()
-	defer tx.Rollback()
-	meta, err := metadata(tx, ctx, s, t)
+	defer h.rollback(ctx, tx)
+	meta, err := h.metadata(tx, ctx, s, t)
 	if errors.Is(err, sql.ErrNoRows) {
 		apiError(w, 404, "NOT_FOUND", "Table not found")
 		return
@@ -220,15 +240,22 @@ type queryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func metadata(q queryer, ctx context.Context, s, t string) (Metadata, error) {
+func (h *Handler) metadata(q queryer, ctx context.Context, s, t string) (Metadata, error) {
 	m := Metadata{Schema: s, Table: t, Columns: []Column{}, Constraints: []Constraint{}, Indexes: []Index{}}
 	var oid int64
-	err := q.QueryRowContext(ctx, `SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind IN ('r','p') AND has_table_privilege(c.oid,'SELECT') AND has_schema_privilege(n.oid,'USAGE') AND n.nspname NOT IN ('information_schema','wbd_auth') AND left(n.nspname,3)<>'pg_'`, s, t).Scan(&oid)
+	const lookup = `SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind IN ('r','p') AND has_table_privilege(c.oid,'SELECT') AND has_schema_privilege(n.oid,'USAGE') AND n.nspname NOT IN ('information_schema','wbd_auth') AND left(n.nspname,3)<>'pg_'`
+	end := h.track(ctx, "sql.query", "table.lookup", lookup, s, t)
+	err := q.QueryRowContext(ctx, lookup, s, t).Scan(&oid)
 	if err != nil {
+		end(0, err)
 		return m, err
 	}
-	rows, err := q.QueryContext(ctx, `SELECT a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod),NOT a.attnotnull,pg_catalog.pg_get_expr(d.adbin,d.adrelid) FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum`, oid)
+	end(1, nil)
+	const columns = `SELECT a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod),NOT a.attnotnull,pg_catalog.pg_get_expr(d.adbin,d.adrelid) FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum`
+	end = h.track(ctx, "sql.query", "table.columns", columns, oid)
+	rows, err := q.QueryContext(ctx, columns, oid)
 	if err != nil {
+		end(0, err)
 		return m, err
 	}
 	for rows.Next() {
@@ -236,7 +263,8 @@ func metadata(q queryer, ctx context.Context, s, t string) (Metadata, error) {
 		var def sql.NullString
 		if rows.Scan(&c.Name, &c.Type, &c.Nullable, &def) != nil {
 			rows.Close()
-			return m, errors.New("scan")
+			end(len(m.Columns)+1, errScan)
+			return m, errScan
 		}
 		if def.Valid {
 			c.Default = &def.String
@@ -245,43 +273,57 @@ func metadata(q queryer, ctx context.Context, s, t string) (Metadata, error) {
 	}
 	if err = rows.Err(); err != nil {
 		rows.Close()
+		end(len(m.Columns), err)
 		return m, err
 	}
 	rows.Close()
-	rows, err = q.QueryContext(ctx, `SELECT conname,CASE contype WHEN 'p' THEN 'primary' WHEN 'f' THEN 'foreign' WHEN 'u' THEN 'unique' WHEN 'c' THEN 'check' WHEN 'x' THEN 'exclusion' ELSE 'other' END,pg_catalog.pg_get_constraintdef(oid,true) FROM pg_catalog.pg_constraint WHERE conrelid=$1 ORDER BY conname`, oid)
+	end(len(m.Columns), nil)
+	const constraints = `SELECT conname,CASE contype WHEN 'p' THEN 'primary' WHEN 'f' THEN 'foreign' WHEN 'u' THEN 'unique' WHEN 'c' THEN 'check' WHEN 'x' THEN 'exclusion' ELSE 'other' END,pg_catalog.pg_get_constraintdef(oid,true) FROM pg_catalog.pg_constraint WHERE conrelid=$1 ORDER BY conname`
+	end = h.track(ctx, "sql.query", "table.constraints", constraints, oid)
+	rows, err = q.QueryContext(ctx, constraints, oid)
 	if err != nil {
+		end(0, err)
 		return m, err
 	}
 	for rows.Next() {
 		var c Constraint
 		if rows.Scan(&c.Name, &c.Kind, &c.Definition) != nil {
 			rows.Close()
-			return m, errors.New("scan")
+			end(len(m.Constraints)+1, errScan)
+			return m, errScan
 		}
 		m.Constraints = append(m.Constraints, c)
 	}
 	if err = rows.Err(); err != nil {
 		rows.Close()
+		end(len(m.Constraints), err)
 		return m, err
 	}
 	rows.Close()
-	rows, err = q.QueryContext(ctx, `SELECT ci.relname,pg_catalog.pg_get_indexdef(i.indexrelid),i.indisunique,i.indisprimary FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ci ON ci.oid=i.indexrelid WHERE i.indrelid=$1 ORDER BY ci.relname`, oid)
+	end(len(m.Constraints), nil)
+	const indexes = `SELECT ci.relname,pg_catalog.pg_get_indexdef(i.indexrelid),i.indisunique,i.indisprimary FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ci ON ci.oid=i.indexrelid WHERE i.indrelid=$1 ORDER BY ci.relname`
+	end = h.track(ctx, "sql.query", "table.indexes", indexes, oid)
+	rows, err = q.QueryContext(ctx, indexes, oid)
 	if err != nil {
+		end(0, err)
 		return m, err
 	}
 	for rows.Next() {
 		var i Index
 		if rows.Scan(&i.Name, &i.Definition, &i.Unique, &i.Primary) != nil {
 			rows.Close()
-			return m, errors.New("scan")
+			end(len(m.Indexes)+1, errScan)
+			return m, errScan
 		}
 		m.Indexes = append(m.Indexes, i)
 	}
 	if err = rows.Err(); err != nil {
 		rows.Close()
+		end(len(m.Indexes), err)
 		return m, err
 	}
 	rows.Close()
+	end(len(m.Indexes), nil)
 	return m, nil
 }
 
@@ -317,8 +359,8 @@ func (h *Handler) rows(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer cancel()
-	defer tx.Rollback()
-	meta, err := metadata(tx, ctx, s, t)
+	defer h.rollback(ctx, tx)
+	meta, err := h.metadata(tx, ctx, s, t)
 	if errors.Is(err, sql.ErrNoRows) {
 		apiError(w, 404, "NOT_FOUND", "Table not found")
 		return
@@ -331,7 +373,7 @@ func (h *Handler) rows(w http.ResponseWriter, r *http.Request) {
 	for _, c := range meta.Columns {
 		res.Columns = append(res.Columns, RowColumn{c.Name, c.Type})
 	}
-	order, err := orderColumns(tx, ctx, s, t)
+	order, err := h.orderColumns(tx, ctx, s, t)
 	if err != nil {
 		targetError(w)
 		return
@@ -351,19 +393,24 @@ func (h *Handler) rows(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	query += " LIMIT $1 OFFSET $2"
+	end := h.track(ctx, "sql.query", "rows.select", query, limit+1, offset)
 	rows, err := tx.QueryContext(ctx, query, limit+1, offset)
 	if err != nil {
+		end(0, err)
 		targetError(w)
 		return
 	}
 	defer rows.Close()
+	n := 0
 	for rows.Next() {
+		n++
 		vals := make([]sql.NullString, len(cols))
 		args := make([]any, len(vals))
 		for i := range vals {
 			args[i] = &vals[i]
 		}
 		if rows.Scan(args...) != nil {
+			end(n, errScan)
 			targetError(w)
 			return
 		}
@@ -380,15 +427,20 @@ func (h *Handler) rows(w http.ResponseWriter, r *http.Request) {
 		}
 		res.Rows = append(res.Rows, row)
 	}
-	if rows.Err() != nil {
+	if err := rows.Err(); err != nil {
+		end(n, err)
 		targetError(w)
 		return
 	}
+	end(n, nil)
 	success(w, res)
 }
-func orderColumns(tx *sql.Tx, ctx context.Context, s, t string) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, `WITH chosen AS (SELECT i.indrelid,i.indkey,i.indnkeyatts FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2 AND i.indisunique AND i.indisvalid AND i.indisready AND i.indpred IS NULL AND i.indexprs IS NULL AND NOT EXISTS (SELECT 1 FROM unnest(i.indkey::smallint[]) WITH ORDINALITY AS x(attnum,ord) JOIN pg_catalog.pg_attribute z ON z.attrelid=c.oid AND z.attnum=x.attnum WHERE x.ord<=i.indnkeyatts AND NOT z.attnotnull) ORDER BY i.indisprimary DESC,i.indexrelid LIMIT 1) SELECT a.attname FROM chosen i CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,ord) JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum WHERE k.ord<=i.indnkeyatts ORDER BY k.ord`, s, t)
+func (h *Handler) orderColumns(tx *sql.Tx, ctx context.Context, s, t string) ([]string, error) {
+	const q = `WITH chosen AS (SELECT i.indrelid,i.indkey,i.indnkeyatts FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2 AND i.indisunique AND i.indisvalid AND i.indisready AND i.indpred IS NULL AND i.indexprs IS NULL AND NOT EXISTS (SELECT 1 FROM unnest(i.indkey::smallint[]) WITH ORDINALITY AS x(attnum,ord) JOIN pg_catalog.pg_attribute z ON z.attrelid=c.oid AND z.attnum=x.attnum WHERE x.ord<=i.indnkeyatts AND NOT z.attnotnull) ORDER BY i.indisprimary DESC,i.indexrelid LIMIT 1) SELECT a.attname FROM chosen i CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,ord) JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum WHERE k.ord<=i.indnkeyatts ORDER BY k.ord`
+	end := h.track(ctx, "sql.query", "rows.order", q, s, t)
+	rows, err := tx.QueryContext(ctx, q, s, t)
 	if err != nil {
+		end(0, err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -396,11 +448,14 @@ func orderColumns(tx *sql.Tx, ctx context.Context, s, t string) ([]string, error
 	for rows.Next() {
 		var c string
 		if rows.Scan(&c) != nil {
-			return nil, errors.New("scan")
+			end(len(out)+1, errScan)
+			return nil, errScan
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	err = rows.Err()
+	end(len(out), err)
+	return out, err
 }
 
 func params(w http.ResponseWriter, r *http.Request) (string, string, bool) {

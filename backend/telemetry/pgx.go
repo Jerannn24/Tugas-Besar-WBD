@@ -42,12 +42,12 @@ func (t *QueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 	attrs = append(attrs, slogDuration(time.Since(started.at)), slogInt("rows_affected", data.CommandTag.RowsAffected()))
 	failed := data.Err != nil
 	if data.Err != nil {
-		msg, state := SafeError(data.Err)
+		state := ""
 		var pgErr *pgconn.PgError
 		if errors.As(data.Err, &pgErr) {
 			state = pgErr.Code
 		}
-		attrs = append(attrs, slogString("error", msg))
+		attrs = append(attrs, slogString("error", "query failed"))
 		if state != "" {
 			attrs = append(attrs, slogString("sql_state", state))
 		}
@@ -57,7 +57,7 @@ func (t *QueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 	} else if t != nil && t.Logger != nil {
 		t.Logger.Info(ctx, sqlEventName(started.query, "completed"), attrs...)
 	}
-	ExportSpan(context.Background(), Span{TraceID: started.trace.TraceID, SpanID: started.trace.SpanID, ParentSpanID: started.trace.ParentSpanID, Name: "db.sql.query", Kind: 3, StartedAt: started.at, EndedAt: time.Now(), Failed: failed, Attributes: map[string]string{"db.system": "postgresql", "db.statement": MaskSQL(started.query), "db.operation.parameter_count": fmt.Sprint(len(started.args)), "correlation_id": started.trace.CorrelationID}})
+	ExportSpan(context.Background(), Span{TraceID: started.trace.TraceID, SpanID: started.trace.SpanID, ParentSpanID: started.trace.ParentSpanID, Name: "db.sql.query", Kind: 3, StartedAt: started.at, EndedAt: time.Now(), Failed: failed, Attributes: map[string]string{"db.system": "postgresql", "db.statement": MaskSecrets(MaskSQL(started.query)), "db.operation.parameter_count": fmt.Sprint(len(started.args)), "correlation_id": started.trace.CorrelationID}})
 }
 
 func slogDuration(d time.Duration) slog.Attr {
@@ -80,9 +80,7 @@ func sqlEventName(query, phase string) string {
 	return "sql.query." + phase
 }
 
-// StartPoolMetrics periodically exports the platform pgx pool's active and
-// idle connection counts. The caller owns and must invoke the returned stop.
-func StartPoolMetrics(ctx context.Context, pool *pgxpool.Pool, registry *Registry, interval time.Duration) func() {
+func StartPoolMetrics(ctx context.Context, pool *pgxpool.Pool, registry *Registry, interval time.Duration, additional ...func() (int64, int64)) func() {
 	if interval <= 0 {
 		interval = 15 * time.Second
 	}
@@ -90,16 +88,27 @@ func StartPoolMetrics(ctx context.Context, pool *pgxpool.Pool, registry *Registr
 		registry = DefaultRegistry()
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	collect := func() {
 		if pool == nil {
 			return
 		}
 		stats := pool.Stat()
-		registry.Set(workerCtx, executioncontract.GaugePoolConnections, float64(stats.AcquiredConns()), executioncontract.MetricLabels{executioncontract.LabelState: executioncontract.ValueActive})
-		registry.Set(workerCtx, executioncontract.GaugePoolConnections, float64(stats.IdleConns()), executioncontract.MetricLabels{executioncontract.LabelState: executioncontract.ValueIdle})
+		active := int64(stats.AcquiredConns())
+		idle := int64(stats.IdleConns())
+		for _, extraStats := range additional {
+			if extraStats != nil {
+				extraActive, extraIdle := extraStats()
+				active += extraActive
+				idle += extraIdle
+			}
+		}
+		registry.Set(workerCtx, executioncontract.GaugePoolConnections, float64(active), executioncontract.MetricLabels{executioncontract.LabelState: executioncontract.ValueActive})
+		registry.Set(workerCtx, executioncontract.GaugePoolConnections, float64(idle), executioncontract.MetricLabels{executioncontract.LabelState: executioncontract.ValueIdle})
 	}
 	collect()
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -111,5 +120,8 @@ func StartPoolMetrics(ctx context.Context, pool *pgxpool.Pool, registry *Registr
 			}
 		}
 	}()
-	return cancel
+	return func() {
+		cancel()
+		<-done
+	}
 }

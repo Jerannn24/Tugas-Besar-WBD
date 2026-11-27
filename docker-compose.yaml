@@ -23,17 +23,23 @@ services:
       ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       FRONTEND_DIST: /app/web
+      OTEL_SERVICE_NAME: dbplatform-backend
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     ports:
       - "8080:8080"
     volumes:
       - ./backend:/app
       - ./frontend/dist:/app/web:ro
+    stop_grace_period: 90s
     depends_on:
       postgres:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
 
   postgres:
     image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+    command: ["postgres", "-c", "track_commit_timestamp=on"]
     environment:
       POSTGRES_USER: ${DB_DEV_BOOTSTRAP_USER:?Set DB_DEV_BOOTSTRAP_USER in .env}
       POSTGRES_PASSWORD: ${DB_DEV_BOOTSTRAP_PASSWORD:?Set DB_DEV_BOOTSTRAP_PASSWORD in .env}
@@ -114,23 +120,15 @@ services:
       - "-config.file=/etc/tempo.yaml"
     restart: unless-stopped
 
-  alloy:
-    image: grafana/alloy:v1.11.0
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.136.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
     volumes:
-      - ./deploy/observability/alloy.alloy:/etc/alloy/config.alloy:ro
-      - alloy-data:/var/lib/alloy/data
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
-      - "12345:12345"
       - "4317:4317"
       - "4318:4318"
-    command:
-      - "run"
-      - "--server.http.listen-addr=0.0.0.0:12345"
-      - "--storage.path=/var/lib/alloy/data"
-      - "/etc/alloy/config.alloy"
     depends_on:
-      - prometheus
       - loki
       - tempo
     restart: unless-stopped
@@ -140,6 +138,7 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
       - "3000:3000"
     depends_on:
@@ -155,5 +154,4 @@ volumes:
   prometheus-data:
   loki-data:
   tempo-data:
-  alloy-data:
   grafana-data:

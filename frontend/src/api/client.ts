@@ -186,6 +186,14 @@ function toErrorBody(v: unknown): ApiErrorBody | null {
   }
 }
 
+const CODE_ALIASES: Record<string, string> = {
+  INVALID_INPUT: 'INVALID_REQUEST',
+  PROPOSAL_STALE: 'VERSION_CONFLICT',
+  CONFLICT: 'VERSION_CONFLICT',
+}
+
+export const canonicalCode = (code: string): string => CODE_ALIASES[code] ?? code
+
 const GENERIC_MESSAGES: Record<string, string> = {
   UNAUTHENTICATED: 'Sesi berakhir. Mengalihkan ke halaman login…',
   INVALID_CREDENTIALS: 'Username atau password salah.',
@@ -196,6 +204,21 @@ const GENERIC_MESSAGES: Record<string, string> = {
   DATABASE_BUSY: 'Database target sedang menjalankan migration. Coba lagi nanti.',
   TARGET_UNAVAILABLE: 'Database target tidak dapat dihubungi.',
   INTERNAL_ERROR: 'Terjadi kesalahan pada server.',
+  INVALID_REQUEST: 'Permintaan tidak valid.',
+  LEADER_REQUIRED: 'Hanya leader group yang dapat menyetujui proposal ini.',
+  REQUEST_CONFLICT: 'Request ID sudah dipakai untuk permintaan lain.',
+  APPROVAL_REQUIRED: 'Proposal belum mendapat semua approval yang wajib.',
+  REVIEW_STALE: 'Review sudah usang. Muat ulang proposal untuk meninjau kembali.',
+  HISTORY_CONFLICT: 'Riwayat migration berubah. Muat ulang sebelum melanjutkan.',
+  VALIDATION_FAILED: 'Input tidak valid.',
+  SQL_UNSUPPORTED: 'SQL tidak didukung.',
+  MIGRATION_IRREVERSIBLE: 'Migration tidak dapat dibatalkan.',
+  INVALID_MIGRATION_ORDER: 'Urutan migration tidak valid.',
+  BATCH_UNSAFE: 'Konfigurasi batch tidak aman.',
+  QUEUE_UNAVAILABLE: 'Antrean belum menerima job. Kirim ulang untuk mencoba lagi.',
+  NOT_IMPLEMENTED: 'Fitur ini belum tersedia di backend.',
+  ALREADY_APPLIED: 'Draft sudah diterapkan dan tidak dapat diubah lagi.',
+  INVALID_GROUP_LEADER: 'Leader harus anggota aktif group ini.',
 }
 
 export function errorMessage(failure: ApiFailure): string {
@@ -211,13 +234,13 @@ export function errorMessage(failure: ApiFailure): string {
         return GENERIC_MESSAGES[code]
       }
 
-      return message || GENERIC_MESSAGES[code] || 'Permintaan gagal.'
+      return message || GENERIC_MESSAGES[canonicalCode(code)] || 'Permintaan gagal.'
     }
   }
 }
 
 export function isErrorCode(result: ApiResult<unknown>, code: string): boolean {
-  return !result.ok && result.kind === 'http' && result.error.code === code
+  return !result.ok && result.kind === 'http' && canonicalCode(result.error.code) === code
 }
 
 const CSRF_CODES: ReadonlySet<string> = new Set(['CSRF_INVALID', 'CSRF_FAILED'])

@@ -1,19 +1,19 @@
 package routes
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/gofiber/fiber/v2"
 )
 
 func TestHealthRoute(t *testing.T) {
-	t.Setenv("DATABASE_URL", "")
-
 	app := fiber.New()
-	Register(app, nil, "test-secret")
+	registerAPI(app, nil, "test-secret", telemetry.NewRegistry())
 
 	req := httptest.NewRequest("GET", "/api/health", nil)
 
@@ -51,10 +51,8 @@ func TestHealthRoute(t *testing.T) {
 }
 
 func TestAPIResponsesAreNoStore(t *testing.T) {
-	t.Setenv("DATABASE_URL", "")
-
 	app := fiber.New()
-	Register(app, nil, "test-secret")
+	registerAPI(app, nil, "test-secret", telemetry.NewRegistry())
 
 	for _, path := range []string{"/api/health", "/api/csrf", "/api/does-not-exist"} {
 		resp, err := app.Test(httptest.NewRequest("GET", path, nil))
@@ -69,10 +67,8 @@ func TestAPIResponsesAreNoStore(t *testing.T) {
 }
 
 func TestUnknownAPIRouteReturnsJSONError(t *testing.T) {
-	t.Setenv("DATABASE_URL", "")
-
 	app := fiber.New()
-	Register(app, nil, "test-secret")
+	registerAPI(app, nil, "test-secret", telemetry.NewRegistry())
 
 	resp, err := app.Test(httptest.NewRequest("GET", "/api/does-not-exist", nil))
 	if err != nil {
@@ -95,5 +91,21 @@ func TestUnknownAPIRouteReturnsJSONError(t *testing.T) {
 	}
 	if body.Error.Code == "" || body.Error.FieldErrors == nil || body.Error.Retryable == nil {
 		t.Fatalf("body not in C01 shape: %+v", body.Error)
+	}
+}
+
+func TestRegisterRejectsMissingPlatformPool(t *testing.T) {
+	app := fiber.New()
+	shutdown, err := Register(context.Background(), app, nil, "test-secret")
+	if err == nil || shutdown != nil {
+		t.Fatalf("Register without platform pool = %v, want a startup failure", err)
+	}
+	resp, err := app.Test(httptest.NewRequest("POST", "/api/proposals/00000000-0000-0000-0000-000000000000/queue", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("queue route from failed startup returned %d, want 404", resp.StatusCode)
 	}
 }

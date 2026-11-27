@@ -26,16 +26,16 @@ type ExecutionDeps struct {
 	Acquire func(ctx context.Context, databaseID string) (*migration.TargetLease, error)
 	Timeout time.Duration
 
-	beforeDispatch          func(ctx context.Context) error
-	afterTargetCommit       func(ctx context.Context) error
-	beforeBatchDispatch     func(ctx context.Context, batchIndex int) error
-	afterTicketReservation  func(ctx context.Context, batchIndex int) error
-	afterBatchCommit        func(ctx context.Context, batchIndex int) error
-	afterBatchUpdate        func(ctx context.Context, batchIndex int) error
-	afterRollbackFirstWrite func(ctx context.Context) error
-	crashAfterBatchAuthorize func(ctx context.Context, batchIndex int) error
-	crashAfterBatchCommit    func(ctx context.Context, batchIndex int) error
-	beforeRecoveryScanStep   func(ctx context.Context, batchIndex int) error
+	beforeDispatch            func(ctx context.Context) error
+	afterTargetCommit         func(ctx context.Context) error
+	beforeBatchDispatch       func(ctx context.Context, batchIndex int) error
+	afterTicketReservation    func(ctx context.Context, batchIndex int) error
+	afterBatchCommit          func(ctx context.Context, batchIndex int) error
+	afterBatchUpdate          func(ctx context.Context, batchIndex int) error
+	afterRollbackFirstWrite   func(ctx context.Context) error
+	crashAfterBatchAuthorize  func(ctx context.Context, batchIndex int) error
+	crashAfterBatchCommit     func(ctx context.Context, batchIndex int) error
+	beforeRecoveryScanStep    func(ctx context.Context, batchIndex int) error
 	beforeRecoveryClosurePage func(ctx context.Context, kind string, pageIndex int, pageSize int) error
 }
 
@@ -76,7 +76,15 @@ func selectSQL(plan executioncontract.ExecutionPlan, action executioncontract.Ac
 	return plan.Snapshot.SQLUp, nil
 }
 
+type reviewReturner interface {
+	ReturnToReviewTx(context.Context, *sql.Tx, executioncontract.RevalidationRequest) error
+}
+
 func (s *Service) failJob(ctx context.Context, claim *Claim, code string, msg string) error {
+	return s.failPreDispatch(ctx, claim, code, msg, nil)
+}
+
+func (s *Service) failPreDispatch(ctx context.Context, claim *Claim, code, msg string, review reviewReturner) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -98,7 +106,9 @@ func (s *Service) failJob(ctx context.Context, claim *Claim, code string, msg st
 		  AND lease_token = $4::uuid AND lease_expires_at > clock_timestamp() AND attempt_no = $5
 		  AND NOT blocks_database
 		  AND NOT EXISTS (SELECT 1 FROM app.job_dispatch_authorizations WHERE job_id = $3)
-		  AND NOT EXISTS (SELECT 1 FROM app.job_attempts WHERE job_id = $3 AND sql_entered)
+		  AND NOT EXISTS (SELECT 1 FROM app.job_batch_step_authorizations WHERE job_id = $3)
+		  AND NOT EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = $3 AND
+		                  (a.sql_entered OR EXISTS (SELECT 1 FROM app.job_statement_evidence e WHERE e.attempt_id = a.id)))
 		  AND execution_id = $6 AND database_id = $7 AND target_id = $8
 		  AND proposal_id = $9 AND migration_id = $10 AND revision = $11 AND actor_id = $12
 		  AND action = $13 AND direction = $14 AND mode = $15
@@ -111,6 +121,11 @@ func (s *Service) failJob(ctx context.Context, claim *Claim, code string, msg st
 	if err := requireOne(res, err, "fail job"); err != nil {
 		return err
 	}
+	if review != nil {
+		if err := review.ReturnToReviewTx(ctx, tx, claim.RevalidationRequest()); err != nil {
+			return err
+		}
+	}
 
 	res, err = tx.ExecContext(ctx, `
 		UPDATE app.job_attempts
@@ -119,9 +134,9 @@ func (s *Service) failJob(ctx context.Context, claim *Claim, code string, msg st
 		    error_message = $2,
 		    error_retryable = false,
 		    finished_at = clock_timestamp()
-		WHERE id = $3 AND job_id = $4 AND status = 'running'
+		WHERE id = $3 AND job_id = $4 AND attempt_no = $6 AND status = 'running' AND NOT sql_entered
 		  AND EXISTS (SELECT 1 FROM app.jobs WHERE id = $4 AND status = 'failed'
-		              AND lease_token = $5::uuid AND attempt_no = $6)
+		              AND lease_token = $5::uuid AND lease_expires_at > clock_timestamp() AND attempt_no = $6)
 	`, code, msg, claim.AttemptID, claim.JobID, claim.LeaseToken, claim.AttemptNo)
 	if err := requireOne(res, err, "fail attempt"); err != nil {
 		return err
@@ -196,6 +211,25 @@ func (s *Service) failedOutcome(ctx context.Context, claim *Claim, code string, 
 	return &ExecutionOutcome{Status: executioncontract.Failed, Error: cause}, nil
 }
 
+func (s *Service) rejectPreDispatch(ctx context.Context, claim *Claim, gate executioncontract.WorkflowGate, cause error) (*ExecutionOutcome, error) {
+	var rejection executioncontract.ContractError
+	if !errors.As(cause, &rejection) || rejection.Retryable {
+		return nil, fmt.Errorf("workflow revalidation failed: %w", cause)
+	}
+	var review reviewReturner
+	if rejection.Code == "REVIEW_STALE" {
+		var ok bool
+		review, ok = gate.(reviewReturner)
+		if !ok {
+			return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", cause)
+		}
+	}
+	if err := s.failPreDispatch(ctx, claim, rejection.Code, rejection.Message, review); err != nil {
+		return nil, errors.Join(cause, err)
+	}
+	return &ExecutionOutcome{Status: executioncontract.Failed, Error: cause}, nil
+}
+
 func (s *Service) unknownOutcome(ctx context.Context, claim *Claim, cause error) (*ExecutionOutcome, error) {
 	if claim != nil && claim.LeaseToken != "" {
 		if err := s.markJobUnknown(ctx, claim, cause); err != nil {
@@ -265,7 +299,7 @@ func (s *Service) rollbackAuthorizedOutcome(ctx context.Context, claim *Claim, s
 	return &ExecutionOutcome{Status: executioncontract.Failed, Error: cause}, nil
 }
 
-func (s *Service) authorizeDispatch(ctx context.Context, claim *Claim, plan executioncontract.ExecutionPlan, sqlText, xid string, version int64) error {
+func (s *Service) authorizeDispatch(ctx context.Context, claim *Claim, gate executioncontract.WorkflowGate, plan executioncontract.ExecutionPlan, sqlText, xid string, version int64) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("dispatch authorization aborted: %w", err)
 	}
@@ -340,16 +374,7 @@ func (s *Service) authorizeDispatch(ctx context.Context, claim *Claim, plan exec
 			           OR (
 			               (j.status IN ('unknown', 'partial', 'partially_reverted')
 			                OR j.execution_status IN ('unknown', 'partial', 'partially_reverted'))
-			               AND NOT EXISTS (
-		                   SELECT 1 FROM app.jobs res
-		                   WHERE (res.execution_id = j.execution_id OR res.source_execution_id = j.execution_id)
-		                     AND res.target_id = j.target_id
-		                     AND res.database_id = j.database_id
-		                     AND res.direction = j.direction
-		                     AND res.status = 'succeeded'
-		                     AND res.execution_status = 'succeeded'
-		                     AND NOT res.blocks_database
-		               )
+			               AND NOT ` + resolvedBlocker("j") + `
 		           )
 		           OR EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
 		                  AND (a.sql_entered OR EXISTS (
@@ -389,7 +414,7 @@ func (s *Service) authorizeDispatch(ctx context.Context, claim *Claim, plan exec
 		                                              AND bsa.batch_index = unse.batch_index
 		                                              AND bsa.physical_target_id = j.target_id
 		                                              AND bsa.direction = j.direction
-		                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+		                                              AND ` + batchEvidenceScope("j") + `
 		                                        ))
 		                                        OR (unse.outcome = 'succeeded' AND EXISTS (
 		                                            SELECT 1 FROM app.job_batch_step_authorizations bsa
@@ -404,7 +429,7 @@ func (s *Service) authorizeDispatch(ctx context.Context, claim *Claim, plan exec
 		                                              AND bsa.batch_index = unse.batch_index
 		                                              AND bsa.physical_target_id = j.target_id
 		                                              AND bsa.direction = j.direction
-		                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+		                                              AND ` + batchEvidenceScope("j") + `
 		                                        ))
 		                                    )
 		                                )
@@ -436,6 +461,21 @@ func (s *Service) authorizeDispatch(ctx context.Context, claim *Claim, plan exec
 	}
 	if blocked {
 		return executioncontract.ContractError{Code: "TARGET_BLOCKED", Message: "target has an unresolved execution"}
+	}
+	if err := guardLegacyUnresolved(ctx, tx, claim.TargetID); err != nil {
+		return err
+	}
+	if transactional, ok := gate.(interface {
+		RevalidateTx(context.Context, *sql.Tx, executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error)
+	}); ok {
+		current, err := transactional.RevalidateTx(ctx, tx, claim.RevalidationRequest())
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(current.Request, plan.Request) || !reflect.DeepEqual(current.Snapshot, plan.Snapshot) || current.Version != plan.Version {
+			return executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan changed before dispatch"}
+		}
+		plan = current
 	}
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
@@ -749,11 +789,7 @@ func (s *Service) ExecuteStandardJob(ctx context.Context, claim *Claim, deps Exe
 	// Step: Revalidate with WorkflowGate
 	plan, err := deps.Gate.Revalidate(ctx, claim.RevalidationRequest())
 	if err != nil {
-		var cErr executioncontract.ContractError
-		if errors.As(err, &cErr) && cErr.Code == "REVIEW_STALE" {
-			return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", err)
-		}
-		return nil, fmt.Errorf("workflow revalidation failed: %w", err)
+		return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 	}
 	if !reflect.DeepEqual(plan.Request, claim.RevalidationRequest()) {
 		return nil, executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan identity mismatch"}
@@ -816,8 +852,12 @@ func (s *Service) ExecuteStandardJob(ctx context.Context, claim *Claim, deps Exe
 		session.Abort("TARGET_PREPARATION_FAILED", "target xid query failed")
 		return s.failedOutcome(ctx, claim, "TARGET_PREPARATION_FAILED", err)
 	}
-	if err := s.authorizeDispatch(ctx, claim, plan, sqlText, xid, version); err != nil {
+	if err := s.authorizeDispatch(ctx, claim, deps.Gate, plan, sqlText, xid, version); err != nil {
 		session.Abort("DISPATCH_NOT_AUTHORIZED", err.Error())
+		var rejection executioncontract.ContractError
+		if errors.As(err, &rejection) && (rejection.Code == "REVIEW_STALE" || rejection.Code == "FORBIDDEN") {
+			return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
+		}
 		return nil, err
 	}
 	if deps.beforeDispatch != nil {

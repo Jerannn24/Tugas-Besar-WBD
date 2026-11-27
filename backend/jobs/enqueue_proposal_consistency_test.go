@@ -96,3 +96,77 @@ func TestEnqueueTxProposalSourceIdentity(t *testing.T) {
 	if err != nil { t.Fatal(err) }
 	if result.ExecutionID != source { t.Fatalf("execution ID = %s, want %s", result.ExecutionID, source) }
 }
+
+func TestEnqueueTxBlocksDuplicateProposalExecution(t *testing.T) {
+	db, owner := testDBs(t)
+	f := createFixture(t, db, owner)
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group := uuid.NewString()
+	exec(`INSERT INTO app.groups(id, name, leader_user_id) VALUES ($1, $2, $3)`, group, "enqueue-"+group, f.actorID)
+	exec(`UPDATE app.migration_proposals SET status='pending_review' WHERE id=$1`, f.proposalID)
+	exec(`INSERT INTO app.migration_proposal_approvals(proposal_id,group_id,approval_round,leader_user_id) VALUES ($1,$2,1,$3)`, f.proposalID, group, f.actorID)
+	exec(`UPDATE app.migration_proposal_approvals SET status='approved' WHERE proposal_id=$1 AND group_id=$2 AND approval_round=1`, f.proposalID, group)
+	exec(`UPDATE app.migration_proposals SET status='approved' WHERE id=$1`, f.proposalID)
+	req := executioncontract.EnqueueRequest{
+		DatabaseID: f.dbID, TargetID: f.targetID, RequestID: uuid.NewString(),
+		ProposalID: f.proposalID, MigrationID: f.draftID, Revision: 1,
+		ActorID: f.actorID, Action: executioncontract.Apply, Snapshot: f.snapshot, SnapshotHash: f.hash,
+	}
+	svc := New(db)
+	first, err := svc.EnqueueTx(ctx, tx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE app.migration_proposals SET status='queued' WHERE id=$1`, f.proposalID)
+	other := req
+	other.RequestID = uuid.NewString()
+	for _, status := range []string{"queued", "running", "retry_wait", "unknown", "partial", "partially_reverted", "succeeded", "failed"} {
+		exec(`UPDATE app.jobs SET status=$2, execution_status=$2, error_code='OTHER' WHERE id=$1`, first.JobID, status)
+		if _, err := svc.EnqueueTx(ctx, tx, other); !errors.Is(err, executioncontract.ErrRequestConflict) {
+			t.Fatalf("status %s: expected conflict, got %v", status, err)
+		}
+	}
+	exec(`UPDATE app.jobs SET error_code='REVIEW_STALE' WHERE id=$1`, first.JobID)
+	if _, err := svc.EnqueueTx(ctx, tx, other); !errors.Is(err, executioncontract.ErrRequestConflict) {
+		t.Fatalf("stale without new round: expected conflict, got %v", err)
+	}
+	exec(`UPDATE app.migration_proposals SET status='pending_review' WHERE id=$1`, f.proposalID)
+	exec(`INSERT INTO app.migration_proposal_approvals(proposal_id,group_id,approval_round,leader_user_id) VALUES ($1,$2,2,$3)`, f.proposalID, group, f.actorID)
+	exec(`UPDATE app.migration_proposal_approvals SET status='approved' WHERE proposal_id=$1 AND group_id=$2 AND approval_round=2`, f.proposalID, group)
+	exec(`UPDATE app.migration_proposals SET status='approved' WHERE id=$1`, f.proposalID)
+	exec(`SAVEPOINT clean_failure`)
+	exec(`UPDATE app.jobs SET error_code='SQL_FAILED' WHERE id=$1`, first.JobID)
+	clean, err := svc.EnqueueTx(ctx, tx, other)
+	if err != nil || clean.Replayed || clean.JobID == first.JobID {
+		t.Fatalf("clean failure with new approval: result=%+v err=%v", clean, err)
+	}
+	exec(`ROLLBACK TO SAVEPOINT clean_failure`)
+	second, err := svc.EnqueueTx(ctx, tx, other)
+	if err != nil || second.Replayed || second.JobID == first.JobID {
+		t.Fatalf("new approval round: result=%+v err=%v", second, err)
+	}
+	replay, err := svc.EnqueueTx(ctx, tx, req)
+	if err != nil || !replay.Replayed || replay.JobID != first.JobID {
+		t.Fatalf("original replay: result=%+v err=%v", replay, err)
+	}
+	changed := req
+	changed.Snapshot.Title = "different snapshot"
+	if _, err := svc.EnqueueTx(ctx, tx, changed); !errors.Is(err, executioncontract.ErrRequestConflict) {
+		t.Fatalf("changed snapshot replay: %v", err)
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM app.jobs WHERE proposal_id=$1`, f.proposalID).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("job count=%d, err=%v", count, err)
+	}
+}

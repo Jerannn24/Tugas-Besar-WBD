@@ -9,61 +9,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/migration"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 )
 var (
 	chkPageLimit      = 20
 	recoveryPageLimit = 20
 )
-func validateAgreedBatchSQL(dir executioncontract.Direction, sqlText string) error {
-	normalized := strings.ToUpper(strings.Join(strings.Fields(strings.TrimRight(strings.TrimSpace(sqlText), ";")), " "))
-	if dir == executioncontract.Up {
-		if normalized != "UPDATE MANAGED.BATCH_ITEMS SET PROCESSED = TRUE WHERE ID = ANY($1::BIGINT[])" {
-			return executioncontract.ContractError{
-				Code:    "SQL_UNSUPPORTED",
-				Message: "batch SQL does not match agreed immutable UPDATE pattern",
-			}
-		}
-		return nil
-	}
-	if dir == executioncontract.Down {
-		if normalized != "UPDATE MANAGED.BATCH_ITEMS SET PROCESSED = FALSE WHERE ID = ANY($1::BIGINT[])" {
-			return executioncontract.ContractError{
-				Code:    "SQL_UNSUPPORTED",
-				Message: "batch SQL does not match agreed immutable UPDATE pattern",
-			}
-		}
-		return nil
-	}
-	return executioncontract.ContractError{
-		Code:    "INVALID_DIRECTION",
-		Message: "unsupported direction for batch execution",
-	}
-}
-
-func validateAgreedBatchConfig(cfg *executioncontract.BatchConfig) error {
-	if cfg == nil {
-		return executioncontract.ContractError{
-			Code:    "INVALID_BATCH_CONFIG",
-			Message: "batch configuration is required",
-		}
-	}
-	if cfg.Schema != "managed" || cfg.Table != "batch_items" || cfg.CursorColumn != "id" ||
-		cfg.BatchSize < 1 || cfg.BatchSize > 10000 {
-		return executioncontract.ContractError{
-			Code:    "INVALID_BATCH_CONFIG",
-			Message: "batch configuration must target managed.batch_items with cursor id and batch size 1..10000",
-		}
-	}
-	return nil
-}
-
 func (s *Service) failPartialJob(ctx context.Context, claim *Claim, code, msg string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
@@ -568,16 +526,7 @@ func (s *Service) checkBatchLeaseAndTargetBlock(ctx context.Context, claim *Clai
 			           OR (
 			               (j.status IN ('unknown', 'partial', 'partially_reverted')
 			                OR j.execution_status IN ('unknown', 'partial', 'partially_reverted'))
-			               AND NOT EXISTS (
-			                   SELECT 1 FROM app.jobs res
-			                   WHERE (res.execution_id = j.execution_id OR res.source_execution_id = j.execution_id)
-			                     AND res.target_id = j.target_id
-			                     AND res.database_id = j.database_id
-			                     AND res.direction = j.direction
-			                     AND res.status = 'succeeded'
-			                     AND res.execution_status = 'succeeded'
-			                     AND NOT res.blocks_database
-			               )
+			               AND NOT ` + resolvedBlocker("j") + `
 			           )
 			           OR EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
 			                  AND (a.sql_entered OR EXISTS (
@@ -617,7 +566,7 @@ func (s *Service) checkBatchLeaseAndTargetBlock(ctx context.Context, claim *Clai
 			                                              AND bsa.batch_index = unse.batch_index
 			                                              AND bsa.physical_target_id = j.target_id
 			                                              AND bsa.direction = j.direction
-			                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+			                                              AND ` + batchEvidenceScope("j") + `
 			                                        ))
 			                                        OR (unse.outcome = 'succeeded' AND EXISTS (
 			                                            SELECT 1 FROM app.job_batch_step_authorizations bsa
@@ -632,7 +581,7 @@ func (s *Service) checkBatchLeaseAndTargetBlock(ctx context.Context, claim *Clai
 			                                              AND bsa.batch_index = unse.batch_index
 			                                              AND bsa.physical_target_id = j.target_id
 			                                              AND bsa.direction = j.direction
-			                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+			                                              AND ` + batchEvidenceScope("j") + `
 			                                        ))
 			                                    )
 			                                )
@@ -675,7 +624,7 @@ func (s *Service) checkBatchLeaseAndTargetBlock(ctx context.Context, claim *Clai
 	return nil
 }
 
-func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, scopeExecID string, plan executioncontract.ExecutionPlan, sqlText, xid string, version int64, ordinal, batchIndex int, chunkIDs []int64) error {
+func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, gate executioncontract.WorkflowGate, scopeExecID string, plan executioncontract.ExecutionPlan, sqlText, xid string, version int64, ordinal, batchIndex int, chunkIDs []int64) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("batch dispatch authorization aborted: %w", err)
 	}
@@ -753,16 +702,7 @@ func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, scop
 			           OR (
 			               (j.status IN ('unknown', 'partial', 'partially_reverted')
 			                OR j.execution_status IN ('unknown', 'partial', 'partially_reverted'))
-			               AND NOT EXISTS (
-			                   SELECT 1 FROM app.jobs res
-			                   WHERE (res.execution_id = j.execution_id OR res.source_execution_id = j.execution_id)
-			                     AND res.target_id = j.target_id
-			                     AND res.database_id = j.database_id
-			                     AND res.direction = j.direction
-			                     AND res.status = 'succeeded'
-			                     AND res.execution_status = 'succeeded'
-			                     AND NOT res.blocks_database
-			               )
+			               AND NOT ` + resolvedBlocker("j") + `
 			           )
 			           OR EXISTS (SELECT 1 FROM app.job_attempts a WHERE a.job_id = j.id
 			                  AND (a.sql_entered OR EXISTS (
@@ -802,7 +742,7 @@ func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, scop
 			                                              AND bsa.batch_index = unse.batch_index
 			                                              AND bsa.physical_target_id = j.target_id
 			                                              AND bsa.direction = j.direction
-			                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+			                                              AND ` + batchEvidenceScope("j") + `
 			                                        ))
 			                                        OR (unse.outcome = 'succeeded' AND EXISTS (
 			                                            SELECT 1 FROM app.job_batch_step_authorizations bsa
@@ -817,7 +757,7 @@ func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, scop
 			                                              AND bsa.batch_index = unse.batch_index
 			                                              AND bsa.physical_target_id = j.target_id
 			                                              AND bsa.direction = j.direction
-			                                              AND (bsa.scope_execution_id = j.execution_id OR (j.action = 'resume' AND bsa.scope_execution_id = j.source_execution_id))
+			                                              AND ` + batchEvidenceScope("j") + `
 			                                        ))
 			                                    )
 			                                )
@@ -853,6 +793,23 @@ func (s *Service) authorizeBatchDispatch(ctx context.Context, claim *Claim, scop
 	if blocked {
 		return executioncontract.ContractError{Code: "TARGET_BLOCKED", Message: "target has an unresolved execution"}
 	}
+	if err := guardLegacyUnresolved(ctx, tx, claim.TargetID); err != nil {
+		return err
+	}
+	transactional, ok := gate.(interface {
+		RevalidateTx(context.Context, *sql.Tx, executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error)
+	})
+	if !ok {
+		return errors.New("batch dispatch requires transactional workflow revalidation")
+	}
+	current, err := transactional.RevalidateTx(ctx, tx, claim.RevalidationRequest())
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(current.Request, plan.Request) || !reflect.DeepEqual(current.Snapshot, plan.Snapshot) || current.Version != plan.Version {
+		return executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan changed before dispatch"}
+	}
+	plan = current
 
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
@@ -2094,7 +2051,7 @@ func (s *Service) scanAndReconcileBatchCheckpoints(
 				outc, outcErr := s.failedBlockedOutcome(ctx, claim, "TARGET_BLOCKED", errors.New("authorized step SQL sha256 mismatch"))
 				return nil, outc, outcErr
 			}
-			if err := validateAgreedBatchSQL(claim.Direction, step.bsaSQLText); err != nil {
+			if err := executioncontract.ValidateBatchSQL(claim.Direction, step.bsaSQLText); err != nil {
 				outc, outcErr := s.failedBlockedOutcome(ctx, claim, "TARGET_BLOCKED", fmt.Errorf("authorized step SQL invalid: %w", err))
 				return nil, outc, outcErr
 			}
@@ -2108,7 +2065,7 @@ func (s *Service) scanAndReconcileBatchCheckpoints(
 				outc, outcErr := s.failedBlockedOutcome(ctx, claim, "TARGET_BLOCKED", fmt.Errorf("decode step plan: %w", err))
 				return nil, outc, outcErr
 			}
-			if err := validateAgreedBatchConfig(stepPlan.Snapshot.Batch); err != nil {
+			if err := executioncontract.ValidateBatchConfig(stepPlan.Snapshot.Batch); err != nil {
 				outc, outcErr := s.failedBlockedOutcome(ctx, claim, "TARGET_BLOCKED", fmt.Errorf("authorized step batch config invalid: %w", err))
 				return nil, outc, outcErr
 			}
@@ -2554,20 +2511,16 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 
 	plan, err := deps.Gate.Revalidate(ctx, claim.RevalidationRequest())
 	if err != nil {
-		var cErr executioncontract.ContractError
-		if errors.As(err, &cErr) && cErr.Code == "REVIEW_STALE" {
-			return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", err)
-		}
-		return nil, fmt.Errorf("workflow revalidation failed: %w", err)
+		return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 	}
 	if !reflect.DeepEqual(plan.Request, claim.RevalidationRequest()) {
 		return nil, executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan request mismatch"}
 	}
-	if err := validateAgreedBatchConfig(plan.Snapshot.Batch); err != nil {
+	if err := executioncontract.ValidateBatchConfig(plan.Snapshot.Batch); err != nil {
 		return s.failedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", err)
 	}
 	sqlText, err := selectSQL(plan, claim.Action, claim.Direction)
-	if err != nil || validateAgreedBatchSQL(claim.Direction, sqlText) != nil {
+	if err != nil || executioncontract.ValidateBatchSQL(claim.Direction, sqlText) != nil {
 		return s.failedOutcome(ctx, claim, "SQL_UNSUPPORTED", errors.New("plan SQL does not match agreed batch pattern"))
 	}
 	approvedSnapBytes, err := json.Marshal(plan.Snapshot)
@@ -2884,6 +2837,7 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 
 	// Execute remaining chunks sequentially
 	for batchIdx := nextBatchIndex; batchIdx < totalBatches; batchIdx++ {
+		ctx := telemetry.WithLogAttrs(ctx, slog.Int("batch_index", batchIdx))
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -2958,7 +2912,7 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 					}
 					return &ExecutionOutcome{Status: executioncontract.Partial, Error: err}, nil
 				}
-				return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", err)
+				return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 			}
 			if earlierCommitted {
 				if failErr := s.failPartialJob(ctx, claim, "GATE_DENIED", err.Error()); failErr != nil {
@@ -2995,7 +2949,7 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 			}
 			return nil, err
 		}
-		if err := validateAgreedBatchConfig(chunkPlan.Snapshot.Batch); err != nil ||
+		if err := executioncontract.ValidateBatchConfig(chunkPlan.Snapshot.Batch); err != nil ||
 			chunkPlan.Snapshot.Batch.BatchSize != approvedBatchConfig.BatchSize ||
 			chunkPlan.Snapshot.Batch.Schema != approvedBatchConfig.Schema ||
 			chunkPlan.Snapshot.Batch.Table != approvedBatchConfig.Table ||
@@ -3008,7 +2962,7 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 			return nil, err
 		}
 		chunkSQL, err := selectSQL(chunkPlan, claim.Action, claim.Direction)
-		if err != nil || chunkSQL != approvedSQLText || validateAgreedBatchSQL(claim.Direction, chunkSQL) != nil {
+		if err != nil || chunkSQL != approvedSQLText || executioncontract.ValidateBatchSQL(claim.Direction, chunkSQL) != nil {
 			err := executioncontract.ContractError{Code: "SQL_MISMATCH", Message: "workflow plan SQL changed"}
 			if earlierCommitted {
 				_ = s.failPartialJob(ctx, claim, "SQL_MISMATCH", err.Message)
@@ -3090,12 +3044,18 @@ func (s *Service) ExecuteBatchJob(ctx context.Context, claim *Claim, deps Execut
 
 		// Lease-fenced atomic persisted authorization and target block immediately before SQL
 		ordinal := batchIdx + 1
-		if err := s.authorizeBatchDispatch(ctx, claim, scopeExecID, chunkPlan, approvedSQLText, xid, version, ordinal, batchIdx, chunkIDs); err != nil {
+		if err := s.authorizeBatchDispatch(ctx, claim, deps.Gate, scopeExecID, chunkPlan, approvedSQLText, xid, version, ordinal, batchIdx, chunkIDs); err != nil {
 			clear(capability)
 			_ = session.Rollback()
 			var cErr executioncontract.ContractError
-			if errors.As(err, &cErr) && cErr.Code == "LEASE_MISMATCH" {
-				return nil, err
+			if errors.As(err, &cErr) && !cErr.Retryable && cErr.Code != "LEASE_MISMATCH" {
+				if earlierCommitted {
+					if failErr := s.failPartialJob(ctx, claim, cErr.Code, cErr.Message); failErr != nil {
+						return nil, errors.Join(err, failErr)
+					}
+					return &ExecutionOutcome{Status: executioncontract.Partial, Error: err}, nil
+				}
+				return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 			}
 			return nil, err
 		}
@@ -3407,7 +3367,7 @@ func (s *Service) ReconcileBatchJob(ctx context.Context, claim *Claim, deps Exec
 	if draft.Batch == nil {
 		return s.failedBlockedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", errors.New("draft snapshot missing batch configuration"))
 	}
-	if err := validateAgreedBatchConfig(draft.Batch); err != nil {
+	if err := executioncontract.ValidateBatchConfig(draft.Batch); err != nil {
 		return s.failedBlockedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", err)
 	}
 	batchSize := draft.Batch.BatchSize
@@ -3919,20 +3879,16 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 
 	plan, err := deps.Gate.Revalidate(ctx, claim.RevalidationRequest())
 	if err != nil {
-		var cErr executioncontract.ContractError
-		if errors.As(err, &cErr) && cErr.Code == "REVIEW_STALE" {
-			return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", err)
-		}
-		return nil, fmt.Errorf("workflow revalidation failed: %w", err)
+		return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 	}
 	if !reflect.DeepEqual(plan.Request, claim.RevalidationRequest()) {
 		return nil, executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan request mismatch"}
 	}
-	if err := validateAgreedBatchConfig(plan.Snapshot.Batch); err != nil {
+	if err := executioncontract.ValidateBatchConfig(plan.Snapshot.Batch); err != nil {
 		return s.failedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", err)
 	}
 	sqlText, err := selectSQL(plan, claim.Action, claim.Direction)
-	if err != nil || validateAgreedBatchSQL(claim.Direction, sqlText) != nil {
+	if err != nil || executioncontract.ValidateBatchSQL(claim.Direction, sqlText) != nil {
 		return s.failedOutcome(ctx, claim, "SQL_UNSUPPORTED", errors.New("plan SQL does not match agreed batch pattern"))
 	}
 	approvedPlanVersion := plan.Version
@@ -4316,6 +4272,7 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 
 	startBatchIdx := N_up - 1 - batchesRevertedCount
 	for batchIdx := startBatchIdx; batchIdx >= 0; batchIdx-- {
+		ctx := telemetry.WithLogAttrs(ctx, slog.Int("batch_index", batchIdx))
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -4384,7 +4341,7 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 					_ = s.failPartiallyRevertedJob(ctx, claim, "REVIEW_STALE", err.Error())
 					return &ExecutionOutcome{Status: executioncontract.PartiallyReverted, Error: err}, nil
 				}
-				return nil, fmt.Errorf("REVIEW_STALE requires WorkflowGate.ReturnToReviewTx and atomic job finalization: %w", err)
+				return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 			}
 			if earlierReverted {
 				_ = s.failPartiallyRevertedJob(ctx, claim, "GATE_DENIED", err.Error())
@@ -4395,7 +4352,7 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 
 		if !reflect.DeepEqual(chunkPlan.Request, claim.RevalidationRequest()) ||
 			chunkPlan.Version != approvedPlanVersion ||
-			validateAgreedBatchConfig(chunkPlan.Snapshot.Batch) != nil {
+			executioncontract.ValidateBatchConfig(chunkPlan.Snapshot.Batch) != nil {
 			err := executioncontract.ContractError{Code: "PLAN_MISMATCH", Message: "workflow plan changed"}
 			if earlierReverted {
 				_ = s.failPartiallyRevertedJob(ctx, claim, "PLAN_MISMATCH", err.Message)
@@ -4404,7 +4361,7 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 			return nil, err
 		}
 		chunkSQL, err := selectSQL(chunkPlan, claim.Action, claim.Direction)
-		if err != nil || chunkSQL != approvedSQLText || validateAgreedBatchSQL(claim.Direction, chunkSQL) != nil {
+		if err != nil || chunkSQL != approvedSQLText || executioncontract.ValidateBatchSQL(claim.Direction, chunkSQL) != nil {
 			err := executioncontract.ContractError{Code: "SQL_MISMATCH", Message: "workflow plan SQL changed"}
 			if earlierReverted {
 				_ = s.failPartiallyRevertedJob(ctx, claim, "SQL_MISMATCH", err.Message)
@@ -4488,12 +4445,18 @@ func (s *Service) executeBatchJobDown(ctx context.Context, claim *Claim, deps Ex
 		}
 
 		ordinal := batchesRevertedCount + 1
-		if err := s.authorizeBatchDispatch(ctx, claim, scopeExecID, chunkPlan, approvedSQLText, xid, version, ordinal, batchIdx, chunkIDs); err != nil {
+		if err := s.authorizeBatchDispatch(ctx, claim, deps.Gate, scopeExecID, chunkPlan, approvedSQLText, xid, version, ordinal, batchIdx, chunkIDs); err != nil {
 			clear(capability)
 			_ = session.Rollback()
 			var cErr executioncontract.ContractError
-			if errors.As(err, &cErr) && cErr.Code == "LEASE_MISMATCH" {
-				return nil, err
+			if errors.As(err, &cErr) && !cErr.Retryable && cErr.Code != "LEASE_MISMATCH" {
+				if earlierReverted {
+					if failErr := s.failPartiallyRevertedJob(ctx, claim, cErr.Code, cErr.Message); failErr != nil {
+						return nil, errors.Join(err, failErr)
+					}
+					return &ExecutionOutcome{Status: executioncontract.PartiallyReverted, Error: err}, nil
+				}
+				return s.rejectPreDispatch(ctx, claim, deps.Gate, err)
 			}
 			return nil, err
 		}
@@ -4723,7 +4686,7 @@ func (s *Service) reconcileBatchJobDown(ctx context.Context, claim *Claim, deps 
 	if draft.Batch == nil {
 		return s.failedBlockedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", errors.New("draft snapshot missing batch configuration"))
 	}
-	if err := validateAgreedBatchConfig(draft.Batch); err != nil {
+	if err := executioncontract.ValidateBatchConfig(draft.Batch); err != nil {
 		return s.failedBlockedOutcome(ctx, claim, "INVALID_BATCH_CONFIG", err)
 	}
 	batchSize := draft.Batch.BatchSize

@@ -10,6 +10,7 @@ SET irreversible_reason = 'Legacy M1 migration: no rollback SQL was recorded.'
 WHERE applied_execution_id IS NOT NULL
   AND sql_down IS NULL
   AND irreversible_reason IS NULL;
+ALTER TABLE app.migration_drafts ENABLE TRIGGER migration_draft_update_guard;
 
 ALTER TABLE app.migration_drafts
     ADD CONSTRAINT migration_drafts_mode_check
@@ -42,7 +43,6 @@ BEGIN
         OR NEW.mode IS DISTINCT FROM OLD.mode
         OR NEW.batch IS DISTINCT FROM OLD.batch
         OR NEW.revision IS DISTINCT FROM OLD.revision
-        OR NEW.revision_locked_at IS DISTINCT FROM OLD.revision_locked_at
     ) THEN
         RAISE EXCEPTION 'executed migration revision is immutable'
             USING ERRCODE = '23514';

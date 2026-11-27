@@ -10,8 +10,8 @@ import type {
   Draft,
   DraftCreateInput,
   DraftPatchInput,
-  ExecuteInput,
   Execution,
+  HistoryEntry,
   Group,
   GroupGrants,
   GroupGrantsInput,
@@ -19,6 +19,7 @@ import type {
   GroupMembers,
   GroupMembersInput,
   ID,
+  LeaderInput,
   List,
   LoginInput,
   LogoutResult,
@@ -61,6 +62,8 @@ export const updateGroup = (groupId: ID, input: GroupInput) =>
   request<Group>('PATCH', `/api/admin/groups/${e(groupId)}`, { body: input })
 export const deleteGroup = (groupId: ID) =>
   request<DeletedResult>('DELETE', `/api/admin/groups/${e(groupId)}`)
+export const setGroupLeader = (groupId: ID, input: LeaderInput) =>
+  request<Group>('PUT', `/api/admin/groups/${e(groupId)}/leader`, { body: input })
 export const getGroupMembers = (groupId: ID) =>
   request<GroupMembers>('GET', `/api/admin/groups/${e(groupId)}/members`)
 export const putGroupMembers = (groupId: ID, input: GroupMembersInput) =>
@@ -106,9 +109,4 @@ export const updateDraft = (databaseId: ID, draftId: ID, input: DraftPatchInput)
 export const listMigrations = (databaseId: ID) =>
   request<List<Execution>>('GET', `${db(databaseId)}/migrations`)
 export const getMigration = (databaseId: ID, executionId: ID) =>
-  request<Execution>('GET', `${db(databaseId)}/migrations/${e(executionId)}`)
-export const executeDraft = (databaseId: ID, draftId: ID, input: ExecuteInput) =>
-  request<Execution>('POST', `${db(databaseId)}/drafts/${e(draftId)}/execute`, {
-    body: input,
-    timeoutMs: 65_000,
-  })
+  request<Execution | HistoryEntry>('GET', `${db(databaseId)}/migrations/${e(executionId)}`)

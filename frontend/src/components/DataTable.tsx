@@ -16,7 +16,7 @@ type Props<T> = {
 
 export function DataTable<T>({ columns, rows, rowKey, caption }: Props<T>) {
   return (
-    <div className="table-scroll">
+    <div className="table-responsive table-scroll">
       <table className="table table-vcenter table-bordered card-table mb-0">
         {caption && <caption className="visually-hidden">{caption}</caption>}
         <thead>

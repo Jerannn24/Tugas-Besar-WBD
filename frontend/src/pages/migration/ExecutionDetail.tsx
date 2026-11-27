@@ -1,7 +1,14 @@
-import type { Execution } from '../../api/types'
+import type { ReactNode } from 'react'
+import { Link } from 'react-router'
+import { isHistoryEntry } from '../../api/history'
+import type { Execution, HistoryEntry, ID } from '../../api/types'
 import { Alert } from '../../components/Alert'
+import { ShortId } from '../../components/ShortId'
+import { ActionBadge, AttemptBadge } from '../../components/StateBadge'
 import { StatusBadge } from '../../components/StatusBadge'
 import { formatDateTime } from '../../lib/format'
+import { paths } from '../../lib/paths'
+import { BatchCommits } from './BatchCommits'
 
 const ERROR_LABELS: Record<string, string> = {
   SQL_FAILED: 'SQL gagal dijalankan; perubahan di-rollback',
@@ -15,9 +22,19 @@ const ERROR_LABELS: Record<string, string> = {
   OUTCOME_UNCONFIRMED: 'Hasil akhir belum terkonfirmasi',
 }
 
-type Props = { execution: Execution; showSql?: boolean }
+function ExecutionLink({ databaseId, id }: { databaseId: ID; id: ID | null }): ReactNode {
+  if (id === null) return '-'
+  return (
+    <Link to={paths.execution(databaseId, id)}>
+      <ShortId id={id} />
+    </Link>
+  )
+}
+
+type Props = { execution: Execution | HistoryEntry; showSql?: boolean }
 
 export function ExecutionDetail({ execution: x, showSql = true }: Props) {
+  const m2 = isHistoryEntry(x) ? x : null
   return (
     <>
       <dl className="detail-list">
@@ -26,9 +43,27 @@ export function ExecutionDetail({ execution: x, showSql = true }: Props) {
         <dt>Title</dt>
         <dd>{x.title}</dd>
         <dt>Status</dt>
-        <dd>
-          <StatusBadge status={x.status} />
-        </dd>
+        <dd>{isHistoryEntry(x) ? <AttemptBadge status={x.status} /> : <StatusBadge status={x.status} />}</dd>
+        {m2 && (
+          <>
+            <dt>Aksi</dt>
+            <dd>
+              <ActionBadge action={m2.action} direction={m2.direction} />
+            </dd>
+            <dt>Commit</dt>
+            <dd>{formatDateTime(m2.committed_at)}</dd>
+            <dt>Lengkap</dt>
+            <dd>{m2.is_complete ? 'Ya' : 'Belum lengkap'}</dd>
+            <dt>Sumber execution</dt>
+            <dd>
+              <ExecutionLink databaseId={m2.database_id} id={m2.source_execution_id} />
+            </dd>
+            <dt>Membatalkan execution</dt>
+            <dd>
+              <ExecutionLink databaseId={m2.database_id} id={m2.reverts_execution_id} />
+            </dd>
+          </>
+        )}
         <dt>Dijalankan oleh</dt>
         <dd>{x.executed_by.username}</dd>
         <dt>Mulai</dt>
@@ -67,6 +102,12 @@ export function ExecutionDetail({ execution: x, showSql = true }: Props) {
           <h3 className="h4">SQL yang dijalankan (snapshot)</h3>
           <pre className="sql-block">{x.sql}</pre>
         </>
+      )}
+
+      {m2 && m2.batch_commits.length > 0 && (
+        <div className="mt-3">
+          <BatchCommits databaseId={m2.database_id} batches={m2.batch_commits} />
+        </div>
       )}
     </>
   )

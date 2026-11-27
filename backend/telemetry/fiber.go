@@ -32,6 +32,11 @@ func Middleware(logger *Logger) fiber.Handler {
 			c.Set("tracestate", trace.TraceState)
 		}
 		requestErr := c.Next()
+		if requestErr != nil {
+			if handlerErr := c.App().ErrorHandler(c, requestErr); handlerErr != nil {
+				_ = c.SendStatus(fiber.StatusInternalServerError)
+			}
+		}
 		attrs := []slog.Attr{
 			slog.String("method", c.Method()),
 			slog.String("path", c.Path()),
@@ -43,7 +48,7 @@ func Middleware(logger *Logger) fiber.Handler {
 		if requestErr != nil {
 			attrs = append(attrs, slog.String("error", MaskSecrets(MaskSQL(requestErr.Error()))))
 		}
-		failed := requestErr != nil || c.Response().StatusCode() >= 500
+		failed := c.Response().StatusCode() >= 500
 		if logger != nil {
 			if failed {
 				logger.Error(ctx, "http.request.completed", attrs...)
@@ -56,7 +61,7 @@ func Middleware(logger *Logger) fiber.Handler {
 			routePath = route.Path
 		}
 		ExportSpan(context.Background(), Span{TraceID: trace.TraceID, SpanID: trace.SpanID, ParentSpanID: trace.ParentSpanID, Name: "http.request", Kind: 2, StartedAt: started, EndedAt: time.Now(), Failed: failed, Attributes: map[string]string{"http.method": c.Method(), "http.route": routePath, "http.status_code": strconv.Itoa(c.Response().StatusCode())}})
-		return requestErr
+		return nil
 	}
 }
 

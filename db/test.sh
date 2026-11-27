@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export BATCH_SCOPE_ISOLATED_TEST_TARGET="${BATCH_SCOPE_ISOLATED_TEST_TARGET:-1}"
 docker compose --profile test up -d --wait postgres-test
 bash db/apply.sh test
 bash db/target-profile/apply.sh test a

@@ -1,4 +1,3 @@
-
 package executioncontract
 
 import (
@@ -38,11 +37,11 @@ const (
 )
 
 const (
-	Apply      Action    = "apply"
-	Rollback   Action    = "rollback"
-	Forward    Action    = "forward"
-	Resume     Action    = "resume"
-	Compensate Action    = "compensate"
+	Apply      Action = "apply"
+	Rollback   Action = "rollback"
+	Forward    Action = "forward"
+	Resume     Action = "resume"
+	Compensate Action = "compensate"
 
 	Up   Direction = "up"
 	Down Direction = "down"
@@ -110,6 +109,46 @@ func ValidateDraft(d Draft) error {
 		return errors.New("invalid batch")
 	}
 
+	return nil
+}
+
+const (
+	batchUpPattern   = "UPDATE MANAGED.BATCH_ITEMS SET PROCESSED = TRUE WHERE ID = ANY($1::BIGINT[])"
+	batchDownPattern = "UPDATE MANAGED.BATCH_ITEMS SET PROCESSED = FALSE WHERE ID = ANY($1::BIGINT[])"
+)
+
+func ValidateBatchSQL(dir Direction, sqlText string) error {
+	normalized := strings.ToUpper(strings.Join(strings.Fields(strings.TrimRight(strings.TrimSpace(sqlText), ";")), " "))
+	want := ""
+	switch dir {
+	case Up:
+		want = batchUpPattern
+	case Down:
+		want = batchDownPattern
+	default:
+		return ContractError{Code: "INVALID_DIRECTION", Message: "unsupported direction for batch execution"}
+	}
+	if normalized != want {
+		return ContractError{Code: "SQL_UNSUPPORTED", Message: "batch SQL does not match agreed immutable UPDATE pattern"}
+	}
+	return nil
+}
+
+func ReversibleSnapshotSQL(alias string) string {
+	return "length(trim(COALESCE(" + alias + ".snapshot->>'sql_down',''))) > 0"
+}
+
+func ValidateBatchConfig(cfg *BatchConfig) error {
+	if cfg == nil {
+		return ContractError{Code: "INVALID_BATCH_CONFIG", Message: "batch configuration is required"}
+	}
+	if cfg.Schema != "managed" || cfg.Table != "batch_items" || cfg.CursorColumn != "id" ||
+		cfg.BatchSize < 1 || cfg.BatchSize > 10000 {
+		return ContractError{
+			Code:    "INVALID_BATCH_CONFIG",
+			Message: "batch configuration must target managed.batch_items with cursor id and batch size 1..10000",
+		}
+	}
 	return nil
 }
 
@@ -376,6 +415,7 @@ type ContractError struct {
 	Code        string            `json:"code"`
 	Message     string            `json:"message"`
 	FieldErrors map[string]string `json:"field_errors"`
+	Issues      []Issue           `json:"issues,omitempty"`
 	Retryable   bool              `json:"retryable"`
 }
 

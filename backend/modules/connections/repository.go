@@ -425,7 +425,21 @@ func (r *Repository) Update(ctx context.Context, id uuid.UUID, input Input, lc l
 		(locked.Target != nil && *locked.Target != *current.Target) {
 		return Summary{}, ErrConflict
 	}
-	if err := guardRunning(ctx, tx, id, locked.Target); err != nil {
+	if !identityChange {
+		item, err := scanSummary(tx.QueryRow(ctx, `UPDATE app.database_connections SET name=$2, updated_at=clock_timestamp()
+			WHERE id=$1 RETURNING `+summaryColumns, id, input.Name))
+		if isUnique(err) {
+			return Summary{}, ErrConflict
+		}
+		if err != nil {
+			return Summary{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Summary{}, err
+		}
+		return item, nil
+	}
+	if err := guardRunning(ctx, tx, locked.Target); err != nil {
 		return Summary{}, err
 	}
 	committed := false
@@ -436,11 +450,15 @@ func (r *Repository) Update(ctx context.Context, id uuid.UUID, input Input, lc l
 		}
 		defer func() { resume(committed) }()
 	}
-	if rebind && locked.Target != nil && marker != nil {
-		// A different physical target would restart version numbering while
-		// the database id already carries history.
+	if rebind && marker != nil {
+		// Preserve the physical target of both legacy and queued execution history.
 		var history bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM app.migration_executions WHERE database_id=$1)`, id).Scan(&history); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM app.migration_executions WHERE database_id=$1 AND execution_target_id<>$2
+		) OR EXISTS (
+			SELECT 1 FROM app.migration_history_entries h JOIN app.jobs j ON j.id=h.job_id
+			WHERE h.database_id=$1 AND j.target_id<>$2
+		)`, id, *marker).Scan(&history); err != nil {
 			return Summary{}, err
 		}
 		if history {
@@ -474,8 +492,8 @@ func (r *Repository) Update(ctx context.Context, id uuid.UUID, input Input, lc l
 }
 
 // guardRunning locks the bound target state (lock order: connection row,
-// then migration_target_state) and refuses while an execution is unresolved.
-func guardRunning(ctx context.Context, tx pgx.Tx, id uuid.UUID, target *uuid.UUID) error {
+// then migration_target_state) and refuses while execution work is pending or unresolved.
+func guardRunning(ctx context.Context, tx pgx.Tx, target *uuid.UUID) error {
 	if target == nil {
 		return nil
 	}
@@ -484,7 +502,12 @@ func guardRunning(ctx context.Context, tx pgx.Tx, id uuid.UUID, target *uuid.UUI
 		return err
 	}
 	var busy bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM app.migration_executions WHERE execution_target_id=$1 AND status IN ('running','unknown'))`, *target).Scan(&busy); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM app.migration_executions WHERE execution_target_id=$1 AND status IN ('running','unknown')
+	) OR EXISTS (
+		SELECT 1 FROM app.jobs WHERE target_id=$1
+			AND (status IN ('queued','running','retry_wait') OR blocks_database)
+	)`, *target).Scan(&busy); err != nil {
 		return err
 	}
 	if busy {
@@ -510,7 +533,7 @@ func (r *Repository) Delete(ctx context.Context, id uuid.UUID, lc lifecycle) err
 	if err != nil {
 		return err
 	}
-	if err := guardRunning(ctx, tx, id, target); err != nil {
+	if err := guardRunning(ctx, tx, target); err != nil {
 		return err
 	}
 	committed := false

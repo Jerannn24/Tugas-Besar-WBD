@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
 type fingerprintMember struct {
 	UserID string `json:"user_id"`
 	Active bool   `json:"active"`
@@ -53,6 +55,36 @@ func (r *Repository) LoadDraft(ctx context.Context, databaseID, migrationID uuid
 	return snapshot, nil
 }
 
+func (r *Repository) sourceSnapshot(ctx context.Context, databaseID, migrationID uuid.UUID, revision int, action string, source *uuid.UUID, mode string) (Snapshot, error) {
+	var valid, reversible bool
+	var raw []byte
+	err := r.db.QueryRow(ctx, `SELECT COALESCE(app.workflow_source_valid($1, d.execution_target_id, $2, $3, $4, $5, $6), false),
+		src.snapshot, COALESCE(src.reversible, false)
+		FROM app.database_connections d
+		LEFT JOIN LATERAL (SELECT j.snapshot, `+executioncontract.ReversibleSnapshotSQL("j")+` AS reversible
+		 FROM app.jobs j WHERE j.execution_id=$5 AND j.database_id=$1
+		 AND j.target_id=d.execution_target_id AND j.migration_id=$2 AND j.revision=$3 ORDER BY j.created_at,j.id LIMIT 1) src ON true
+		WHERE d.id=$1 AND d.deleted_at IS NULL`,
+		databaseID, migrationID, revision, action, source, mode).Scan(&valid, &raw, &reversible)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if !valid {
+		return Snapshot{}, ErrInvalidProposal
+	}
+	if action == string(executioncontract.Compensate) && !reversible {
+		return Snapshot{}, executioncontract.ContractError{
+			Code:    "MIGRATION_IRREVERSIBLE",
+			Message: "Migration tidak dapat dikompensasi karena tidak memiliki SQL down",
+		}
+	}
+	var snapshot Snapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return Snapshot{}, ErrInvalidProposal
+	}
+	return snapshot, nil
+}
+
 func (r *Repository) Fingerprint(ctx context.Context) ([]uuid.UUID, [32]byte, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT
@@ -79,11 +111,7 @@ func (r *Repository) Fingerprint(ctx context.Context) ([]uuid.UUID, [32]byte, er
 	return scanFingerprintRows(rows)
 }
 
-func (r *Repository) FingerprintForDatabase(
-	ctx context.Context,
-	databaseID uuid.UUID,
-) ([]uuid.UUID, [32]byte, error) {
-	rows, err := r.db.Query(ctx, `
+const approvalRosterQuery = `
 		SELECT
 			group_row.id,
 			group_row.leader_user_id,
@@ -106,7 +134,49 @@ func (r *Repository) FingerprintForDatabase(
 			group_row.id,
 			grant_row.access,
 			membership.user_id
-	`, databaseID)
+	`
+
+const currentApprovalCountsQuery = `
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (
+				WHERE latest_approval.status = 'approved'
+					AND ($3::timestamptz IS NULL OR latest_approval.approved_at <= $3)
+					AND latest_approval.leader_user_id = group_row.leader_user_id
+					AND group_row.leader_user_id IS NOT NULL
+					AND leader_user.is_active
+					AND EXISTS (
+						SELECT 1
+						FROM app.group_memberships membership
+						WHERE membership.group_id = group_row.id
+							AND membership.user_id = group_row.leader_user_id
+					)
+			)
+		FROM app.group_database_grants grant_row
+		JOIN app.groups group_row
+			ON group_row.id = grant_row.group_id
+		LEFT JOIN app.users leader_user
+			ON leader_user.id = group_row.leader_user_id
+		LEFT JOIN LATERAL (
+			SELECT
+				approval.status,
+				approval.leader_user_id,
+				approval.approved_at
+			FROM app.migration_proposal_approvals approval
+			WHERE approval.proposal_id = $1
+				AND approval.group_id = group_row.id
+			ORDER BY approval.approval_round DESC
+			LIMIT 1
+		) latest_approval ON TRUE
+		WHERE grant_row.database_id = $2
+			AND grant_row.access IN ('view', 'edit')
+	`
+
+func (r *Repository) FingerprintForDatabase(
+	ctx context.Context,
+	databaseID uuid.UUID,
+) ([]uuid.UUID, [32]byte, error) {
+	rows, err := r.db.Query(ctx, approvalRosterQuery, databaseID)
 
 	if err != nil {
 		return nil, [32]byte{}, err
@@ -116,9 +186,12 @@ func (r *Repository) FingerprintForDatabase(
 	return scanFingerprintRows(rows)
 }
 
-
 func scanFingerprintRows(
-	rows pgx.Rows,
+	rows interface {
+		Next() bool
+		Scan(...any) error
+		Err() error
+	},
 ) ([]uuid.UUID, [32]byte, error) {
 	var (
 		all     []fingerprintRoster
@@ -205,7 +278,11 @@ func (r *Repository) CreateProposal(
 ) (uuid.UUID, error) {
 	id := uuid.New()
 
-	_, err := r.db.Exec(ctx, `
+	tag, err := r.db.Exec(ctx, `
+		WITH draft AS (
+			SELECT id FROM app.migration_drafts
+			WHERE id=$3 AND database_id=$2 AND revision=$4 FOR UPDATE
+		)
 		INSERT INTO app.migration_proposals (
 			id,
 			database_id,
@@ -220,10 +297,8 @@ func (r *Repository) CreateProposal(
 			validation,
 			created_by
 		)
-		VALUES (
-			$1, $2, $3, $4, $5, $6,
-			'draft', $7, $8, $9, NULL, $10
-		)
+		SELECT $1, $2, $3, $4, $5, $6,
+			'draft', $7, $8, $9, NULL, $10 FROM draft
 	`,
 		id,
 		databaseID,
@@ -239,6 +314,9 @@ func (r *Repository) CreateProposal(
 	if err != nil {
 		return uuid.Nil, err
 	}
+	if tag.RowsAffected() != 1 {
+		return uuid.Nil, ErrProposalStale
+	}
 
 	return id, nil
 }
@@ -246,6 +324,7 @@ func (r *Repository) CreateProposal(
 func (r *Repository) Submit(
 	ctx context.Context,
 	id, actorID uuid.UUID,
+	requestedRevision int,
 ) (Proposal, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
@@ -284,6 +363,9 @@ func (r *Repository) Submit(
 	}
 	if err != nil {
 		return Proposal{}, err
+	}
+	if requestedRevision > 0 && requestedRevision != revision {
+		return Proposal{}, ErrProposalStale
 	}
 	if status != "draft" {
 		return Proposal{}, ErrConflict
@@ -561,7 +643,7 @@ func (r *Repository) Approve(
 		return Proposal{}, err
 	}
 	if !anchorValid {
-		return Proposal{}, ErrForbidden
+		return Proposal{}, ErrLeaderRequired
 	}
 
 	rows, err := tx.Query(ctx, `
@@ -605,7 +687,7 @@ func (r *Repository) Approve(
 	rows.Close()
 
 	if len(ledGroups) == 0 {
-		return Proposal{}, ErrForbidden
+		return Proposal{}, ErrLeaderRequired
 	}
 
 	anchorFound := false
@@ -618,7 +700,7 @@ func (r *Repository) Approve(
 	}
 
 	if !anchorFound {
-		return Proposal{}, ErrForbidden
+		return Proposal{}, ErrLeaderRequired
 	}
 
 	for _, currentGroupID := range ledGroups {
@@ -652,39 +734,7 @@ func (r *Repository) Approve(
 	// Hitung approval terbaru untuk setiap grup secara independen.
 	var required, approved int
 
-	err = tx.QueryRow(ctx, `
-		SELECT
-			COUNT(*),
-			COUNT(*) FILTER (
-				WHERE latest_approval.status = 'approved'
-					AND latest_approval.leader_user_id = group_row.leader_user_id
-					AND group_row.leader_user_id IS NOT NULL
-					AND leader_user.is_active
-					AND EXISTS (
-						SELECT 1
-						FROM app.group_memberships membership
-						WHERE membership.group_id = group_row.id
-							AND membership.user_id = group_row.leader_user_id
-					)
-			)
-		FROM app.group_database_grants grant_row
-		JOIN app.groups group_row
-			ON group_row.id = grant_row.group_id
-		LEFT JOIN app.users leader_user
-			ON leader_user.id = group_row.leader_user_id
-		LEFT JOIN LATERAL (
-			SELECT
-				approval.status,
-				approval.leader_user_id
-			FROM app.migration_proposal_approvals approval
-			WHERE approval.proposal_id = $1
-				AND approval.group_id = group_row.id
-			ORDER BY approval.approval_round DESC
-			LIMIT 1
-		) latest_approval ON TRUE
-		WHERE grant_row.database_id = $2
-			AND grant_row.access IN ('view', 'edit')
-	`, proposalID, databaseID).Scan(&required, &approved)
+	err = tx.QueryRow(ctx, currentApprovalCountsQuery, proposalID, databaseID, nil).Scan(&required, &approved)
 
 	if err != nil {
 		return Proposal{}, err
@@ -765,35 +815,86 @@ func (r *Repository) Get(ctx context.Context, id uuid.UUID) (Proposal, error) {
 	return proposal, nil
 }
 
+func (r *Repository) ListIDs(ctx context.Context, databaseID uuid.UUID, cursor *uuid.UUID, limit int) ([]uuid.UUID, error) {
+	if cursor != nil {
+		var exists bool
+		if err := r.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM app.migration_proposals WHERE database_id=$1 AND id=$2)`, databaseID, *cursor).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, ErrInvalidProposal
+		}
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT proposal.id
+		FROM app.migration_proposals proposal
+		WHERE proposal.database_id = $1
+		  AND (
+		    $2::uuid IS NULL
+		    OR (proposal.created_at, proposal.id) < (
+		      SELECT cursor_row.created_at, cursor_row.id
+		      FROM app.migration_proposals cursor_row
+		      WHERE cursor_row.database_id = $1 AND cursor_row.id = $2
+		    )
+		  )
+		ORDER BY proposal.created_at DESC, proposal.id DESC
+		LIMIT $3
+	`, databaseID, cursor, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (r *Repository) mayEnqueue(ctx context.Context, actor, proposalID uuid.UUID) error {
+	return NewPolicy(r.db).MayEnqueue(ctx, actor, proposalID)
+}
+
+func (r *Repository) MayReview(ctx context.Context, actor, databaseID, proposalID uuid.UUID) (bool, error) {
+	var allowed bool
+	err := r.db.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM app.migration_proposal_approvals a
+		JOIN app.migration_proposals p ON p.id=a.proposal_id AND p.database_id=$2
+		JOIN app.migration_drafts draft ON draft.id=p.migration_id AND draft.database_id=$2 AND draft.revision=p.revision
+		JOIN app.groups g ON g.id=a.group_id AND g.leader_user_id=$1
+		JOIN app.users u ON u.id=$1 AND u.is_active
+		JOIN app.group_memberships m ON m.group_id=g.id AND m.user_id=$1
+		JOIN app.group_database_grants d ON d.group_id=g.id AND d.database_id=$2 AND d.access IN ('view','edit')
+		WHERE a.proposal_id=$3 AND a.status='pending' AND a.leader_user_id=$1
+		  AND a.approval_round=(SELECT MAX(x.approval_round) FROM app.migration_proposal_approvals x WHERE x.proposal_id=a.proposal_id AND x.group_id=a.group_id)
+	)`, actor, databaseID, proposalID).Scan(&allowed)
+	if err != nil || !allowed {
+		return false, err
+	}
+	proposal, err := r.Get(ctx, proposalID)
+	if err != nil {
+		return false, err
+	}
+	_, fingerprint, err := r.FingerprintForDatabase(ctx, databaseID)
+	if err != nil {
+		return false, err
+	}
+	if proposal.ApprovalFingerprint != hexEncode(fingerprint[:]) {
+		return false, nil
+	}
+	return allowed, err
+}
+
 func fingerprintTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	databaseID uuid.UUID,
 ) ([]uuid.UUID, [32]byte, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT
-			group_row.id,
-			group_row.leader_user_id,
-			COALESCE(leader_user.is_active, FALSE),
-			grant_row.access,
-			membership.user_id,
-			COALESCE(member_user.is_active, FALSE)
-		FROM app.groups group_row
-		JOIN app.group_database_grants grant_row
-			ON grant_row.group_id = group_row.id
-		LEFT JOIN app.users leader_user
-			ON leader_user.id = group_row.leader_user_id
-		LEFT JOIN app.group_memberships membership
-			ON membership.group_id = group_row.id
-		LEFT JOIN app.users member_user
-			ON member_user.id = membership.user_id
-		WHERE grant_row.database_id = $1
-			AND grant_row.access IN ('view', 'edit')
-		ORDER BY
-			group_row.id,
-			grant_row.access,
-			membership.user_id
-	`, databaseID)
+	rows, err := tx.Query(ctx, approvalRosterQuery, databaseID)
 
 	if err != nil {
 		return nil, [32]byte{}, err

@@ -1,6 +1,8 @@
 package workflow
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -45,5 +47,15 @@ func TestApprovalSummaryComplete(t *testing.T) {
 	}
 	if (ApprovalSummary{Required: 2, Approved: 1}).Complete() {
 		t.Fatal("partial approvals must remain incomplete")
+	}
+}
+
+func TestCreateRollbackRequiresSource(t *testing.T) {
+	s := &Service{}
+	_, err := s.Create(context.Background(), uuid.New(), CreateInput{
+		DatabaseID: uuid.NewString(), MigrationID: uuid.NewString(), Action: "rollback",
+	})
+	if !errors.Is(err, ErrInvalidProposal) {
+		t.Fatalf("rollback without source: got %v, want ErrInvalidProposal", err)
 	}
 }

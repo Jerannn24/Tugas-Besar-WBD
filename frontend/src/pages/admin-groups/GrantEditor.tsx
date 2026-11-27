@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router'
 import type { ApiFailure } from '../../api/client'
 import { getGroupGrants, putGroupGrants } from '../../api/endpoints'
 import type { ConnectionSummary, Group, GroupGrants, ID } from '../../api/types'
@@ -9,6 +10,7 @@ import { Loading } from '../../components/Loading'
 import { MutationAlert } from '../../components/MutationAlert'
 import { Panel } from '../../components/Panel'
 import { describeFailure, type MutationFailure } from '../../lib/mutation'
+import { paths } from '../../lib/paths'
 
 type Access = GroupGrants['grants'][number]['access']
 type Choice = Access | 'none'
@@ -116,7 +118,7 @@ export function GrantEditor({ group, connections, onDirtyChange }: Props) {
           </p>
           {rows.length === 0 ? (
             <p className="text-secondary">
-              Belum ada connection. Tambahkan di <a href="/admin/connections/">Admin: Connections</a>.
+              Belum ada connection. Tambahkan di <Link to={paths.adminConnections}>Admin: Connections</Link>.
             </p>
           ) : (
             <div className="list-group mb-3">
