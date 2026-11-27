@@ -72,6 +72,29 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 			t.Errorf("retire test connection: %v", err)
 		}
 	})
+	cleanup, err := pgx.ConnectConfig(ctx, workflowTargetConfig(t, "MIGRATION_TEST_TARGET_CLEANUP_URL"))
+	if err != nil {
+		t.Fatal("connect to the test target cleanup role")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		defer func() { _ = cleanup.Close(ctx) }()
+		scoped := "execution_id IN (SELECT execution_id FROM wbd_auth.batch_scopes WHERE database_id=$1)"
+		for _, query := range []string{
+			"DELETE FROM wbd_auth.batch_row_versions WHERE " + scoped,
+			"DELETE FROM wbd_auth.batch_checkpoints WHERE " + scoped,
+			"DELETE FROM wbd_auth.batch_tickets WHERE " + scoped,
+			"DELETE FROM wbd_auth.batch_scope_items WHERE " + scoped,
+			"DELETE FROM wbd_auth.batch_scopes WHERE database_id=$1",
+			"DELETE FROM wbd_auth.execution_receipts WHERE database_id=$1",
+			"DELETE FROM wbd_auth.execution_tickets WHERE database_id=$1",
+		} {
+			if _, err := cleanup.Exec(ctx, query, connection.ID); err != nil {
+				t.Errorf("cleanup target evidence: %v", err)
+			}
+		}
+	})
 
 	password := "Smoke1!" + uuid.NewString()
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
@@ -176,6 +199,9 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 	if proposal.Status != string(executioncontract.PendingReview) {
 		t.Fatalf("submitted proposal status=%q, want pending_review", proposal.Status)
 	}
+	if code := edit.request(t, post, proposalPath+"/jobs", workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: proposal.Revision}, http.StatusConflict, nil); code != "APPROVAL_REQUIRED" {
+		t.Fatalf("enqueue of pending proposal error=%q, want APPROVAL_REQUIRED", code)
+	}
 	var reviewView workflow.Proposal
 	review.request(t, get, proposalPath, nil, http.StatusOK, &reviewView)
 	if !strings.Contains(strings.Join(reviewView.AllowedActions, ","), "approve") {
@@ -211,8 +237,8 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 	if code := edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: input.RequestID, Revision: changedRevision}, http.StatusConflict, nil); code != "REQUEST_CONFLICT" {
 		t.Fatalf("reused request with changed revision error=%q, want REQUEST_CONFLICT", code)
 	}
-	if code := edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: changedRevision}, http.StatusConflict, nil); code != "PROPOSAL_STALE" {
-		t.Fatalf("new request with stale revision error=%q, want PROPOSAL_STALE", code)
+	if code := edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: changedRevision}, http.StatusConflict, nil); code != "VERSION_CONFLICT" {
+		t.Fatalf("new request with stale revision error=%q, want VERSION_CONFLICT", code)
 	}
 	edit.request(t, post, queuePath, workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: proposal.Revision}, http.StatusConflict, nil)
 	job := waitForWorkflowJob(t, ctx, edit, accepted.StatusURL, executioncontract.Succeeded)

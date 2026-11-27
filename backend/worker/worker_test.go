@@ -130,6 +130,7 @@ func setupWorkerTestEnv(t *testing.T) *workerTestEnv {
 			}
 		}
 	}
+	requireIdleQueue(t, platformDB)
 	return &workerTestEnv{
 		platformDB:         platformDB,
 		ownerDB:            ownerDB,
@@ -210,6 +211,42 @@ type jobFixture struct {
 	snapshot    executioncontract.Draft
 }
 
+// requireIdleQueue keeps Step from claiming or reconciling jobs that another test left behind.
+func requireIdleQueue(t *testing.T, db *sql.DB) {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT id::text, title, status FROM app.jobs
+		WHERE status IN ('queued', 'running', 'retry_wait', 'unknown') OR blocks_database`)
+	if err != nil {
+		t.Fatalf("check job queue: %v", err)
+	}
+	defer rows.Close()
+	var foreign []string
+	for rows.Next() {
+		var id, title, status string
+		if err := rows.Scan(&id, &title, &status); err != nil {
+			t.Fatalf("scan job queue: %v", err)
+		}
+		foreign = append(foreign, id+" ("+title+", "+status+")")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read job queue: %v", err)
+	}
+	if len(foreign) > 0 {
+		t.Fatalf("job queue must be idle before a worker test, found: %s", strings.Join(foreign, "; "))
+	}
+}
+
+// planFor returns the snapshot of the fixture that owns req.JobID and refuses foreign jobs without touching them.
+func planFor(req executioncontract.RevalidationRequest, version string, fixes ...jobFixture) (executioncontract.ExecutionPlan, error) {
+	for _, f := range fixes {
+		if f.jobID == req.JobID {
+			return executioncontract.ExecutionPlan{Request: req, Snapshot: f.snapshot, Version: version}, nil
+		}
+	}
+	return executioncontract.ExecutionPlan{}, executioncontract.ContractError{Code: "TEST_FOREIGN_JOB", Message: "job " + req.JobID + " does not belong to this test", Retryable: true}
+}
+
 func enqueueStandardJob(t *testing.T, env *workerTestEnv, targetID, dbName, sqlUp, sqlDown string) jobFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -225,12 +262,17 @@ func enqueueStandardJob(t *testing.T, env *workerTestEnv, targetID, dbName, sqlU
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		if env.targetCleanupDB != nil {
+		// Evidence lives on the job's own target; leftover tickets would collide with later versions.
+		targetCleanupDB := env.targetCleanupDB
+		if targetID == env.physicalTargetID_B && env.physicalTargetID_B != "" {
+			targetCleanupDB = env.targetCleanupDB_B
+		}
+		if targetCleanupDB != nil {
 			for _, query := range []string{
 				"DELETE FROM wbd_auth.execution_receipts WHERE database_id = $1",
 				"DELETE FROM wbd_auth.execution_tickets WHERE database_id = $1",
 			} {
-				_, _ = env.targetCleanupDB.ExecContext(cleanupCtx, query, dbID)
+				_, _ = targetCleanupDB.ExecContext(cleanupCtx, query, dbID)
 			}
 		}
 		if env.targetExecDB != nil {
@@ -569,11 +611,7 @@ func TestWorker_StandardJob_Lifecycle(t *testing.T) {
 
 	gate := executioncontract.FakeGate{
 		RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
-			return executioncontract.ExecutionPlan{
-				Request:  req,
-				Snapshot: fix.snapshot,
-				Version:  "1",
-			}, nil
+			return planFor(req, "1", fix)
 		},
 		RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 			return nil
@@ -606,7 +644,7 @@ func TestWorker_StandardJob_Lifecycle(t *testing.T) {
 		t.Fatalf("get job: %v", err)
 	}
 	if job.Status != executioncontract.Succeeded {
-		t.Fatalf("expected job status succeeded, got %s", job.Status)
+		t.Fatalf("expected job status succeeded, got %s error=%+v", job.Status, job.Error)
 	}
 	if job.BlocksDatabase {
 		t.Fatal("expected blocks_database to be false after completion")
@@ -679,11 +717,7 @@ func TestWorker_BatchJob_Lifecycle(t *testing.T) {
 
 	gate := executioncontract.FakeGate{
 		RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
-			return executioncontract.ExecutionPlan{
-				Request:  req,
-				Snapshot: fix.snapshot,
-				Version:  "1",
-			}, nil
+			return planFor(req, "1", fix)
 		},
 		RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 			return nil
@@ -751,11 +785,7 @@ func TestWorker_LeaseRenewal(t *testing.T) {
 		RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
 			// Delay slightly so that renewal tick fires during execution
 			time.Sleep(120 * time.Millisecond)
-			return executioncontract.ExecutionPlan{
-				Request:  req,
-				Snapshot: fix.snapshot,
-				Version:  "1",
-			}, nil
+			return planFor(req, "1", fix)
 		},
 		RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 			return nil
@@ -831,11 +861,7 @@ func TestWorker_StopAuthorizingOnStaleRenewal(t *testing.T) {
 			}
 			// Wait for renewal tick to fire and fail
 			time.Sleep(120 * time.Millisecond)
-			return executioncontract.ExecutionPlan{
-				Request:  req,
-				Snapshot: fix.snapshot,
-				Version:  "1",
-			}, nil
+			return planFor(req, "1", fix)
 		},
 	}
 
@@ -901,11 +927,7 @@ func TestWorker_Shutdown_BoundedDrain(t *testing.T) {
 		gate := executioncontract.FakeGate{
 			RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
 				<-stopCalled
-				return executioncontract.ExecutionPlan{
-					Request:  req,
-					Snapshot: fix.snapshot,
-					Version:  "1",
-				}, nil
+				return planFor(req, "1", fix)
 			},
 			RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 				return nil
@@ -1059,7 +1081,7 @@ func TestWorker_Run_ParentCancellationDrainsJob(t *testing.T) {
 			case <-ctx.Done():
 				return executioncontract.ExecutionPlan{}, ctx.Err()
 			case <-release:
-				return executioncontract.ExecutionPlan{Request: req, Snapshot: fix.snapshot, Version: "1"}, nil
+				return planFor(req, "1", fix)
 			}
 		},
 		RecordCommitFunc: func(context.Context, *sql.Tx, executioncontract.CommitEvidence) error { return nil },
@@ -1206,11 +1228,7 @@ func TestWorker_ReceiptOnlyRecovery(t *testing.T) {
 
 	gate := executioncontract.FakeGate{
 		RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
-			return executioncontract.ExecutionPlan{
-				Request:  req,
-				Snapshot: fix.snapshot,
-				Version:  "1",
-			}, nil
+			return planFor(req, "1", fix)
 		},
 		RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 			return nil
@@ -1360,11 +1378,7 @@ func TestWorker_Concurrency_DifferentTargets(t *testing.T) {
 
 	sharedGate := executioncontract.FakeGate{
 		RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
-			snap := fixA.snapshot
-			if req.JobID == fixB.jobID {
-				snap = fixB.snapshot
-			}
-			return executioncontract.ExecutionPlan{Request: req, Snapshot: snap, Version: "1"}, nil
+			return planFor(req, "1", fixA, fixB)
 		},
 		RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error { return nil },
 	}
@@ -1457,11 +1471,7 @@ func TestWorker_Shutdown_StubbornDependency(t *testing.T) {
 				time.Sleep(150 * time.Millisecond)
 				return executioncontract.ExecutionPlan{}, rCtx.Err()
 			case <-unblockDependency:
-				return executioncontract.ExecutionPlan{
-					Request:  req,
-					Snapshot: fix.snapshot,
-					Version:  "1",
-				}, nil
+				return planFor(req, "1", fix)
 			}
 		},
 	}
@@ -1624,11 +1634,7 @@ func TestWorker_Lifecycle_StopDuringRecovery(t *testing.T) {
 
 	gate := executioncontract.FakeGate{
 		RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
-			return executioncontract.ExecutionPlan{
-				Request:  req,
-				Snapshot: fix.snapshot,
-				Version:  "1",
-			}, nil
+			return planFor(req, "1", fix)
 		},
 		RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 			return nil
@@ -1782,13 +1788,11 @@ func TestWorker_Recovery_CandidateRotation_AvoidStarvation(t *testing.T) {
 
 	sharedGate := executioncontract.FakeGate{
 		RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
-			snap := fixA.snapshot
 			ver := fmt.Sprintf("%d", verTargetA)
 			if req.JobID == fixB.jobID {
-				snap = fixB.snapshot
 				ver = fmt.Sprintf("%d", verTargetB)
 			}
-			return executioncontract.ExecutionPlan{Request: req, Snapshot: snap, Version: ver}, nil
+			return planFor(req, ver, fixA, fixB)
 		},
 		RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 			return nil
@@ -2020,11 +2024,7 @@ func TestWorker_TracePropagation(t *testing.T) {
 				capturedTS = tc.Tracestate
 			}
 			mu.Unlock()
-			return executioncontract.ExecutionPlan{
-				Request:  req,
-				Snapshot: fix.snapshot,
-				Version:  "1",
-			}, nil
+			return planFor(req, "1", fix)
 		},
 		RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 			return nil
@@ -2194,7 +2194,7 @@ func TestWorker_NonSuccessNilErrorOutcomesAndTraceCorrelation(t *testing.T) {
 		var logs []capturedLog
 		gate := executioncontract.FakeGate{
 			RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
-				return executioncontract.ExecutionPlan{Request: req, Snapshot: fix.snapshot, Version: "1"}, nil
+				return planFor(req, "1", fix)
 			},
 		}
 		w, err := New(svc, jobs.ExecutionDeps{Gate: gate, Acquire: env.makeAcquire(t), Timeout: 10 * time.Second}, Config{
@@ -2301,14 +2301,17 @@ func TestWorker_NonSuccessNilErrorOutcomesAndTraceCorrelation(t *testing.T) {
 			t.Fatalf("set batch traceparent: %v", err)
 		}
 
-		var revalidateCalls int
+		// Approval turns stale only after the first chunk commits, so the job ends partial.
 		gate := executioncontract.FakeGate{
-			RevalidateFunc: func(_ context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
-				revalidateCalls++
-				if revalidateCalls >= 3 {
+			RevalidateFunc: func(ctx context.Context, req executioncontract.RevalidationRequest) (executioncontract.ExecutionPlan, error) {
+				var committed bool
+				if err := env.platformDB.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM app.job_batch_commit_proofs WHERE job_id = $1)", req.JobID).Scan(&committed); err != nil {
+					return executioncontract.ExecutionPlan{}, err
+				}
+				if committed {
 					return executioncontract.ExecutionPlan{}, executioncontract.ContractError{Code: "REVIEW_STALE", Message: "approval stale"}
 				}
-				return executioncontract.ExecutionPlan{Request: req, Snapshot: fix.snapshot, Version: "1"}, nil
+				return planFor(req, "1", fix)
 			},
 			RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 				return nil
@@ -2371,7 +2374,7 @@ func TestWorker_NonSuccessNilErrorOutcomesAndTraceCorrelation(t *testing.T) {
 					sawPersistedContext = true
 				}
 				time.Sleep(120 * time.Millisecond)
-				return executioncontract.ExecutionPlan{Request: req, Snapshot: fix.snapshot, Version: "1"}, nil
+				return planFor(req, "1", fix)
 			},
 			RecordCommitFunc: func(_ context.Context, _ *sql.Tx, _ executioncontract.CommitEvidence) error {
 				return nil

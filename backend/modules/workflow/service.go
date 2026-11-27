@@ -452,6 +452,9 @@ func (s *Service) Enqueue(ctx context.Context, actor, proposalID uuid.UUID, inpu
 	if input.Revision > 0 && input.Revision != revision {
 		return EnqueueOutput{}, ErrProposalStale
 	}
+	if status == "pending_review" {
+		return EnqueueOutput{}, ErrPendingApprovals
+	}
 	if status != "approved" && status != "queued" {
 		return EnqueueOutput{}, ErrConflict
 	}
