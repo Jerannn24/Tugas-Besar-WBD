@@ -19,7 +19,7 @@ const databaseID = "11111111-1111-4111-8111-111111111111"
 const draftID = "22222222-2222-4222-8222-222222222222"
 const targetID = "33333333-3333-4333-8333-333333333333"
 
-var draftColumns = []string{"id", "database_id", "title", "sql", "revision", "created_by", "created_at", "updated_at", "applied_execution_id", "sql_down", "irreversible_reason", "mode", "batch"}
+var draftColumns = []string{"id", "database_id", "title", "sql", "revision", "created_by", "created_at", "updated_at", "applied_execution_id", "sql_down", "irreversible_reason", "mode", "batch", "is_applied", "latest_execution_id", "latest_execution_direction"}
 var timestamp = time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 
 type statusError int
@@ -90,7 +90,16 @@ func assertError(t *testing.T, w *httptest.ResponseRecorder, status int, code st
 	}
 }
 func draftRows(title, sql string, revision int, applied any) *sqlmock.Rows {
-	return sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, title, sql, revision, "actor", timestamp, timestamp, applied, nil, nil, "standard", nil)
+	isApplied := applied != nil
+	var direction any
+	if isApplied {
+		direction = "up"
+	}
+	return draftRowsWithExecution(title, sql, revision, applied, applied, direction, isApplied)
+}
+
+func draftRowsWithExecution(title, sql string, revision int, applied, latest, direction any, isApplied bool) *sqlmock.Rows {
+	return sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, title, sql, revision, "actor", timestamp, timestamp, applied, nil, nil, "standard", nil, isApplied, latest, direction)
 }
 func expectLocks(m sqlmock.Sqlmock) {
 	m.ExpectBegin()
@@ -113,7 +122,7 @@ func assertDraft(t *testing.T, w *httptest.ResponseRecorder, status, revision in
 		t.Fatal(err)
 	}
 	d := v.Data
-	if w.Code != status || d.ID != draftID || d.DatabaseID != databaseID || d.Title != title || d.SQL != sql || d.Revision != revision || d.CreatedBy != "actor" || d.AppliedExecutionID != nil || !d.UpdatedAt.Equal(timestamp) {
+	if w.Code != status || d.ID != draftID || d.DatabaseID != databaseID || d.Title != title || d.SQL != sql || d.Revision != revision || d.CreatedBy != "actor" || d.AppliedExecutionID != nil || d.IsApplied || d.LatestExecutionID != nil || d.LatestExecutionDirection != nil || !d.UpdatedAt.Equal(timestamp) {
 		t.Fatalf("%d %+v %s", w.Code, d, w.Body)
 	}
 	if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("Content-Type") != "application/json" {
@@ -168,7 +177,7 @@ func TestPatchIncrementsRevision(t *testing.T) {
 	expectDraftLock(m, 2, false, down, "previous reason")
 	m.ExpectQuery(`UPDATE app.migration_drafts SET .*revision=revision\+1,.* WHERE database_id=\$1 AND id=\$2 AND revision=\$5 RETURNING`).
 		WithArgs(databaseID, draftID, "New", "SELECT 2", 2, down, nil, "standard", "null").
-		WillReturnRows(sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "New", "SELECT 2", 3, "actor", timestamp, timestamp, nil, down, nil, "standard", nil))
+		WillReturnRows(sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "New", "SELECT 2", 3, "actor", timestamp, timestamp, nil, down, nil, "standard", nil, false, nil, nil))
 	m.ExpectCommit()
 	d := assertDraft(t, request(mux, "PATCH", path(true), `{"title":" New ","sql":"SELECT 2","revision":2,"irreversible_reason":null}`), 200, 3, "New", "SELECT 2")
 	if d.SQLDown == nil || *d.SQLDown != down || d.IrreversibleReason != nil {
@@ -290,7 +299,7 @@ func TestCreateWithIrreversibleReason(t *testing.T) {
 	expectLocks(m)
 	m.ExpectQuery("INSERT INTO app.migration_drafts").
 		WithArgs(uuidArgument{}, databaseID, "Draft", "SELECT 1", "actor", sqlmock.AnyArg(), nil, reason, "standard", "null").
-		WillReturnRows(sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "Draft", "SELECT 1", 1, "actor", timestamp, timestamp, nil, nil, reason, "standard", nil))
+		WillReturnRows(sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "Draft", "SELECT 1", 1, "actor", timestamp, timestamp, nil, nil, reason, "standard", nil, false, nil, nil))
 	m.ExpectCommit()
 	d := assertDraft(t, request(mux, "POST", path(false), `{"title":"Draft","sql":"SELECT 1","irreversible_reason":"`+reason+`"}`), 201, 1, "Draft", "SELECT 1")
 	if d.IrreversibleReason == nil || *d.IrreversibleReason != reason || d.SQLDown != nil {
@@ -330,7 +339,7 @@ func TestAuthorizationRecheckedAfterLock(t *testing.T) {
 func TestListAndDetail(t *testing.T) {
 	t.Run("empty list", func(t *testing.T) {
 		_, m, mux := fixture(t)
-		m.ExpectQuery("SELECT id::text,database_id::text,title,sql,revision").WithArgs(databaseID).WillReturnRows(sqlmock.NewRows(draftColumns))
+		m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID).WillReturnRows(sqlmock.NewRows(draftColumns))
 		w := request(mux, "GET", path(false), "")
 		if w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"data":{"items":[]}}` {
 			t.Fatalf("%d %s", w.Code, w.Body)
@@ -338,15 +347,48 @@ func TestListAndDetail(t *testing.T) {
 	})
 	t.Run("detail", func(t *testing.T) {
 		_, m, mux := fixture(t)
-		m.ExpectQuery("SELECT id::text,database_id::text,title,sql,revision").WithArgs(databaseID, draftID).WillReturnRows(draftRows("Title", "SELECT 1", 4, nil))
+		m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID, draftID).WillReturnRows(draftRows("Title", "SELECT 1", 4, nil))
 		assertDraft(t, request(mux, "GET", path(true), ""), 200, 4, "Title", "SELECT 1")
 	})
 	t.Run("not found", func(t *testing.T) {
 		_, m, mux := fixture(t)
-		m.ExpectQuery("SELECT id::text,database_id::text,title,sql,revision").WithArgs(databaseID, draftID).WillReturnRows(sqlmock.NewRows(draftColumns))
+		m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID, draftID).WillReturnRows(sqlmock.NewRows(draftColumns))
 		assertError(t, request(mux, "GET", path(true), ""), 404, "NOT_FOUND")
 	})
 }
+func TestDetailDerivesM2AppliedStateFromHistoryWithoutLegacyPointer(t *testing.T) {
+	_, m, mux := fixture(t)
+	const executionID = "44444444-4444-4444-8444-444444444444"
+	m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID, draftID).
+		WillReturnRows(draftRowsWithExecution("Title", "SELECT 1", 1, nil, executionID, "up", true))
+	w := request(mux, "GET", path(true), "")
+	var v struct{ Data Draft }
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != 200 || v.Data.AppliedExecutionID != nil || !v.Data.IsApplied || v.Data.LatestExecutionID == nil || *v.Data.LatestExecutionID != executionID || v.Data.LatestExecutionDirection == nil || *v.Data.LatestExecutionDirection != "up" {
+		t.Fatalf("M2 execution state was not derived independently of the M1 pointer: %d %+v %s", w.Code, v.Data, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), `"is_applied":true`) || !strings.Contains(w.Body.String(), `"latest_execution_id":"`+executionID+`"`) {
+		t.Fatalf("M2 execution state missing from API response: %s", w.Body)
+	}
+}
+
+func TestDetailReportsM2RollbackAsNotAppliedButKeepsLatestExecution(t *testing.T) {
+	_, m, mux := fixture(t)
+	const executionID = "55555555-5555-4555-8555-555555555555"
+	m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID, draftID).
+		WillReturnRows(draftRowsWithExecution("Title", "SELECT 1", 1, nil, executionID, "down", false))
+	w := request(mux, "GET", path(true), "")
+	var v struct{ Data Draft }
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != 200 || v.Data.IsApplied || v.Data.LatestExecutionID == nil || *v.Data.LatestExecutionID != executionID || v.Data.LatestExecutionDirection == nil || *v.Data.LatestExecutionDirection != "down" {
+		t.Fatalf("M2 rollback state was not represented correctly: %d %+v %s", w.Code, v.Data, w.Body)
+	}
+}
+
 func TestDatabaseErrorsAreSanitizedAndRollback(t *testing.T) {
 	for _, kind := range []string{"begin", "connection", "insert", "commit", "list"} {
 		t.Run(kind, func(t *testing.T) {
@@ -369,7 +411,7 @@ func TestDatabaseErrorsAreSanitizedAndRollback(t *testing.T) {
 				m.ExpectCommit().WillReturnError(errors.New("private password"))
 			case "list":
 				method, body = "GET", ""
-				m.ExpectQuery("SELECT id::text,database_id::text,title,sql,revision").WithArgs(databaseID).WillReturnError(errors.New("private password"))
+				m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID).WillReturnError(errors.New("private password"))
 			}
 			assertError(t, request(mux, method, p, body), 500, "INTERNAL_ERROR")
 		})
@@ -419,11 +461,11 @@ func TestListReadErrorsDoNotReturnPartialSuccess(t *testing.T) {
 			_, m, mux := fixture(t)
 			rows := draftRows("Title", "SELECT 1", 1, nil)
 			if stage == "scan" {
-				rows = sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "Title", "SELECT 1", "invalid integer", "actor", timestamp, timestamp, nil, nil, nil, "standard", nil)
+				rows = sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "Title", "SELECT 1", "invalid integer", "actor", timestamp, timestamp, nil, nil, nil, "standard", nil, false, nil, nil)
 			} else {
-				rows.AddRow(draftID, databaseID, "Title", "SELECT 1", 1, "actor", timestamp, timestamp, nil, nil, nil, "standard", nil).RowError(1, errors.New("private stream error"))
+				rows.AddRow(draftID, databaseID, "Title", "SELECT 1", 1, "actor", timestamp, timestamp, nil, nil, nil, "standard", nil, false, nil, nil).RowError(1, errors.New("private stream error"))
 			}
-			m.ExpectQuery("SELECT id::text,database_id::text,title,sql,revision").WithArgs(databaseID).WillReturnRows(rows)
+			m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID).WillReturnRows(rows)
 			assertError(t, request(mux, "GET", path(false), ""), 500, "INTERNAL_ERROR")
 		})
 	}
@@ -432,13 +474,13 @@ func TestListReadErrorsDoNotReturnPartialSuccess(t *testing.T) {
 func TestDetailPreservesAppliedExecutionAndNormalizesTimestamp(t *testing.T) {
 	_, m, mux := fixture(t)
 	local := time.Date(2026, 10, 25, 19, 0, 0, 0, time.FixedZone("WIB", 7*3600))
-	m.ExpectQuery("SELECT id::text,database_id::text,title,sql,revision").WithArgs(databaseID, draftID).WillReturnRows(sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "Title", "SELECT 1", 1, "actor", local, local, targetID, nil, nil, "standard", nil))
+	m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID, draftID).WillReturnRows(sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "Title", "SELECT 1", 1, "actor", local, local, targetID, nil, nil, "standard", nil, true, targetID, "up"))
 	w := request(mux, "GET", path(true), "")
 	var v struct{ Data Draft }
 	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
 		t.Fatal(err)
 	}
-	if w.Code != 200 || v.Data.AppliedExecutionID == nil || *v.Data.AppliedExecutionID != targetID || !v.Data.UpdatedAt.Equal(timestamp) || !strings.Contains(w.Body.String(), `"updated_at":"2026-10-25T12:00:00Z"`) {
+	if w.Code != 200 || v.Data.AppliedExecutionID == nil || *v.Data.AppliedExecutionID != targetID || !v.Data.IsApplied || v.Data.LatestExecutionID == nil || *v.Data.LatestExecutionID != targetID || v.Data.LatestExecutionDirection == nil || *v.Data.LatestExecutionDirection != "up" || !v.Data.UpdatedAt.Equal(timestamp) || !strings.Contains(w.Body.String(), `"updated_at":"2026-10-25T12:00:00Z"`) {
 		t.Fatalf("%d %s", w.Code, w.Body)
 	}
 	if strings.Contains(w.Body.String(), "created_at") {
@@ -450,7 +492,7 @@ func TestBatchDraftRoundTrip(t *testing.T) {
 	_, m, mux := fixture(t)
 	const batch = `{"schema":"managed","table":"items","cursor_column":"id","batch_size":100,"parameters":{"active":true}}`
 	rows := func(revision int, mode string, config any) *sqlmock.Rows {
-		return sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "Draft", "SELECT 1", revision, "actor", timestamp, timestamp, nil, nil, nil, mode, config)
+		return sqlmock.NewRows(draftColumns).AddRow(draftID, databaseID, "Draft", "SELECT 1", revision, "actor", timestamp, timestamp, nil, nil, nil, mode, config, false, nil, nil)
 	}
 	check := func(d Draft) {
 		t.Helper()
@@ -463,11 +505,15 @@ func TestBatchDraftRoundTrip(t *testing.T) {
 	m.ExpectCommit()
 	check(assertDraft(t, request(mux, "POST", path(false), `{"title":"Draft","sql":"SELECT 1","mode":"batch","batch":`+batch+`}`), 201, 1, "Draft", "SELECT 1"))
 
-	m.ExpectQuery("SELECT id::text,database_id::text,title,sql,revision").WithArgs(databaseID, draftID).WillReturnRows(rows(1, "batch", batch))
+	m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID, draftID).WillReturnRows(rows(1, "batch", batch))
 	check(assertDraft(t, request(mux, "GET", path(true), ""), 200, 1, "Draft", "SELECT 1"))
-	m.ExpectQuery("SELECT id::text,database_id::text,title,sql,revision").WithArgs(databaseID).WillReturnRows(rows(1, "batch", batch))
+	m.ExpectQuery("SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision").WithArgs(databaseID).WillReturnRows(rows(1, "batch", batch))
 	w := request(mux, "GET", path(false), "")
-	var list struct { Data struct { Items []Draft `json:"items"` } `json:"data"` }
+	var list struct {
+		Data struct {
+			Items []Draft `json:"items"`
+		} `json:"data"`
+	}
 	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &list) != nil || len(list.Data.Items) != 1 {
 		t.Fatalf("list: %d %s", w.Code, w.Body)
 	}
@@ -475,7 +521,7 @@ func TestBatchDraftRoundTrip(t *testing.T) {
 
 	for _, tc := range []struct {
 		name, body, mode, argument string
-		stored any
+		stored                     any
 	}{
 		{"omitted", `{"title":"Draft","sql":"SELECT 1","revision":1}`, "batch", batch, batch},
 		{"clear", `{"title":"Draft","sql":"SELECT 1","revision":1,"mode":"standard","batch":null}`, "standard", "null", nil},
@@ -498,7 +544,11 @@ func TestBatchDraftRoundTrip(t *testing.T) {
 }
 
 func TestRejectsInvalidBatchInput(t *testing.T) {
-	for _, tc := range []struct { name, fields string; status int; code string }{
+	for _, tc := range []struct {
+		name, fields string
+		status       int
+		code         string
+	}{
 		{"unknown mode", `"mode":"other"`, 422, "VALIDATION_FAILED"},
 		{"null mode", `"mode":null`, 422, "VALIDATION_FAILED"},
 		{"missing batch", `"mode":"batch"`, 422, "VALIDATION_FAILED"},

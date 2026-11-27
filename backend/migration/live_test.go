@@ -154,7 +154,7 @@ func TestLiveMigrationLifecycle(t *testing.T) {
 	}
 	create := func(text string) string {
 		t.Helper()
-		raw, _ := json.Marshal(map[string]string{"title": "Live migration", "sql": text})
+		raw, _ := json.Marshal(map[string]string{"title": "Live migration", "sql": text, "irreversible_reason": "Live integration fixture does not define rollback SQL"})
 		r := httptest.NewRequest("POST", "/api/databases/"+database+"/drafts", strings.NewReader(string(raw)))
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, r)

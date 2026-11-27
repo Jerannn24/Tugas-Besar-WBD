@@ -1,4 +1,3 @@
-
 package workflow
 
 import (
@@ -23,6 +22,7 @@ const (
 
 var (
 	ErrForbidden        = errors.New("workflow action is forbidden")
+	ErrLeaderRequired   = errors.New("current user is not an eligible group leader")
 	ErrPendingApprovals = errors.New("workflow approvals are incomplete")
 )
 
@@ -251,11 +251,11 @@ func currentApprovalFingerprint(
 	}
 
 	type roster struct {
-		Group       string   `json:"group"`
-		Leader      *string  `json:"leader"`
-		LeaderActive bool    `json:"leader_active"`
-		Access      Access   `json:"access"`
-		Members     []member `json:"members"`
+		Group        string   `json:"group"`
+		Leader       *string  `json:"leader"`
+		LeaderActive bool     `json:"leader_active"`
+		Access       Access   `json:"access"`
+		Members      []member `json:"members"`
 	}
 
 	var (

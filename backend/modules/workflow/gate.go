@@ -161,7 +161,15 @@ func (g *Gate) RevalidateTx(ctx context.Context, tx *sql.Tx, in executioncontrac
 		return executioncontract.ExecutionPlan{}, contractError("REQUEST_CONFLICT", "Snapshot identity mismatch", false)
 	}
 	if err := executioncontract.ValidateDraft(snapshot); err != nil {
-		return executioncontract.ExecutionPlan{}, contractError("VALIDATION_FAILED", err.Error(), false)
+		return executioncontract.ExecutionPlan{}, executioncontract.ContractError{
+			Code:    "VALIDATION_FAILED",
+			Message: "Migration draft validation failed",
+			Issues: []executioncontract.Issue{{
+				Code:    "INVALID_DRAFT",
+				Message: err.Error(),
+			}},
+			Retryable: false,
+		}
 	}
 	version, err := reserveJobTargetVersion(ctx, tx, in.ExecutionID, in.TargetID)
 	if err != nil {

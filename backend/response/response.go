@@ -12,6 +12,7 @@ type APIError struct {
 	Code        string            `json:"code"`
 	Message     string            `json:"message"`
 	FieldErrors map[string]string `json:"field_errors"`
+	Issues      interface{}       `json:"issues,omitempty"`
 	Retryable   bool              `json:"retryable"`
 }
 
@@ -31,6 +32,21 @@ func Fail(c *fiber.Ctx, status int, code, message string) error {
 			Code:        code,
 			Message:     message,
 			FieldErrors: map[string]string{},
+			Retryable:   false,
+		},
+	})
+}
+
+func FailDetailed(c *fiber.Ctx, status int, code, message string, retryable bool, issues interface{}) error {
+	return c.Status(status).JSON(APIResponse{
+		Success: false,
+		Data:    nil,
+		Error: &APIError{
+			Code:        code,
+			Message:     message,
+			FieldErrors: map[string]string{},
+			Issues:      issues,
+			Retryable:   retryable,
 		},
 	})
 }

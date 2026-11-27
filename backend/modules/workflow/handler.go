@@ -2,12 +2,14 @@ package workflow
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/response"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 )
@@ -75,6 +77,16 @@ func (h *Handler) submit(c *fiber.Ctx) error {
 	}
 	proposal, err := h.service.Submit(c.UserContext(), actor.ID, id, revision)
 	if err != nil {
+		if errors.Is(err, ErrInvalidProposal) && proposal.Validation != nil && proposal.Validation.Status == "failed" {
+			return response.FailDetailed(
+				c,
+				http.StatusUnprocessableEntity,
+				"VALIDATION_FAILED",
+				"Validasi migration gagal",
+				false,
+				proposal.Validation.Issues,
+			)
+		}
 		return mapError(c, err)
 	}
 	proposal, err = h.service.present(c.UserContext(), actor.ID, proposal)
@@ -261,41 +273,66 @@ func (h *Handler) list(c *fiber.Ctx) error {
 }
 
 func invalid(c *fiber.Ctx) error {
-	return response.Fail(c, http.StatusBadRequest, "INVALID_INPUT", "Request tidak valid")
+	return response.Fail(c, http.StatusBadRequest, "INVALID_REQUEST", "Request tidak valid")
 }
 
 func mapError(c *fiber.Ctx, err error) error {
 	var contractErr executioncontract.ContractError
 	if errors.As(err, &contractErr) {
+		code := contractErr.Code
 		status := http.StatusConflict
-		switch contractErr.Code {
-		case "INVALID_REQUEST":
+		switch code {
+		case "INVALID_REQUEST", "INVALID_INPUT":
 			status = http.StatusBadRequest
+			code = "INVALID_REQUEST"
 		case "NOT_FOUND":
 			status = http.StatusNotFound
 		case "FORBIDDEN":
+			status = http.StatusForbidden
+		case "LEADER_REQUIRED":
 			status = http.StatusForbidden
 		case "INTERNAL_ERROR", "NOT_CONFIGURED":
 			status = http.StatusInternalServerError
 		case "TARGET_UNAVAILABLE":
 			status = http.StatusBadGateway
+		case "VALIDATION_FAILED":
+			status = http.StatusUnprocessableEntity
+		case "VERSION_CONFLICT", "PROPOSAL_STALE", "REVIEW_STALE", "CONFLICT":
+			status = http.StatusConflict
+			code = "VERSION_CONFLICT"
 		}
-		return response.Fail(c, status, contractErr.Code, contractErr.Message)
+		if status >= http.StatusInternalServerError {
+			logInternalError(c, err)
+		}
+		return response.FailDetailed(c, status, code, contractErr.Message, contractErr.Retryable, contractErr.Issues)
 	}
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return response.Fail(c, http.StatusNotFound, "NOT_FOUND", "Proposal tidak ditemukan")
-	case errors.Is(err, ErrProposalStale):
-		return response.Fail(c, http.StatusConflict, "PROPOSAL_STALE", "Proposal sudah tidak sesuai dengan snapshot terkini")
-	case errors.Is(err, ErrConflict):
-		return response.Fail(c, http.StatusConflict, "CONFLICT", "Proposal tidak dapat diubah pada status ini")
+	case errors.Is(err, ErrProposalStale), errors.Is(err, ErrConflict):
+		return response.Fail(c, http.StatusConflict, "VERSION_CONFLICT", "Proposal sudah berubah atau tidak lagi sesuai dengan versi terkini")
 	case errors.Is(err, ErrPendingApprovals):
 		return response.Fail(c, http.StatusConflict, "APPROVAL_REQUIRED", "Persetujuan proposal belum lengkap")
+	case errors.Is(err, ErrLeaderRequired):
+		return response.Fail(c, http.StatusForbidden, "LEADER_REQUIRED", "Hanya leader group yang berhak memberikan persetujuan")
 	case errors.Is(err, ErrForbidden), errors.Is(err, authz.ErrForbidden):
 		return response.Fail(c, http.StatusForbidden, "FORBIDDEN", "Akses ditolak")
 	case errors.Is(err, ErrInvalidProposal):
 		return invalid(c)
 	default:
+		logInternalError(c, err)
 		return response.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Terjadi kesalahan internal")
 	}
+}
+
+func logInternalError(c *fiber.Ctx, err error) {
+	message, _ := telemetry.SafeError(err)
+	telemetry.DefaultLogger().Error(
+		c.UserContext(),
+		"workflow.request.internal_error",
+		slog.String("method", c.Method()),
+		slog.String("path", c.Path()),
+		slog.Int("http_status", http.StatusInternalServerError),
+		slog.String("error", message),
+	)
 }

@@ -30,19 +30,22 @@ type Dependencies struct {
 type Handler struct{ d Dependencies }
 
 type Draft struct {
-	ID                 string                         `json:"id"`
-	DatabaseID         string                         `json:"database_id"`
-	Title              string                         `json:"title"`
-	SQL                string                         `json:"sql"`
-	Revision           int                            `json:"revision"`
-	CreatedBy          string                         `json:"created_by"`
-	CreatedAt          time.Time                      `json:"-"`
-	UpdatedAt          time.Time                      `json:"updated_at"`
-	AppliedExecutionID *string                        `json:"applied_execution_id"`
-	SQLDown            *string                        `json:"sql_down,omitempty"`
-	IrreversibleReason *string                        `json:"irreversible_reason,omitempty"`
-	Mode               executioncontract.Mode         `json:"mode"`
-	Batch              *executioncontract.BatchConfig `json:"batch"`
+	ID                       string                         `json:"id"`
+	DatabaseID               string                         `json:"database_id"`
+	Title                    string                         `json:"title"`
+	SQL                      string                         `json:"sql"`
+	Revision                 int                            `json:"revision"`
+	CreatedBy                string                         `json:"created_by"`
+	CreatedAt                time.Time                      `json:"-"`
+	UpdatedAt                time.Time                      `json:"updated_at"`
+	AppliedExecutionID       *string                        `json:"applied_execution_id"`
+	IsApplied                bool                           `json:"is_applied"`
+	LatestExecutionID        *string                        `json:"latest_execution_id"`
+	LatestExecutionDirection *string                        `json:"latest_execution_direction"`
+	SQLDown                  *string                        `json:"sql_down,omitempty"`
+	IrreversibleReason       *string                        `json:"irreversible_reason,omitempty"`
+	Mode                     executioncontract.Mode         `json:"mode"`
+	Batch                    *executioncontract.BatchConfig `json:"batch"`
 }
 type input struct {
 	Title                 string                         `json:"title"`
@@ -81,7 +84,7 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.d.Platform.QueryContext(ctx, draftSelect+` WHERE database_id=$1 ORDER BY updated_at DESC,id`, id)
+	rows, err := h.d.Platform.QueryContext(ctx, draftSelect+` WHERE d.database_id=$1 ORDER BY d.updated_at DESC,d.id`, id)
 	if err != nil {
 		internal(w)
 		return
@@ -115,7 +118,7 @@ func (h *Handler) detail(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 400, "INVALID_REQUEST", "Invalid draft id")
 		return
 	}
-	d, err := scan(h.d.Platform.QueryRowContext(ctx, draftSelect+` WHERE database_id=$1 AND id=$2`, id, did))
+	d, err := scan(h.d.Platform.QueryRowContext(ctx, draftSelect+` WHERE d.database_id=$1 AND d.id=$2`, id, did))
 	if errors.Is(err, sql.ErrNoRows) {
 		notFound(w)
 		return
@@ -334,16 +337,36 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) {
 	success(w, updated)
 }
 
-const draftProjection = `id::text,database_id::text,title,sql,revision,created_by::text,created_at,updated_at,applied_execution_id::text,sql_down,irreversible_reason,mode,batch`
-const draftSelect = `SELECT ` + draftProjection + ` FROM app.migration_drafts`
+const draftReturningProjection = `id::text,database_id::text,title,sql,revision,created_by::text,created_at,updated_at,applied_execution_id::text,sql_down,irreversible_reason,mode,batch,
+	(applied_execution_id IS NOT NULL),applied_execution_id::text,
+	CASE WHEN applied_execution_id IS NOT NULL THEN 'up'::text ELSE NULL::text END`
+
+const draftSelect = `SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision,d.created_by::text,
+	d.created_at,d.updated_at,d.applied_execution_id::text,d.sql_down,d.irreversible_reason,d.mode,d.batch,
+	CASE WHEN m2.execution_id IS NOT NULL THEN m2.direction = 'up'
+	     ELSE d.applied_execution_id IS NOT NULL END AS is_applied,
+	COALESCE(m2.execution_id::text,d.applied_execution_id::text) AS latest_execution_id,
+	COALESCE(m2.direction,CASE WHEN d.applied_execution_id IS NOT NULL THEN 'up'::text ELSE NULL::text END) AS latest_execution_direction
+	FROM app.migration_drafts d
+	LEFT JOIN LATERAL (
+		SELECT h.execution_id,h.direction
+		FROM app.migration_history_entries h
+		WHERE h.database_id=d.database_id AND h.migration_id=d.id
+		  AND h.revision=d.revision AND h.job_id IS NOT NULL AND h.is_complete
+		ORDER BY h.version DESC,h.committed_at DESC,h.commit_id DESC
+		LIMIT 1
+	) m2 ON TRUE`
+
+const draftProjection = draftReturningProjection
 
 type rowScanner interface{ Scan(...any) error }
 
 func scan(row rowScanner) (Draft, error) {
 	var d Draft
-	var applied sql.NullString
+	var applied, latest, direction sql.NullString
 	var batch []byte
-	err := row.Scan(&d.ID, &d.DatabaseID, &d.Title, &d.SQL, &d.Revision, &d.CreatedBy, &d.CreatedAt, &d.UpdatedAt, &applied, &d.SQLDown, &d.IrreversibleReason, &d.Mode, &batch)
+	err := row.Scan(&d.ID, &d.DatabaseID, &d.Title, &d.SQL, &d.Revision, &d.CreatedBy, &d.CreatedAt, &d.UpdatedAt,
+		&applied, &d.SQLDown, &d.IrreversibleReason, &d.Mode, &batch, &d.IsApplied, &latest, &direction)
 	if err == nil && len(batch) != 0 {
 		err = json.Unmarshal(batch, &d.Batch)
 	}
@@ -351,6 +374,12 @@ func scan(row rowScanner) (Draft, error) {
 	d.UpdatedAt = d.UpdatedAt.UTC()
 	if applied.Valid {
 		d.AppliedExecutionID = &applied.String
+	}
+	if latest.Valid {
+		d.LatestExecutionID = &latest.String
+	}
+	if direction.Valid {
+		d.LatestExecutionDirection = &direction.String
 	}
 	return d, err
 }

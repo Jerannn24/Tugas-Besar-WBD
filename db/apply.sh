@@ -26,6 +26,7 @@ for migration in db/migrations/*.sql; do
   [[ -f $migration ]] || fail 'no migration files found'
   version=${migration##*/}
   version=${version%.sql}
+  printf 'Checking platform migration %s\n' "$version"
   snapshot=$(mktemp)
   cp -- "$migration" "$snapshot"
   checksum=$(sha256sum "$snapshot" | cut -d ' ' -f1)
@@ -103,11 +104,15 @@ GRANT SELECT ON app.schema_migrations TO wbd_platform_runtime;
 \endif
 SELECT EXISTS (SELECT 1 FROM app.schema_migrations WHERE version = :'migration_version') AS version_exists \gset
 \if :version_exists
--- Migration 013 reconciles both published versions of 007 without rewriting the ledger.
+-- Migration 013 reconciles published 007 versions, including the original source ZIP, without rewriting the ledger.
 SELECT (checksum = :'migration_checksum'
         OR (version = '007_workflow_history'
-            AND checksum = '59145eacfcf517218cbd6a9efbf6356c8797946bec62965ad2761da55717c5d6'
-            AND :'migration_checksum' = 'cb6197be8e59f85bbb41582faea533d74dd199e012b89a3393a742f96b9019f6')) AS checksum_matches
+            AND :'migration_checksum' = 'a9ee91fe1bffb35336e1a80b60c928c40e665ccb0ae9f51a0a8e9356150f13ca'
+            AND checksum IN (
+                '59145eacfcf517218cbd6a9efbf6356c8797946bec62965ad2761da55717c5d6',
+                'cb6197be8e59f85bbb41582faea533d74dd199e012b89a3393a742f96b9019f6',
+                'd4e2fd90c88b1917ab00eb10de3df8169b66f61a251d3c625a259d1683f0993e'
+            ))) AS checksum_matches
 FROM app.schema_migrations WHERE version = :'migration_version' \gset
 \if :checksum_matches
 \echo 'Migration already applied with an accepted checksum; no-op.'

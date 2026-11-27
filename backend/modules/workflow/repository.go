@@ -633,7 +633,7 @@ func (r *Repository) Approve(
 		return Proposal{}, err
 	}
 	if !anchorValid {
-		return Proposal{}, ErrForbidden
+		return Proposal{}, ErrLeaderRequired
 	}
 
 	rows, err := tx.Query(ctx, `
@@ -677,7 +677,7 @@ func (r *Repository) Approve(
 	rows.Close()
 
 	if len(ledGroups) == 0 {
-		return Proposal{}, ErrForbidden
+		return Proposal{}, ErrLeaderRequired
 	}
 
 	anchorFound := false
@@ -690,7 +690,7 @@ func (r *Repository) Approve(
 	}
 
 	if !anchorFound {
-		return Proposal{}, ErrForbidden
+		return Proposal{}, ErrLeaderRequired
 	}
 
 	for _, currentGroupID := range ledGroups {
@@ -815,7 +815,21 @@ func (r *Repository) ListIDs(ctx context.Context, databaseID uuid.UUID, cursor *
 			return nil, ErrInvalidProposal
 		}
 	}
-	rows, err := r.db.Query(ctx, `SELECT id FROM app.migration_proposals WHERE database_id=$1 AND ($2::uuid IS NULL OR id < $2) ORDER BY id DESC LIMIT $3`, databaseID, cursor, limit)
+	rows, err := r.db.Query(ctx, `
+		SELECT proposal.id
+		FROM app.migration_proposals proposal
+		WHERE proposal.database_id = $1
+		  AND (
+		    $2::uuid IS NULL
+		    OR (proposal.created_at, proposal.id) < (
+		      SELECT cursor_row.created_at, cursor_row.id
+		      FROM app.migration_proposals cursor_row
+		      WHERE cursor_row.database_id = $1 AND cursor_row.id = $2
+		    )
+		  )
+		ORDER BY proposal.created_at DESC, proposal.id DESC
+		LIMIT $3
+	`, databaseID, cursor, limit)
 	if err != nil {
 		return nil, err
 	}

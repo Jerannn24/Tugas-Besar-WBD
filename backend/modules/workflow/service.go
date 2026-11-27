@@ -51,8 +51,8 @@ type Proposal struct {
 	SourceExecutionID   *string                       `json:"source_execution_id"`
 	Status              string                        `json:"status"`
 	Snapshot            Snapshot                      `json:"snapshot"`
-	SnapshotHash        string                        `json:"snapshot_hash"`
-	ApprovalFingerprint string                        `json:"approval_fingerprint"`
+	SnapshotHash        string                        `json:"-"`
+	ApprovalFingerprint string                        `json:"-"`
 	Validation          *executioncontract.Validation `json:"validation"`
 	Approvals           []Approval                    `json:"approvals"`
 	AllowedActions      []string                      `json:"allowed_actions"`

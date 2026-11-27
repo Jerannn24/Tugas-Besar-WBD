@@ -1,4 +1,3 @@
-
 package executioncontract
 
 import (
@@ -38,11 +37,11 @@ const (
 )
 
 const (
-	Apply      Action    = "apply"
-	Rollback   Action    = "rollback"
-	Forward    Action    = "forward"
-	Resume     Action    = "resume"
-	Compensate Action    = "compensate"
+	Apply      Action = "apply"
+	Rollback   Action = "rollback"
+	Forward    Action = "forward"
+	Resume     Action = "resume"
+	Compensate Action = "compensate"
 
 	Up   Direction = "up"
 	Down Direction = "down"
@@ -376,6 +375,7 @@ type ContractError struct {
 	Code        string            `json:"code"`
 	Message     string            `json:"message"`
 	FieldErrors map[string]string `json:"field_errors"`
+	Issues      []Issue           `json:"issues,omitempty"`
 	Retryable   bool              `json:"retryable"`
 }
 
