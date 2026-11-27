@@ -1,21 +1,26 @@
 package databaseapi
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/auth"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/authz"
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/modules/connections"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestRegisterRejectsMissingDependencies(t *testing.T) {
@@ -240,8 +245,8 @@ func TestRoutingFallbacks(t *testing.T) {
 	}{
 		{"GET", base + "/nope", 404, "NOT_FOUND"},
 		{"DELETE", base + "/migrations", 405, "METHOD_NOT_ALLOWED"},
-		{"GET", base + "/drafts/" + testDraft + "/execute", 405, "METHOD_NOT_ALLOWED"},
-		{"POST", base + "/drafts/" + testDraft + "/execute", 400, "INVALID_REQUEST"},
+		{"GET", base + "/drafts/" + testDraft + "/execute", 404, "NOT_FOUND"},
+		{"POST", base + "/drafts/" + testDraft + "/execute", 404, "NOT_FOUND"},
 		{"POST", base + "/migrations", 405, "METHOD_NOT_ALLOWED"},
 	}
 	for _, tt := range tests {
@@ -266,5 +271,93 @@ func TestRoutingHistoryValidationRuns(t *testing.T) {
 	}
 	if len(authorizer.required) != 1 || authorizer.required[0] != authz.AccessView {
 		t.Fatalf("history must authorize with view access, got %v", authorizer.required)
+	}
+}
+
+func TestViewerSQLLogsShareRequestTrace(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "sql error"}[fail], func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			query := mock.ExpectQuery("SELECT c.id::text,c.name")
+			if fail {
+				query.WillReturnError(&pgconn.PgError{Code: "42501", Message: "private-error"})
+			} else {
+				query.WillReturnRows(sqlmock.NewRows([]string{"id", "name", "access"}).
+					AddRow(testDB, "private-row", "view"))
+			}
+			var output bytes.Buffer
+			logger := telemetry.NewLogger(&output, slog.LevelInfo)
+			app := fiber.New()
+			app.Use(telemetry.Middleware(logger))
+			api := app.Group("/api", func(c *fiber.Ctx) error {
+				c.Locals("authz.actor", authz.Actor{ID: uuid.MustParse("c0000000-0000-4000-8000-0000000000c1")})
+				return c.Next()
+			})
+			stop, err := register(api, db, &fakeAuthorizer{}, connections.NewPoolManager(nil), logger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stop()
+			req := httptest.NewRequest("GET", "/api/databases", nil)
+			req.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+			req.Header.Set("X-Correlation-ID", "request-correlation")
+			req.Header.Set("X-Request-ID", "22222222-2222-4222-8222-222222222222")
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			wantStatus := http.StatusOK
+			if fail {
+				wantStatus = http.StatusInternalServerError
+			}
+			if resp.StatusCode != wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, wantStatus)
+			}
+			var events []map[string]any
+			for _, line := range bytes.Split(bytes.TrimSpace(output.Bytes()), []byte("\n")) {
+				var event map[string]any
+				if err := json.Unmarshal(line, &event); err != nil {
+					t.Fatal(err)
+				}
+				events = append(events, event)
+			}
+			if len(events) != 3 {
+				t.Fatalf("want start, finish, request; got %s", output.String())
+			}
+			span := strings.Split(resp.Header.Get("traceparent"), "-")
+			if len(span) != 4 {
+				t.Fatalf("invalid response traceparent: %q", resp.Header.Get("traceparent"))
+			}
+			for i, name := range []string{"sql.query.start", "sql.query.finish", "http.request.completed"} {
+				e := events[i]
+				if e["event"] != name || e["trace_id"] != "4bf92f3577b34da6a3ce929d0e0e4736" || e["span_id"] != span[2] || e["correlation_id"] != "request-correlation" {
+					t.Fatalf("unexpected event: %v", e)
+				}
+			}
+			finish := events[1]
+			if fail {
+				if finish["status"] != "error" || finish["rows"] != float64(0) || finish["sql_state"] != "42501" || finish["error"] != "query_failed" {
+					t.Fatalf("unexpected failure: %v", finish)
+				}
+			} else if finish["status"] != "ok" || finish["rows"] != float64(1) {
+				t.Fatalf("unexpected success: %v", finish)
+			}
+			for _, secret := range []string{"private-row", "private-error", "22222222-2222-4222-8222-222222222222"} {
+				if strings.Contains(output.String(), secret) {
+					t.Fatalf("logs contain %q: %s", secret, output.String())
+				}
+			}
+			if events[0]["params"] != "[REDACTED]" {
+				t.Fatalf("parameters not redacted: %v", events[0])
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

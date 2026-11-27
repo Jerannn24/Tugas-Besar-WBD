@@ -9,7 +9,7 @@ import { MutationAlert } from '../../components/MutationAlert'
 import { Panel } from '../../components/Panel'
 import { SESSION_ENDED_URL } from '../../lib/app'
 import { describeFailure, type MutationFailure } from '../../lib/mutation'
-import { useBeforeUnload } from '../../lib/unload'
+import { LeaveGuard } from '../../components/LeaveGuard'
 import { USERNAME_MAX, passwordError, usernameError } from './rules'
 
 const FIELDS = ['username', 'password', 'is_admin', 'is_active']
@@ -34,7 +34,6 @@ export function EditUser({ user, isSelf, onSaved, onClose }: Props) {
   if (form.is_active !== user.is_active) patch.is_active = form.is_active
   if (form.password !== '') patch.password = form.password
   const dirty = Object.keys(patch).length > 0
-  useBeforeUnload(dirty)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -75,6 +74,8 @@ export function EditUser({ user, isSelf, onSaved, onClose }: Props) {
   }
 
   return (
+    <>
+      <LeaveGuard when={dirty} />
     <Panel
       title={<>Edit user: <span className="mono">{user.username}</span></>}
       actions={
@@ -143,5 +144,6 @@ export function EditUser({ user, isSelf, onSaved, onClose }: Props) {
         </div>
       </form>
     </Panel>
+    </>
   )
 }

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 )
 
 type Actor struct{ ID string }
@@ -28,20 +30,35 @@ type Dependencies struct {
 type Handler struct{ d Dependencies }
 
 type Draft struct {
-	ID                 string    `json:"id"`
-	DatabaseID         string    `json:"database_id"`
-	Title              string    `json:"title"`
-	SQL                string    `json:"sql"`
-	Revision           int       `json:"revision"`
-	CreatedBy          string    `json:"created_by"`
-	CreatedAt          time.Time `json:"-"`
-	UpdatedAt          time.Time `json:"updated_at"`
-	AppliedExecutionID *string   `json:"applied_execution_id"`
+	ID                       string                         `json:"id"`
+	DatabaseID               string                         `json:"database_id"`
+	Title                    string                         `json:"title"`
+	SQL                      string                         `json:"sql"`
+	Revision                 int                            `json:"revision"`
+	CreatedBy                string                         `json:"created_by"`
+	CreatedAt                time.Time                      `json:"-"`
+	UpdatedAt                time.Time                      `json:"updated_at"`
+	AppliedExecutionID       *string                        `json:"applied_execution_id"`
+	IsApplied                bool                           `json:"is_applied"`
+	LatestExecutionID        *string                        `json:"latest_execution_id"`
+	LatestExecutionDirection *string                        `json:"latest_execution_direction"`
+	SQLDown                  *string                        `json:"sql_down,omitempty"`
+	IrreversibleReason       *string                        `json:"irreversible_reason,omitempty"`
+	Mode                     executioncontract.Mode         `json:"mode"`
+	Batch                    *executioncontract.BatchConfig `json:"batch"`
 }
 type input struct {
-	Title    string `json:"title"`
-	SQL      string `json:"sql"`
-	Revision *int   `json:"revision,omitempty"`
+	Title                 string                         `json:"title"`
+	SQL                   string                         `json:"sql"`
+	Revision              *int                           `json:"revision,omitempty"`
+	SQLDown               *string                        `json:"sql_down"`
+	IrreversibleReason    *string                        `json:"irreversible_reason"`
+	Mode                  *executioncontract.Mode        `json:"mode"`
+	Batch                 *executioncontract.BatchConfig `json:"batch"`
+	hasMode               bool
+	hasBatch              bool
+	hasSQLDown            bool
+	hasIrreversibleReason bool
 }
 
 func New(d Dependencies) (*Handler, error) {
@@ -67,7 +84,7 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.d.Platform.QueryContext(ctx, draftSelect+` WHERE database_id=$1 ORDER BY updated_at DESC,id`, id)
+	rows, err := h.d.Platform.QueryContext(ctx, draftSelect+` WHERE d.database_id=$1 ORDER BY d.updated_at DESC,d.id`, id)
 	if err != nil {
 		internal(w)
 		return
@@ -101,7 +118,7 @@ func (h *Handler) detail(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 400, "INVALID_REQUEST", "Invalid draft id")
 		return
 	}
-	d, err := scan(h.d.Platform.QueryRowContext(ctx, draftSelect+` WHERE database_id=$1 AND id=$2`, id, did))
+	d, err := scan(h.d.Platform.QueryRowContext(ctx, draftSelect+` WHERE d.database_id=$1 AND d.id=$2`, id, did))
 	if errors.Is(err, sql.ErrNoRows) {
 		notFound(w)
 		return
@@ -125,6 +142,18 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if validate(w, &in) != nil {
+		return
+	}
+	if !in.hasMode {
+		mode := executioncontract.Standard
+		in.Mode = &mode
+	}
+	if !validateBatch(w, *in.Mode, in.Batch) {
+		return
+	}
+	batch, err := json.Marshal(in.Batch)
+	if err != nil {
+		internal(w)
 		return
 	}
 	draftID, err := newUUID()
@@ -156,7 +185,10 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	d, err := scan(tx.QueryRowContext(ctx, `INSERT INTO app.migration_drafts(id,database_id,title,sql,revision,created_by,created_at,updated_at) VALUES($1,$2,$3,$4,1,$5,$6,$6) RETURNING id::text,database_id::text,title,sql,revision,created_by::text,created_at,updated_at,applied_execution_id::text`, draftID, id, in.Title, in.SQL, a.ID, now))
+	d, err := scan(tx.QueryRowContext(ctx, `INSERT INTO app.migration_drafts
+		(id,database_id,title,sql,revision,created_by,created_at,updated_at,sql_down,irreversible_reason,mode,batch)
+		VALUES($1,$2,$3,$4,1,$5,$6,$6,$7,$8,$9,NULLIF($10::jsonb,'null'::jsonb)) RETURNING `+draftProjection,
+		draftID, id, in.Title, in.SQL, a.ID, now, in.SQLDown, in.IrreversibleReason, *in.Mode, string(batch)))
 	if err != nil {
 		internal(w)
 		return
@@ -219,9 +251,34 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) {
 		accessError(w, err)
 		return
 	}
-	var d Draft
-	var applied sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT id::text,database_id::text,title,sql,revision,created_by::text,created_at,updated_at,applied_execution_id::text FROM app.migration_drafts WHERE database_id=$1 AND id=$2 FOR UPDATE`, id, did).Scan(&d.ID, &d.DatabaseID, &d.Title, &d.SQL, &d.Revision, &d.CreatedBy, &d.CreatedAt, &d.UpdatedAt, &applied)
+	// Check while holding the connection lock, before waiting on the draft
+	// row: the worker can hold the draft while authorizing against the connection.
+	var busy bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM app.migration_executions WHERE database_id=$1 AND draft_id=$2 AND status IN ('running','unknown')
+		UNION ALL
+		SELECT 1 FROM app.jobs WHERE database_id=$1 AND migration_id=$2
+			AND (status IN ('queued','running','retry_wait') OR blocks_database)
+	)`, id, did).Scan(&busy)
+	if err != nil {
+		internal(w)
+		return
+	}
+	if busy {
+		conflict(w, "DATABASE_BUSY")
+		return
+	}
+	var revision int
+	var locked bool
+	var oldSQLDown, oldReason *string
+	var oldMode executioncontract.Mode
+	var oldBatch []byte
+	err = tx.QueryRowContext(ctx, `SELECT revision, applied_execution_id IS NOT NULL OR revision_locked_at IS NOT NULL OR EXISTS (
+		SELECT FROM app.migration_history_entries h
+		WHERE h.database_id=d.database_id AND h.migration_id=d.id AND h.revision=d.revision
+		  AND h.job_id IS NOT NULL AND h.action='apply' AND h.direction='up'
+		), sql_down, irreversible_reason, mode, batch FROM app.migration_drafts d WHERE database_id=$1 AND id=$2 FOR UPDATE`,
+		id, did).Scan(&revision, &locked, &oldSQLDown, &oldReason, &oldMode, &oldBatch)
 	if errors.Is(err, sql.ErrNoRows) {
 		notFound(w)
 		return
@@ -230,30 +287,41 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) {
 		internal(w)
 		return
 	}
-	d.CreatedAt = d.CreatedAt.UTC()
-	d.UpdatedAt = d.UpdatedAt.UTC()
-	if applied.Valid {
+	if locked {
 		conflict(w, "ALREADY_APPLIED")
 		return
 	}
-	if d.Revision != expected {
+	if revision != expected || revision >= int(^uint32(0)>>1) {
 		conflict(w, "VERSION_CONFLICT")
 		return
 	}
-	if d.Revision >= int(^uint32(0)>>1) || expected > int(^uint32(0)>>1) {
-		conflict(w, "VERSION_CONFLICT")
+	if !in.hasSQLDown {
+		in.SQLDown = oldSQLDown
+	}
+	if !in.hasIrreversibleReason {
+		in.IrreversibleReason = oldReason
+	}
+	if !in.hasMode {
+		in.Mode = &oldMode
+	}
+	if !in.hasBatch && len(oldBatch) != 0 {
+		if err := json.Unmarshal(oldBatch, &in.Batch); err != nil {
+			internal(w)
+			return
+		}
+	}
+	if !validateBatch(w, *in.Mode, in.Batch) {
 		return
 	}
-	var busy bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM app.migration_executions WHERE database_id=$1 AND draft_id=$2 AND status IN ('running','unknown'))`, id, did).Scan(&busy); err != nil {
+	batch, err := json.Marshal(in.Batch)
+	if err != nil {
 		internal(w)
 		return
 	}
-	if busy {
-		conflict(w, "DATABASE_BUSY")
-		return
-	}
-	updated, err := scan(tx.QueryRowContext(ctx, `UPDATE app.migration_drafts SET title=$3,sql=$4,revision=revision+1,updated_at=GREATEST(clock_timestamp(),updated_at) WHERE database_id=$1 AND id=$2 AND revision=$5 RETURNING id::text,database_id::text,title,sql,revision,created_by::text,created_at,updated_at,applied_execution_id::text`, id, did, in.Title, in.SQL, expected))
+	updated, err := scan(tx.QueryRowContext(ctx, `UPDATE app.migration_drafts SET title=$3,sql=$4,
+		revision=revision+1,updated_at=GREATEST(clock_timestamp(),updated_at),sql_down=$6,irreversible_reason=$7,mode=$8,batch=NULLIF($9::jsonb,'null'::jsonb)
+		WHERE database_id=$1 AND id=$2 AND revision=$5 RETURNING `+draftProjection,
+		id, did, in.Title, in.SQL, expected, in.SQLDown, in.IrreversibleReason, *in.Mode, string(batch)))
 	if errors.Is(err, sql.ErrNoRows) {
 		conflict(w, "VERSION_CONFLICT")
 		return
@@ -269,18 +337,49 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) {
 	success(w, updated)
 }
 
-const draftSelect = `SELECT id::text,database_id::text,title,sql,revision,created_by::text,created_at,updated_at,applied_execution_id::text FROM app.migration_drafts`
+const draftReturningProjection = `id::text,database_id::text,title,sql,revision,created_by::text,created_at,updated_at,applied_execution_id::text,sql_down,irreversible_reason,mode,batch,
+	(applied_execution_id IS NOT NULL),applied_execution_id::text,
+	CASE WHEN applied_execution_id IS NOT NULL THEN 'up'::text ELSE NULL::text END`
+
+const draftSelect = `SELECT d.id::text,d.database_id::text,d.title,d.sql,d.revision,d.created_by::text,
+	d.created_at,d.updated_at,d.applied_execution_id::text,d.sql_down,d.irreversible_reason,d.mode,d.batch,
+	CASE WHEN m2.execution_id IS NOT NULL THEN m2.direction = 'up'
+	     ELSE d.applied_execution_id IS NOT NULL END AS is_applied,
+	COALESCE(m2.execution_id::text,d.applied_execution_id::text) AS latest_execution_id,
+	COALESCE(m2.direction,CASE WHEN d.applied_execution_id IS NOT NULL THEN 'up'::text ELSE NULL::text END) AS latest_execution_direction
+	FROM app.migration_drafts d
+	LEFT JOIN LATERAL (
+		SELECT h.execution_id,h.direction
+		FROM app.migration_history_entries h
+		WHERE h.database_id=d.database_id AND h.migration_id=d.id
+		  AND h.revision=d.revision AND h.job_id IS NOT NULL AND h.is_complete
+		ORDER BY h.version DESC,h.committed_at DESC,h.commit_id DESC
+		LIMIT 1
+	) m2 ON TRUE`
+
+const draftProjection = draftReturningProjection
 
 type rowScanner interface{ Scan(...any) error }
 
 func scan(row rowScanner) (Draft, error) {
 	var d Draft
-	var applied sql.NullString
-	err := row.Scan(&d.ID, &d.DatabaseID, &d.Title, &d.SQL, &d.Revision, &d.CreatedBy, &d.CreatedAt, &d.UpdatedAt, &applied)
+	var applied, latest, direction sql.NullString
+	var batch []byte
+	err := row.Scan(&d.ID, &d.DatabaseID, &d.Title, &d.SQL, &d.Revision, &d.CreatedBy, &d.CreatedAt, &d.UpdatedAt,
+		&applied, &d.SQLDown, &d.IrreversibleReason, &d.Mode, &batch, &d.IsApplied, &latest, &direction)
+	if err == nil && len(batch) != 0 {
+		err = json.Unmarshal(batch, &d.Batch)
+	}
 	d.CreatedAt = d.CreatedAt.UTC()
 	d.UpdatedAt = d.UpdatedAt.UTC()
 	if applied.Valid {
 		d.AppliedExecutionID = &applied.String
+	}
+	if latest.Valid {
+		d.LatestExecutionID = &latest.String
+	}
+	if direction.Valid {
+		d.LatestExecutionDirection = &direction.String
 	}
 	return d, err
 }
@@ -339,7 +438,7 @@ func decode(w http.ResponseWriter, r *http.Request, patch bool) (input, bool) {
 		return in, false
 	}
 	for key := range fields {
-		if key != "title" && key != "sql" && !(patch && key == "revision") {
+		if key != "title" && key != "sql" && key != "sql_down" && key != "irreversible_reason" && key != "mode" && key != "batch" && !(patch && key == "revision") {
 			apiError(w, 400, "INVALID_REQUEST", "Invalid JSON request")
 			return in, false
 		}
@@ -360,19 +459,54 @@ func decode(w http.ResponseWriter, r *http.Request, patch bool) (input, bool) {
 		apiError(w, 400, "INVALID_REQUEST", "Invalid JSON request")
 		return in, false
 	}
+	// A nil value clears a field only when the request actually included it.
+	_, in.hasSQLDown = fields["sql_down"]
+	_, in.hasIrreversibleReason = fields["irreversible_reason"]
+	_, in.hasMode = fields["mode"]
+	_, in.hasBatch = fields["batch"]
+	if in.hasMode && in.Mode == nil {
+		fieldError(w, "mode", "Must be standard or batch")
+		return in, false
+	}
 	return in, true
 }
 func validate(w http.ResponseWriter, in *input) error {
+	if in.hasMode && *in.Mode != executioncontract.Standard && *in.Mode != executioncontract.Batch {
+		fieldError(w, "mode", "Must be standard or batch")
+		return errors.New("invalid")
+	}
+	if in.Batch != nil && (in.Batch.BatchSize < 1 || in.Batch.BatchSize > 10000) {
+		fieldError(w, "batch", "Batch size must be between 1 and 10000")
+		return errors.New("invalid")
+	}
 	in.Title = strings.TrimSpace(in.Title)
 	if strings.ContainsRune(in.Title, 0) || len([]rune(in.Title)) < 1 || len([]rune(in.Title)) > 100 {
 		fieldError(w, "title", "Must contain 1 to 100 characters")
 		return errors.New("invalid")
 	}
-	if strings.TrimSpace(in.SQL) == "" || len(in.SQL) > 262144 || strings.IndexByte(in.SQL, 0) >= 0 {
+	if !validText(in.SQL, 262144) {
 		fieldError(w, "sql", "Must contain nonblank SQL up to 262144 bytes without NUL")
 		return errors.New("invalid")
 	}
+	if in.SQLDown != nil && !validText(*in.SQLDown, 262144) {
+		fieldError(w, "sql_down", "Must contain nonblank SQL up to 262144 bytes without NUL")
+		return errors.New("invalid")
+	}
+	if in.IrreversibleReason != nil && !validText(*in.IrreversibleReason, 1024) {
+		fieldError(w, "irreversible_reason", "Must contain nonblank text up to 1024 bytes without NUL")
+		return errors.New("invalid")
+	}
 	return nil
+}
+func validateBatch(w http.ResponseWriter, mode executioncontract.Mode, batch *executioncontract.BatchConfig) bool {
+	if (mode == executioncontract.Batch) != (batch != nil) {
+		fieldError(w, "batch", "Batch configuration must match mode and have a size between 1 and 10000")
+		return false
+	}
+	return true
+}
+func validText(value string, maxBytes int) bool {
+	return len(value) <= maxBytes && strings.IndexByte(value, 0) < 0 && strings.TrimSpace(value) != ""
 }
 func newUUID() (string, error) {
 	b := make([]byte, 16)

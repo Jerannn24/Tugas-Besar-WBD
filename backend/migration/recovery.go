@@ -2,9 +2,11 @@ package migration
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 
 	"github.com/Jerannn24/Tugas-Besar-WBD.git/history"
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 )
 
 func (h *Handler) Reconcile(ctx context.Context, databaseID, executionID string) (history.Execution, error) {
@@ -14,6 +16,7 @@ func (h *Handler) Reconcile(ctx context.Context, databaseID, executionID string)
 		return history.Execution{}, fault(400, "INVALID_REQUEST", "Invalid reconciliation request")
 	}
 	databaseID, executionID = strings.ToLower(databaseID), strings.ToLower(executionID)
+	ctx = telemetry.WithLogAttrs(ctx, slog.String("execution_id", executionID), slog.String("database_id", databaseID))
 	a, err := h.store.load(ctx, databaseID, executionID)
 	if err != nil {
 		return history.Execution{}, err

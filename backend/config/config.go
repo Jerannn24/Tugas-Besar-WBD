@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -41,7 +42,12 @@ func (c Config) Validate() error {
 }
 
 func LoadDB(config Config) *pgxpool.Pool {
-	dbpool, err := pgxpool.New(context.Background(), config.DB)
+	poolConfig, err := pgxpool.ParseConfig(config.DB)
+	if err != nil {
+		log.Fatalf("Unable to parse database configuration: %v\n", err)
+	}
+	poolConfig.ConnConfig.Tracer = telemetry.DefaultQueryTracer()
+	dbpool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
 	}

@@ -2,6 +2,7 @@
 
 interface ImportMetaEnv {
   readonly VITE_USE_FIXTURES?: string
+  readonly VITE_HISTORY_LIMIT?: string
 }
 
 interface ImportMeta {

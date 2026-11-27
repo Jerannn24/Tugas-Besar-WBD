@@ -30,6 +30,10 @@ type groupInput struct {
 	Name string `json:"name"`
 }
 
+type leaderInput struct {
+	UserID *uuid.UUID `json:"user_id"`
+}
+
 type membersInput struct {
 	UserIDs []uuid.UUID `json:"user_ids"`
 }
@@ -104,6 +108,22 @@ func (h *Handler) updateGroup(c *fiber.Ctx) error {
 		return invalid(c)
 	}
 	item, err := h.service.UpdateGroup(c.UserContext(), id, input.Name)
+	if err != nil {
+		return mapError(c, err)
+	}
+	return response.JSON(c, http.StatusOK, item)
+}
+
+func (h *Handler) setGroupLeader(c *fiber.Ctx) error {
+	id, err := parseID(c.Params("group_id"))
+	if err != nil {
+		return invalid(c)
+	}
+	var input leaderInput
+	if err := c.BodyParser(&input); err != nil {
+		return invalid(c)
+	}
+	item, err := h.service.SetGroupLeader(c.UserContext(), id, input.UserID)
 	if err != nil {
 		return mapError(c, err)
 	}
@@ -203,6 +223,8 @@ func mapError(c *fiber.Ctx, err error) error {
 		return response.Fail(c, http.StatusConflict, "CONFLICT", "Resource sudah ada")
 	case errors.Is(err, ErrLastAdmin):
 		return response.Fail(c, http.StatusConflict, "LAST_ACTIVE_ADMIN", "Admin aktif terakhir tidak dapat dinonaktifkan")
+	case errors.Is(err, ErrInvalidLeader):
+		return response.Fail(c, http.StatusConflict, "INVALID_GROUP_LEADER", "Leader harus merupakan anggota grup yang aktif")
 	default:
 		return internal(c)
 	}

@@ -1,10 +1,14 @@
-import type { LoginInput, SessionView } from '../api/types'
+import type { Actor, ID, LoginInput, SessionView } from '../api/types'
 import type { TransportRequest } from '../api/client'
-import { DATABASES_BY_USER, FIXTURE_CSRF_TOKEN, SESSION_LIFETIME_MS, USERS } from './data'
+import { DATABASES_BY_USER, FIXTURE_CSRF_TOKEN, SESSION_LIFETIME_MS, TARGETS, USERS } from './data'
 import { VIEWER, tableKey } from './viewer'
-import { fail, ok, parseBody } from './http'
+import { fail, failM2, ok, parseBody } from './http'
 import { NETWORK_DROP, handleMigrationRequest } from './migrations'
 import { handleAdminRequest } from './admin'
+import { workflowRoute } from './workflow'
+import { jobsRoute, settle } from './jobs'
+import { historyRoute } from './history'
+import { load, save, type Ctx } from './state'
 
 const SESSION_KEY = 'fixture_user'
 
@@ -46,7 +50,11 @@ const DATABASE_ROUTE = /^\/api\/databases\/([^/]+)\/(.+)$/
 function databaseRequest(req: TransportRequest, databaseId: string, rest: string): Response {
   let dropped = false
   const res = withUser(req, (username) => {
-    const result = handleMigrationRequest(req, username, databaseId, rest.split('/').map(decodeURIComponent))
+    const parts = rest.split('/').map(decodeURIComponent)
+    const result =
+      databaseId === TARGETS.demo_m2.id
+        ? domainRequest(req, username, databaseId, parts)
+        : (handleMigrationRequest(req, username, databaseId, parts) ?? domainRequest(req, username, databaseId, parts))
     if (result === NETWORK_DROP) {
       dropped = true
       return ok(null)
@@ -55,6 +63,44 @@ function databaseRequest(req: TransportRequest, databaseId: string, rest: string
   })
   if (dropped) throw new TypeError('Failed to fetch (simulasi fixture)')
   return res
+}
+
+const DOMAIN_RESOURCES = new Set(['proposals', 'jobs', 'attempts'])
+const knownDatabases = () => new Set(Object.values(DATABASES_BY_USER).flat().map((d) => d.id))
+
+function domainRequest(
+  req: TransportRequest,
+  username: string,
+  databaseId: ID,
+  parts: string[],
+): Response | typeof NETWORK_DROP | null {
+  const [resource, id, action, ...extra] = parts
+  const ownsAll = databaseId === TARGETS.demo_m2.id
+  if (!DOMAIN_RESOURCES.has(resource) && !(ownsAll && (resource === 'drafts' || resource === 'migrations'))) return null
+
+  if (!UUID.test(databaseId)) return failM2(400, 'INVALID_REQUEST', 'database_id tidak valid.')
+  const access = (DATABASES_BY_USER[username] ?? []).find((d) => d.id === databaseId)?.access
+  if (!access) {
+    return knownDatabases().has(databaseId)
+      ? failM2(403, 'FORBIDDEN', 'Anda tidak memiliki akses ke database ini.')
+      : failM2(404, 'NOT_FOUND', 'Database tidak ditemukan.')
+  }
+  if (id !== undefined && !UUID.test(id)) return failM2(400, 'INVALID_REQUEST', 'ID tidak valid.')
+  if (extra.length > 0) return failM2(404, 'NOT_FOUND', `Route tidak dikenal: ${req.method} ${req.path}`)
+
+  const user = USERS[username]
+  const actor: Actor = { id: user.id, username: user.username }
+  const state = load()
+  settle(state)
+  const key = `${req.method} ${resource}${id ? '/:id' : ''}${action ? `/${action}` : ''}`
+  const ctx: Ctx = { req, state, actor, access, databaseId, id }
+  const result =
+    workflowRoute(key, ctx) ??
+    jobsRoute(key, ctx) ??
+    historyRoute(key, ctx) ??
+    failM2(404, 'NOT_FOUND', `Fixture belum tersedia untuk ${req.method} ${req.path}.`)
+  save(state)
+  return ctx.dropResponse ? NETWORK_DROP : result
 }
 
 const VIEWER_ROUTE = /^\/api\/databases\/([^/]+)\/(schemas|table|rows)$/

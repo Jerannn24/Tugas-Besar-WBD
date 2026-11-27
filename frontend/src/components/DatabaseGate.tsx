@@ -1,6 +1,8 @@
 import type { ReactNode } from 'react'
+import { Link } from 'react-router'
 import type { DatabaseSummary, ID } from '../api/types'
 import { useDatabaseAccess } from '../lib/access'
+import { paths } from '../lib/paths'
 import { Alert } from './Alert'
 import { FailureAlert } from './FailureAlert'
 import { Loading } from './Loading'
@@ -21,7 +23,7 @@ export function DatabaseGate({ databaseId, children }: Props) {
       return (
         <Alert variant="warning" title="Database tidak tersedia">
           <p className="mb-2">Database tidak ditemukan atau Anda tidak memiliki akses ke database ini.</p>
-          <a href="/databases/">Kembali ke daftar database</a>
+          <Link to={paths.databases}>Kembali ke daftar database</Link>
         </Alert>
       )
     case 'ready':
@@ -52,7 +54,7 @@ function Denied({ status }: { status: number }) {
   return (
     <Alert variant={d.variant} title={d.title}>
       <p className="mb-2">{d.text}</p>
-      <a href="/databases/">Kembali ke daftar database</a>
+      <Link to={paths.databases}>Kembali ke daftar database</Link>
     </Alert>
   )
 }

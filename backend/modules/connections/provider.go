@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/telemetry"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/stdlib"
 )
@@ -84,6 +85,8 @@ func openRolePools(cfg targetConfig) (rolePools, error) {
 	if err != nil {
 		return rolePools{}, err
 	}
+	ec.Tracer = telemetry.DefaultQueryTracer()
+	pc.Tracer = telemetry.DefaultQueryTracer()
 	executor := stdlib.OpenDB(*ec)
 	// Executor sessions carry advisory locks and transaction state: never
 	// keep idle ones around for reuse.
@@ -321,6 +324,40 @@ func (m *PoolManager) Quiesce(id uuid.UUID) (func(bool), error) {
 			m.mu.Unlock()
 		})
 	}, nil
+}
+
+func (m *PoolManager) ConnectionStats() (active, idle int64) {
+	m.mu.Lock()
+	pools := make(map[*sql.DB]struct{})
+	for _, e := range m.entries {
+		if e.viewer != nil {
+			pools[e.viewer] = struct{}{}
+		}
+		if e.current != nil {
+			if e.current.pools.executor != nil {
+				pools[e.current.pools.executor] = struct{}{}
+			}
+			if e.current.pools.preparer != nil {
+				pools[e.current.pools.preparer] = struct{}{}
+			}
+		}
+		for generation := range e.retired {
+			if generation.pools.executor != nil {
+				pools[generation.pools.executor] = struct{}{}
+			}
+			if generation.pools.preparer != nil {
+				pools[generation.pools.preparer] = struct{}{}
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	for pool := range pools {
+		stats := pool.Stats()
+		active += int64(stats.InUse)
+		idle += int64(stats.Idle)
+	}
+	return active, idle
 }
 
 // ActiveLeases reports leases and in-flight reservations for id.

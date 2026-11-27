@@ -9,3 +9,5 @@ export function formatDateTime(value: string | null): string {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : dateTimeFormat.format(date)
 }
+
+export const shortId = (id: string): string => id.slice(0, 8)

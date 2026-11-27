@@ -135,6 +135,8 @@ Saat volume pertama kali dibuat, `db/init/10-provision.sh` membuat role serta da
 docker compose ps postgres
 ```
 
+PostgreSQL development mengaktifkan `track_commit_timestamp` agar worker dapat memverifikasi waktu commit di database target. Target PostgreSQL eksternal juga perlu mengaktifkan pengaturan ini sebelum menjalankan migrasi.
+
 ### 3. Terapkan migrasi platform
 
 ```sh
@@ -158,6 +160,8 @@ Perintah ini membuat schema `managed` dan role `wbd_target_<a|b>_executor`, `_pr
 docker compose up -d backend
 docker compose logs -f backend   # tunggu "Server starting on port 8080", lalu Ctrl+C
 ```
+
+Backend memerlukan migrasi platform `014_linear_job_sources` sebelum membuka HTTP. Dua worker antrean memungkinkan target yang berbeda diproses bersamaan; eksekusi lama dengan hasil belum pasti tetap memblokir targetnya. Saat menerima `SIGTERM` (misalnya dari `docker compose stop backend`) atau `SIGINT`, backend berhenti menerima trafik, memberi pekerjaan aktif waktu untuk selesai, lalu menutup pool database. Pekerjaan persisten yang belum selesai diperiksa kembali saat backend menyala.
 
 ### 6. Buka aplikasi
 
@@ -194,7 +198,9 @@ Untuk menjalankan lagi di hari berikutnya, cukup `docker compose up -d postgres 
 2. **Admin → Users**: buat akun user.
 3. **Admin → Groups**: buat grup, tambahkan anggota, lalu beri grant ke database.
 4. **Databases**: lihat schema dan isi tabel.
-5. **Migrations**: buat draft migrasi, jalankan, dan lihat riwayat eksekusi.
+5. **Migrations**: buat draft, lanjutkan ke review dan approval, lalu gunakan **Execute** di SPA. Tombol ini memanggil `POST /api/databases/{database_id}/proposals/{proposal_id}/jobs` dan menampilkan job. Eksekusi langsung dari draft tidak lagi tersedia.
+
+   Riwayat mendukung pagination dengan `?limit=20` dan parameter opsional `hide_rollback=true`; tanpa query, respons memakai bentuk legacy. Kelayakan rollback dan forward sudah ditentukan di backend, tetapi kontrol rollback dan forward pada SPA saat ini masih merupakan handoff frontend.
 
 ## Testing dan Quality Check
 
@@ -240,6 +246,15 @@ docker compose --profile test run --rm --no-deps \
   backend go test ./modules/auth/...
 ```
 
+### Bukti penerimaan performa
+
+Pada PostgreSQL 16.15 lokal terisolasi (target B), tabel `managed.batch_items` berisi 1.000.000 baris; dataset yang sama di-reset ke `processed=false` antara pengujian. Pengaturan: `shared_buffers=128MB`, `synchronous_commit=on`, dan default `fsync=on`.
+
+- Satu `UPDATE` tanpa batch: 8,524 detik.
+- Job batch yang disetujui, ukuran 10.000: 61,371 detik dari masuk antrean hingga teramati selesai; 100 batch / 1.000.000 baris di-commit.
+
+Batch menyediakan progres dan checkpoint, bukan klaim peningkatan kecepatan.
+
 ## Referensi Port dan Variabel
 
 | URL                         | Layanan                                       |
@@ -265,3 +280,138 @@ docker compose --profile test down -v   # hapus container DAN semua data databas
 - Junior Natra Situmorang - 13524055
 - Ishaq Irfan Farizal - 13524094
 - Reynard Nathanael - 13524103
+
+## Bonus Observability 
+
+Implementasi observability menyediakan tiga jenis telemetry untuk backend:
+
+1. **Logs**: structured JSON logs ditulis ke stdout dan dikirim ke OpenTelemetry Collector melalui OTLP/HTTP. Collector meneruskan logs ke Loki.
+2. **Traces**: trace HTTP request, operasi worker, dan query PostgreSQL dikirim ke Collector melalui OTLP/HTTP, lalu diteruskan ke Tempo.
+3. **Metrics**: backend menyediakan endpoint Prometheus pada `/api/metrics`. Prometheus melakukan scrape setiap 15 detik dan Grafana menampilkan dashboard yang diprovisikan otomatis.
+
+Stack observability terdiri dari OpenTelemetry Collector, Prometheus, Loki, Tempo, dan Grafana. Konfigurasi masing-masing service berada di `deploy/observability/` dan didefinisikan di `docker-compose.yaml`.
+
+### Prasyarat
+
+Selesaikan konfigurasi `.env`, build frontend, provisioning PostgreSQL, migrasi platform, dan profil database target sesuai bagian [Menjalankan Aplikasi](#menjalankan-aplikasi). Backend memerlukan migrasi platform `014_linear_job_sources` sebelum dapat berjalan.
+
+Pastikan `.env` sudah tersedia dan berisi konfigurasi database serta `JWT_SECRET`. Endpoint OTLP untuk backend sudah dikonfigurasi pada service `backend` di Compose:
+
+- `OTEL_SERVICE_NAME=dbplatform-backend`
+- `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318`
+
+Tidak perlu menambahkan endpoint Collector ke `.env` untuk penggunaan Compose standar.
+
+### Menjalankan stack observability
+
+Jika aplikasi dan migrasi sudah siap, jalankan service backend dan observability:
+
+```sh
+docker compose up -d --build backend prometheus loki tempo otel-collector grafana
+docker compose ps
+docker compose logs -f --tail 50 backend otel-collector
+```
+
+Untuk melihat structured logs backend secara langsung tanpa membuka Grafana:
+
+```sh
+docker compose logs -f backend
+```
+
+Untuk menghentikan tampilan log, tekan `Ctrl+C`; container tetap berjalan.
+
+### Endpoint dan akses
+
+| Komponen | URL | Fungsi |
+|---|---|---|
+| Backend metrics | http://localhost:8080/api/metrics | Metrics exposition format Prometheus |
+| Prometheus | http://localhost:9090 | Query dan status scrape metrics |
+| Grafana | http://localhost:3000 | Dashboard, Explore, dan korelasi telemetry |
+| Loki | http://localhost:3100 | Backend penyimpanan logs |
+| Tempo | http://localhost:3200 | Backend penyimpanan traces |
+| OpenTelemetry Collector | `localhost:4317` / `localhost:4318` | Receiver OTLP gRPC / HTTP |
+
+Grafana diprovisikan dengan data source Prometheus, Loki, dan Tempo. Login awal Grafana menggunakan `admin` / `admin` jika kredensial belum pernah diubah. Segera ganti password setelah login pertama.
+
+Dashboard **DB Platform Observability** tersedia pada folder **DB Platform**. Dashboard berisi sembilan panel:
+
+- Jobs per status.
+- Queue wait p95.
+- Migration duration p95.
+- Target lock wait p95.
+- Database pool connections.
+- Pool acquisition wait p95.
+- Retry count.
+- Committed batches.
+- Committed rows.
+
+Dashboard dan provisioning data source berada di:
+
+```text
+deploy/observability/grafana/dashboards/dbplatform.json
+deploy/observability/grafana/provisioning/dashboards/dashboards.yaml
+deploy/observability/grafana/provisioning/datasources/datasources.yaml
+```
+
+### Metrics yang tersedia
+
+Semua nama metric menggunakan prefix `dbplatform_`. Label dibatasi pada kumpulan nilai yang terkontrol; ID user, ID job, nama database, dan SQL tidak digunakan sebagai label metric.
+
+| Metric | Tipe | Label | Keterangan |
+|---|---|---|---|
+| `dbplatform_jobs` | Gauge | `status` | Jumlah job untuk setiap status (`queued`, `running`, `retry_wait`, `succeeded`, `failed`, dan status terminal lain yang didukung). |
+| `dbplatform_job_retries_total` | Counter | `reason` | Jumlah retry job. |
+| `dbplatform_queue_wait_seconds` | Histogram | `mode` | Waktu tunggu job sebelum attempt dimulai, dipisahkan menurut mode standard/batch. |
+| `dbplatform_lock_wait_seconds` | Histogram | `result` | Waktu tunggu PostgreSQL advisory lock. |
+| `dbplatform_migration_duration_seconds` | Histogram | `action`, `result` | Durasi attempt migration. |
+| `dbplatform_pool_connections` | Gauge | `state` | Jumlah koneksi aktif dan idle dari platform pool serta pool target yang dikelola. |
+| `dbplatform_pool_wait_seconds` | Histogram | `result` | Waktu untuk memperoleh koneksi target. |
+| `dbplatform_batches_committed_total` | Counter | `direction` | Jumlah batch yang memiliki commit proof, menurut arah `up`/`down`. |
+| `dbplatform_rows_committed_total` | Counter | `direction` | Jumlah row yang memiliki commit proof, menurut arah `up`/`down`. |
+
+Metrik job dan pool dikumpulkan secara periodik dengan interval lima detik. Prometheus melakukan scrape setiap 15 detik sesuai `deploy/observability/prometheus/prometheus.yml`.
+
+Contoh query pada Prometheus → Graph:
+
+```promql
+# Jumlah job berdasarkan status
+dbplatform_jobs
+
+# Koneksi aktif dan idle
+dbplatform_pool_connections
+
+# Retry per menit dalam jendela lima menit
+rate(dbplatform_job_retries_total[5m]) * 60
+
+# p95 waktu tunggu antrean
+histogram_quantile(0.95, sum by (le) (rate(dbplatform_queue_wait_seconds_bucket[5m])))
+
+# p95 durasi migration
+histogram_quantile(0.95, sum by (le) (rate(dbplatform_migration_duration_seconds_bucket[5m])))
+```
+
+### Logs dan traces
+
+Middleware HTTP menerima `traceparent` dan `tracestate` sesuai konteks trace, serta menerima `X-Correlation-ID` yang tervalidasi. Jika correlation ID tidak diberikan, trace ID digunakan sebagai correlation ID. Response mengembalikan `traceparent` dan `X-Correlation-ID` untuk membantu penelusuran request.
+
+Structured logs memuat event, timestamp, level, dan bila tersedia `trace_id`, `span_id`, serta `correlation_id`. Query PostgreSQL dicatat sebagai event dan span. Worker memulihkan trace context yang disimpan bersama job agar request awal dapat dikorelasikan dengan eksekusi worker.
+
+Untuk melihat logs, buka Grafana → **Explore** → pilih data source **Loki**. Untuk melihat trace, pilih data source **Tempo**. Trace ID dari log dapat digunakan untuk mencari trace terkait. Collector mengirim logs ke Loki dan traces ke Tempo; metrics dikumpulkan langsung oleh Prometheus dari endpoint backend.
+
+Informasi sensitif seperti password, token, secret, cookie, authorization, kredensial, dan parameter SQL disamarkan sebelum dicatat. Nilai parameter SQL tidak dicatat sebagai nilai asli. Telemetry exporter menggunakan antrean terbatas dan timeout agar pengiriman telemetry tidak menahan alur utama aplikasi; ketika antrean penuh atau Collector tidak tersedia, sebagian telemetry dapat terbuang tanpa menghentikan request aplikasi.
+
+### Memeriksa apakah telemetry masuk
+
+1. Pastikan semua container observability berstatus `Up` melalui `docker compose ps`.
+2. Buka `http://localhost:8080/api/metrics`; endpoint harus menampilkan teks Prometheus dengan nama metric `dbplatform_`.
+3. Buka Prometheus → **Status → Targets** dan pastikan target `dbplatform` berstatus **UP**.
+4. Buka Grafana dan pastikan dashboard **DB Platform Observability** muncul pada folder **DB Platform**.
+5. Buat aktivitas aplikasi, misalnya login, membuka halaman database, atau menjalankan job, lalu periksa logs di Loki dan traces di Tempo. Pengumpulan job metrics juga membutuhkan data job/attempt yang relevan.
+
+### Menghentikan stack
+
+```sh
+docker compose down
+```
+
+Perintah tersebut menghentikan container tetapi mempertahankan volume. Volume `prometheus-data`, `loki-data`, `tempo-data`, dan `grafana-data` menyimpan data observability. Gunakan `docker compose down -v` hanya jika memang ingin menghapus seluruh volume, termasuk data database dan observability.

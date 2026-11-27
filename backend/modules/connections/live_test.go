@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -181,6 +182,122 @@ func TestLiveBindReregisterAndAcquire(t *testing.T) {
 	renamed.Executor, renamed.Preparer = nil, nil
 	if got, err := e.repo.Update(e.ctx, again.ID, renamed, e.pm); err != nil || got.ExecutionReady || got.ExecutorUsername != nil {
 		t.Fatalf("unbind: %v %+v", err, got)
+	}
+}
+
+func TestLivePendingJobsPreventUnbindingAndDeletion(t *testing.T) {
+	requireURL := func(key string) string {
+		value := os.Getenv(key)
+		if value == "" {
+			if os.Getenv("TEST_INTEGRATION_REQUIRED") == "1" {
+				t.Fatalf("%s not set", key)
+			}
+			t.Skipf("%s not set", key)
+		}
+		return value
+	}
+	prefix := "MIGRATION_TEST_TARGET_"
+	if os.Getenv(prefix+"B_VIEWER_URL") != "" && os.Getenv(prefix+"B_EXECUTOR_URL") != "" && os.Getenv(prefix+"B_PREPARER_URL") != "" {
+		prefix += "B_"
+	}
+	targetConfig := func(role string) *pgx.ConnConfig {
+		key := prefix + role + "_URL"
+		cfg, err := pgx.ParseConfig(requireURL(key))
+		if err != nil {
+			t.Fatalf("invalid %s", key)
+		}
+		return cfg
+	}
+	viewer, executor, preparer := targetConfig("VIEWER"), targetConfig("EXECUTOR"), targetConfig("PREPARER")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, requireURL("MIGRATION_TEST_PLATFORM_URL"))
+	if err != nil {
+		t.Fatal("invalid MIGRATION_TEST_PLATFORM_URL")
+	}
+	t.Cleanup(pool.Close)
+	owner, err := pgx.Connect(ctx, requireURL("MIGRATION_TEST_OWNER_URL"))
+	if err != nil {
+		t.Fatal("connect with MIGRATION_TEST_OWNER_URL")
+	}
+	t.Cleanup(func() { _ = owner.Close(context.Background()) })
+	repo := NewRepository(pool, "queue-guard-test-key")
+	unbind := Input{
+		Name: "queue-guard-" + uuid.NewString(), Host: viewer.Host, Port: int(viewer.Port),
+		DatabaseName: viewer.Database, Username: viewer.User, Password: viewer.Password, SSLMode: "disable",
+		Executor: &RoleCredential{Username: executor.User, Password: &executor.Password},
+		Preparer: &RoleCredential{Username: preparer.User, Password: &preparer.Password},
+	}
+	item, err := repo.Create(ctx, unbind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup := func(q string, id uuid.UUID) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := owner.Exec(ctx, q, id); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { cleanup("DELETE FROM app.database_connections WHERE id=$1", item.ID) })
+	// Keep the seeded job out of claim and recovery while testing connection administration.
+	var jobID, actorID, proposalID, draftID uuid.UUID
+	err = owner.QueryRow(ctx, `WITH actor AS (
+		INSERT INTO app.users (id, username, password_hash)
+		VALUES (gen_random_uuid(), 'queue_guard_' || gen_random_uuid()::text, 'hash') RETURNING id
+	), draft AS (
+		INSERT INTO app.migration_drafts (id, database_id, revision, title, sql, created_by)
+		SELECT gen_random_uuid(), $1, 1, 'Queue guard', 'SELECT 1', id FROM actor RETURNING id, created_by
+	), proposal AS (
+		INSERT INTO app.migration_proposals (database_id, migration_id, revision, action, status, snapshot, snapshot_hash, created_by)
+		SELECT $1, id, 1, 'apply', 'draft', '{}'::jsonb, sha256('snapshot'::bytea), created_by FROM draft
+		RETURNING id, migration_id, created_by
+	)
+	INSERT INTO app.jobs (database_id, target_id, request_id, proposal_id, migration_id, revision, execution_id,
+		actor_id, action, direction, snapshot, snapshot_hash, next_retry_at, lease_expires_at)
+	SELECT c.id, c.execution_target_id, gen_random_uuid()::text, p.id, p.migration_id, 1, gen_random_uuid(),
+		p.created_by, 'apply', 'up', '{}'::jsonb, 'snapshot', 'infinity', 'infinity'
+	FROM proposal p JOIN app.database_connections c ON c.id=$1
+	RETURNING id, actor_id, proposal_id, migration_id`, item.ID).Scan(&jobID, &actorID, &proposalID, &draftID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanup("DELETE FROM app.jobs WHERE id=$1", jobID)
+		cleanup("DELETE FROM app.migration_proposals WHERE id=$1", proposalID)
+		cleanup("DELETE FROM app.migration_drafts WHERE id=$1", draftID)
+		cleanup("DELETE FROM app.users WHERE id=$1", actorID)
+	})
+	label := unbind
+	label.Name += "-renamed"
+	label.Password = ""
+	label.Executor = &RoleCredential{Username: executor.User}
+	label.Preparer = &RoleCredential{Username: preparer.User}
+	if updated, err := repo.Update(ctx, item.ID, label, nil); err != nil || updated.Name != label.Name {
+		t.Fatalf("label update with pending job: %+v, %v", updated, err)
+	}
+
+	unbind.Executor, unbind.Preparer = nil, nil
+	for _, state := range []struct {
+		status string
+		blocks bool
+	}{{"queued", false}, {"running", false}, {"retry_wait", false}, {"partial", true}} {
+		if _, err := owner.Exec(ctx, `UPDATE app.jobs SET status=$2, execution_status=$2, blocks_database=$3 WHERE id=$1`, jobID, state.status, state.blocks); err != nil {
+			t.Fatal(err)
+		}
+		// No local pool lifecycle: the durable guard protects other processes too.
+		if _, err := repo.Update(ctx, item.ID, unbind, nil); !errors.Is(err, ErrBusy) {
+			t.Errorf("update while job is %s: %v, want ErrBusy", state.status, err)
+		}
+		if err := repo.Delete(ctx, item.ID, nil); !errors.Is(err, ErrBusy) {
+			t.Errorf("delete while job is %s: %v, want ErrBusy", state.status, err)
+		}
+	}
+	if _, err := owner.Exec(ctx, `UPDATE app.jobs SET status='failed', execution_status='failed', blocks_database=false WHERE id=$1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Update(ctx, item.ID, unbind, nil); err != nil {
+		t.Fatalf("unbinding after clean failure: %v", err)
 	}
 }
 

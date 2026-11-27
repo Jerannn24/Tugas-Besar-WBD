@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"errors"
 
 	"github.com/google/uuid"
 )
@@ -50,6 +51,16 @@ func (s *Service) CreateGroup(ctx context.Context, name string) (Group, error) {
 
 func (s *Service) UpdateGroup(ctx context.Context, id uuid.UUID, name string) (Group, error) {
 	return s.repository.UpdateGroup(ctx, id, name)
+}
+
+func (s *Service) SetGroupLeader(ctx context.Context, id uuid.UUID, leaderID *uuid.UUID) (Group, error) {
+	repository, ok := s.repository.(interface {
+		SetGroupLeader(context.Context, uuid.UUID, *uuid.UUID) (Group, error)
+	})
+	if !ok {
+		return Group{}, errors.New("group leader repository is not configured")
+	}
+	return repository.SetGroupLeader(ctx, id, leaderID)
 }
 
 func (s *Service) DeleteGroup(ctx context.Context, id uuid.UUID) error {

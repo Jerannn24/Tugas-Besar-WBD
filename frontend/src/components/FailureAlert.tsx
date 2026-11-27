@@ -1,7 +1,9 @@
+import { Link } from 'react-router'
 import { errorMessage, type ApiFailure } from '../api/client'
 import { Alert } from './Alert'
 import { Button } from './Button'
 import { classifyFailure } from '../lib/failure'
+import { paths } from '../lib/paths'
 
 type Props = {
   failure: ApiFailure
@@ -29,7 +31,7 @@ export function FailureAlert({
     case 'expired':
       return (
         <Alert variant="warning" title="Sesi berakhir">
-          Mengalihkan ke <a href="/login/">halaman login</a>…
+          Mengalihkan ke <Link to={paths.login}>halaman login</Link>…
         </Alert>
       )
     case 'invalid':

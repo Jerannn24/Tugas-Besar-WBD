@@ -23,17 +23,23 @@ services:
       ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       FRONTEND_DIST: /app/web
+      OTEL_SERVICE_NAME: dbplatform-backend
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     ports:
       - "8080:8080"
     volumes:
       - ./backend:/app
       - ./frontend/dist:/app/web:ro
+    stop_grace_period: 90s
     depends_on:
       postgres:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
 
   postgres:
     image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+    command: ["postgres", "-c", "track_commit_timestamp=on"]
     environment:
       POSTGRES_USER: ${DB_DEV_BOOTSTRAP_USER:?Set DB_DEV_BOOTSTRAP_USER in .env}
       POSTGRES_PASSWORD: ${DB_DEV_BOOTSTRAP_PASSWORD:?Set DB_DEV_BOOTSTRAP_PASSWORD in .env}
@@ -58,6 +64,7 @@ services:
   postgres-test:
     image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
     profiles: ["test"]
+    command: ["postgres", "-c", "track_commit_timestamp=on"]
     environment:
       POSTGRES_USER: ${DB_TEST_BOOTSTRAP_USER:?Set DB_TEST_BOOTSTRAP_USER in .env}
       POSTGRES_PASSWORD: ${DB_TEST_BOOTSTRAP_PASSWORD:?Set DB_TEST_BOOTSTRAP_PASSWORD in .env}
@@ -78,7 +85,73 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+      
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./deploy/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    restart: unless-stopped
 
+  loki:
+    image: grafana/loki:3.5.0
+    volumes:
+      - ./deploy/observability/loki.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    command:
+      - "-config.file=/etc/loki/local-config.yaml"
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.8.0
+    volumes:
+      - ./deploy/observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+    command:
+      - "-config.file=/etc/tempo.yaml"
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.136.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./deploy/observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      - loki
+      - tempo
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    restart: unless-stopped
+    
 volumes:
   postgres-dev-data:
   postgres-test-data:
+
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  grafana-data:

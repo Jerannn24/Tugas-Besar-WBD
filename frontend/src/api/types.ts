@@ -26,10 +26,13 @@ export type SessionView = {
 
 export type CsrfView = { csrf_token: string };
 
-export type Group = { 
-  id: ID; 
-  name: string 
+export type Group = {
+  id: ID;
+  name: string;
+  leader_user_id: ID | null;
 };
+
+export type LeaderInput = { user_id: ID };
 
 export type GroupMembers = { 
   group_id: ID; 
@@ -133,6 +136,10 @@ export type Draft = {
   created_by: ID; 
   updated_at: string;
   applied_execution_id: ID | null;
+  sql_down?: string | null;
+  irreversible_reason?: string | null;
+  mode?: MigrationMode;
+  batch?: BatchConfig | null;
 };
 
 export type ExecutionStatus = 'running' | 'succeeded' | 'failed' | 'unknown';
@@ -159,6 +166,10 @@ export type Execution = {
     code: string; 
     message: string 
   } | null;
+  attempt_id?: ID;
+  execution_id?: ID;
+  source_execution_id?: ID;
+  reverts_execution_id?: ID;
 };
 
 export type ApiErrorBody = ApiError['error'];
@@ -216,7 +227,249 @@ export type DraftPatchInput = {
   revision: number 
 };
 
-export type ExecuteInput = { 
-  revision: number; 
-  request_id: string 
+export type DecimalString = string;
+export type JsonObject = Record<string, unknown>;
+
+export type MigrationAction = 'apply' | 'rollback' | 'forward' | 'resume' | 'compensate';
+export type Direction = 'up' | 'down';
+export type MigrationMode = 'standard' | 'batch';
+export type ProposalStatus = 'draft' | 'pending_review' | 'approved' | 'queued' | 'superseded';
+export type ValidationStatus = 'passed' | 'failed';
+export type ApprovalStatus = 'pending' | 'approved';
+export type JobStatus =
+  | 'queued'
+  | 'running'
+  | 'retry_wait'
+  | 'succeeded'
+  | 'failed'
+  | 'partial'
+  | 'partially_reverted'
+  | 'unknown';
+export type StatementOutcome = 'succeeded' | 'failed' | 'unknown';
+
+export type AllowedAction =
+  | 'submit_review'
+  | 'approve'
+  | 'enqueue'
+  | 'propose_apply'
+  | 'propose_rollback'
+  | 'propose_forward'
+  | 'propose_resume'
+  | 'propose_compensate'
+  | 'edit'
+  | 'discard';
+
+export type Success<T> = { success: true; data: T; error: null };
+export type Failure = { success: false; data: null; error: ApiErrorBody };
+
+export type CursorPage<T> = { items: T[]; next_cursor: string | null };
+export type Actor = { id: ID; username: string };
+
+export type BatchConfig = {
+  schema: string;
+  table: string;
+  cursor_column: string;
+  // 1–10000
+  batch_size: number;
+  parameters: JsonObject;
 };
+
+export type Snapshot = {
+  migration_id: ID;
+  database_id: ID;
+  title: string;
+  sql_up: string;
+  sql_down: string | null;
+  irreversible_reason: string | null;
+  revision: number;
+  mode: MigrationMode;
+  batch: BatchConfig | null;
+};
+
+export type Validation = {
+  status: ValidationStatus;
+  checked_at: string;
+  issues: { code: string; message: string }[];
+};
+
+export type Approval = {
+  group_id: ID;
+  leader_user_id: ID | null;
+  status: ApprovalStatus;
+  approved_at: string | null;
+};
+
+export type Proposal = {
+  proposal_id: ID;
+  database_id: ID;
+  migration_id: ID;
+  revision: number;
+  action: MigrationAction;
+  source_execution_id: ID | null;
+  status: ProposalStatus;
+  snapshot: Snapshot;
+  validation: Validation | null;
+  approvals: Approval[];
+  allowed_actions: AllowedAction[];
+};
+
+export type Progress = {
+  direction: Direction;
+  batches_committed: DecimalString;
+  rows_committed: DecimalString;
+  batches_reverted: DecimalString;
+  rows_reverted: DecimalString;
+  total_rows: DecimalString | null;
+};
+
+export type JobError = { code: string; message: string; retryable: boolean };
+
+export type JobAccepted = {
+  job_id: ID;
+  execution_id: ID;
+  proposal_id: ID;
+  database_id: ID;
+  status: JobStatus;
+  status_url: string;
+  replayed?: boolean;
+};
+
+export type JobView = JobAccepted & {
+  migration_id: ID;
+  revision: number;
+  action: MigrationAction;
+  mode: MigrationMode;
+  execution_status: JobStatus;
+  attempt_no: number;
+  blocks_database: boolean;
+  progress: Progress | null;
+  source_execution_id: ID | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  next_retry_at: string | null;
+  error: JobError | null;
+  allowed_actions: AllowedAction[];
+};
+
+export type Attempt = {
+  attempt_id: ID;
+  job_id: ID | null;
+  execution_id: ID;
+  database_id: ID;
+  migration_id: ID;
+  revision: number;
+  actor_id: ID;
+  attempt_no: number;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  error: JobError | null;
+  legacy_execution_id: ID | null;
+};
+
+export type BatchCommit = {
+  batch_index: DecimalString;
+  row_count: DecimalString;
+  committed_at: string;
+  receipt: string;
+  range_start: string | null;
+  range_end: string | null;
+  sql_snapshot: string;
+  safe_parameters: JsonObject;
+  job_id: ID;
+  executed_by: Actor;
+};
+
+export type HistoryEntry = {
+  execution_id: ID;
+  migration_id: ID;
+  revision: number;
+  version: DecimalString;
+  action: MigrationAction;
+  direction: Direction;
+  executed_by: Actor;
+  committed_at: string;
+  sql_snapshot: string;
+  source_execution_id: ID | null;
+  reverts_execution_id: ID | null;
+  is_complete: boolean;
+  batch_commits: BatchCommit[];
+  id: ID;
+  database_id: ID;
+  draft_id: ID;
+  draft_revision: number;
+  title: string;
+  sql: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  error: { code: string; message: string } | null;
+};
+
+export type LegacyHistory = {
+  version: DecimalString;
+  executed_by: Actor;
+  id: ID;
+  database_id: ID;
+  draft_id: ID;
+  draft_revision: number;
+  title: string;
+  sql: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  error: { code: string; message: string } | null;
+};
+
+export type HistoryStatement = {
+  ordinal: number;
+  batch_index: number | null;
+  sql: string;
+  parameters: JsonObject;
+  outcome: StatementOutcome;
+};
+
+export type HistoryAttemptRow = {
+  attempt_id: ID;
+  execution_id: ID;
+  migration_id: ID;
+  revision: number | null;
+  version: DecimalString | null;
+  actor: Actor | null;
+  action: MigrationAction;
+  direction: Direction;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  source_execution_id: ID | null;
+  sql_entered: boolean | null;
+  statements: HistoryStatement[];
+  commit: HistoryEntry | null;
+  is_active_head: boolean;
+  allowed_actions: AllowedAction[];
+};
+
+export type HistoryPage = CursorPage<HistoryAttemptRow> & { active_head_execution_id: ID | null };
+
+export type DraftInputM2 = {
+  title: string;
+  sql: string;
+  sql_down: string | null;
+  irreversible_reason: string | null;
+  mode: MigrationMode;
+  batch: BatchConfig | null;
+};
+
+export type DraftUpdateM2 = DraftInputM2 & { revision: number };
+
+export type ProposalCreate = {
+  migration_id: ID;
+  revision: number;
+  action: MigrationAction;
+  source_execution_id: ID | null;
+};
+
+export type RevisionRequest = { revision: number };
+export type ApprovalRequest = { revision: number; group_id: ID };
+export type EnqueueRequest = { request_id: string; revision: number };

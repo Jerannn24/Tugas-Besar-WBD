@@ -1,0 +1,23 @@
+== Lingkungan ==
+waktu (UTC)     : 2026-11-20T17:37:15Z
+host kernel     : Linux 6.18.58.1-microsoft-standard-WSL2
+host CPU        : 13th Gen Intel(R) Core(TM) i5-13450HX (8 logical)
+host RAM        : 10186396 kB
+docker          : ya, service postgres, image postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54, server 29.1.2
+container       : 8 cpu, 10186396 kB RAM
+postgres        : PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+setting         : shared_buffers=128MB work_mem=4MB max_wal_size=1GB synchronous_commit=on fsync=on wal_level=replica
+database / role : dev_target_b / wbd_target_b_executor
+rows / runs     : 500000 / 3
+query           : UPDATE managed.batch_items SET processed = TRUE;
+
+== Run ==
+run 1: reset 567.6 ms | UPDATE 1001.667 ms | updated=500000 processed_true=500000/500000 OK
+run 2: reset 500.3 ms | UPDATE 1066.531 ms | updated=500000 processed_true=500000/500000 OK
+run 3: reset 538.5 ms | UPDATE 1060.875 ms | updated=500000 processed_true=500000/500000 OK
+final reset: 540.8 ms (processed=false untuk 500000 row)
+
+== Ringkasan ==
+UPDATE ms min=1001.667 median=1060.875 max=1066.531
+PASS: semua run > 1000 ms dan hasil terverifikasi
+laporan: db/testdata/results/full_update_20261120T173714Z_500000.txt
