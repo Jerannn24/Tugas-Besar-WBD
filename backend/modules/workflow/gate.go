@@ -252,7 +252,8 @@ func (g *Gate) AllowedActions(ctx context.Context, actorID, databaseID, executio
 	var resume, compensate, rollback, forward bool
 	err = g.db.QueryRow(ctx, `SELECT
 		COALESCE(app.workflow_source_valid(j.database_id, d.execution_target_id, j.migration_id, j.revision, 'resume', j.execution_id, j.mode), false),
-		COALESCE(app.workflow_source_valid(j.database_id, d.execution_target_id, j.migration_id, j.revision, 'compensate', j.execution_id, j.mode), false),
+		COALESCE(app.workflow_source_valid(j.database_id, d.execution_target_id, j.migration_id, j.revision, 'compensate', j.execution_id, j.mode)
+		  AND `+executioncontract.ReversibleSnapshotSQL("j")+`, false),
 		COALESCE(app.workflow_source_valid(j.database_id, d.execution_target_id, j.migration_id, j.revision, 'rollback', j.execution_id, j.mode), false),
 		COALESCE(app.workflow_source_valid(j.database_id, d.execution_target_id, j.migration_id, j.revision, 'forward', j.execution_id, j.mode), false)
 		FROM app.jobs j

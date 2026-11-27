@@ -78,11 +78,18 @@ func (h *Handler) submit(c *fiber.Ctx) error {
 	proposal, err := h.service.Submit(c.UserContext(), actor.ID, id, revision)
 	if err != nil {
 		if errors.Is(err, ErrInvalidProposal) && proposal.Validation != nil && proposal.Validation.Status == "failed" {
+			code, message := "VALIDATION_FAILED", "Validasi migration gagal"
+			for _, issue := range proposal.Validation.Issues {
+				if issue.Code == "SQL_UNSUPPORTED" {
+					code, message = "SQL_UNSUPPORTED", "SQL batch di luar pola yang didukung"
+					break
+				}
+			}
 			return response.FailDetailed(
 				c,
 				http.StatusUnprocessableEntity,
-				"VALIDATION_FAILED",
-				"Validasi migration gagal",
+				code,
+				message,
 				false,
 				proposal.Validation.Issues,
 			)
@@ -295,7 +302,7 @@ func mapError(c *fiber.Ctx, err error) error {
 			status = http.StatusInternalServerError
 		case "TARGET_UNAVAILABLE":
 			status = http.StatusBadGateway
-		case "VALIDATION_FAILED":
+		case "VALIDATION_FAILED", "MIGRATION_IRREVERSIBLE":
 			status = http.StatusUnprocessableEntity
 		case "VERSION_CONFLICT", "PROPOSAL_STALE", "REVIEW_STALE", "CONFLICT":
 			status = http.StatusConflict

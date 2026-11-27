@@ -542,11 +542,39 @@ func validateSnapshot(snapshot Snapshot) executioncontract.Validation {
 	if strings.TrimSpace(snapshot.SQLUp) == "" {
 		issues = append(issues, executioncontract.Issue{Code: "INVALID_SQL", Message: "sql is required"})
 	}
+	if snapshot.Mode == string(executioncontract.Batch) {
+		issues = append(issues, batchIssues(snapshot)...)
+	}
 	status := "valid"
 	if len(issues) > 0 {
 		status = "invalid"
 	}
 	return executioncontract.Validation{Status: status, CheckedAt: time.Now().UTC(), Issues: issues}
+}
+
+func batchIssues(snapshot Snapshot) []executioncontract.Issue {
+	issues := []executioncontract.Issue{}
+	var cfg *executioncontract.BatchConfig
+	if snapshot.Batch != nil {
+		raw, err := json.Marshal(snapshot.Batch)
+		cfg = &executioncontract.BatchConfig{}
+		if err != nil || json.Unmarshal(raw, cfg) != nil {
+			cfg = nil
+		}
+	}
+	if executioncontract.ValidateBatchConfig(cfg) != nil {
+		issues = append(issues, executioncontract.Issue{Code: "INVALID_BATCH_CONFIG",
+			Message: "batch harus menargetkan managed.batch_items dengan cursor_column id dan batch_size 1..10000"})
+	}
+	if executioncontract.ValidateBatchSQL(executioncontract.Up, snapshot.SQLUp) != nil {
+		issues = append(issues, executioncontract.Issue{Code: "SQL_UNSUPPORTED",
+			Message: "sql_up batch harus sama dengan pola: UPDATE managed.batch_items SET processed = TRUE WHERE id = ANY($1::bigint[])"})
+	}
+	if snapshot.SQLDown != nil && executioncontract.ValidateBatchSQL(executioncontract.Down, *snapshot.SQLDown) != nil {
+		issues = append(issues, executioncontract.Issue{Code: "SQL_UNSUPPORTED",
+			Message: "sql_down batch harus sama dengan pola: UPDATE managed.batch_items SET processed = FALSE WHERE id = ANY($1::bigint[])"})
+	}
+	return issues
 }
 
 func digest(value any) ([32]byte, error) {

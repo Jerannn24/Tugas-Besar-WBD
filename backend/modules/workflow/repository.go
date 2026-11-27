@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 
+	"github.com/Jerannn24/Tugas-Besar-WBD.git/executioncontract"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -55,18 +56,27 @@ func (r *Repository) LoadDraft(ctx context.Context, databaseID, migrationID uuid
 }
 
 func (r *Repository) sourceSnapshot(ctx context.Context, databaseID, migrationID uuid.UUID, revision int, action string, source *uuid.UUID, mode string) (Snapshot, error) {
-	var valid bool
+	var valid, reversible bool
 	var raw []byte
 	err := r.db.QueryRow(ctx, `SELECT COALESCE(app.workflow_source_valid($1, d.execution_target_id, $2, $3, $4, $5, $6), false),
-		(SELECT j.snapshot FROM app.jobs j WHERE j.execution_id=$5 AND j.database_id=$1
-		 AND j.target_id=d.execution_target_id AND j.migration_id=$2 AND j.revision=$3 ORDER BY j.created_at,j.id LIMIT 1)
-		FROM app.database_connections d WHERE d.id=$1 AND d.deleted_at IS NULL`,
-		databaseID, migrationID, revision, action, source, mode).Scan(&valid, &raw)
+		src.snapshot, COALESCE(src.reversible, false)
+		FROM app.database_connections d
+		LEFT JOIN LATERAL (SELECT j.snapshot, `+executioncontract.ReversibleSnapshotSQL("j")+` AS reversible
+		 FROM app.jobs j WHERE j.execution_id=$5 AND j.database_id=$1
+		 AND j.target_id=d.execution_target_id AND j.migration_id=$2 AND j.revision=$3 ORDER BY j.created_at,j.id LIMIT 1) src ON true
+		WHERE d.id=$1 AND d.deleted_at IS NULL`,
+		databaseID, migrationID, revision, action, source, mode).Scan(&valid, &raw, &reversible)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	if !valid {
 		return Snapshot{}, ErrInvalidProposal
+	}
+	if action == string(executioncontract.Compensate) && !reversible {
+		return Snapshot{}, executioncontract.ContractError{
+			Code:    "MIGRATION_IRREVERSIBLE",
+			Message: "Migration tidak dapat dikompensasi karena tidak memiliki SQL down",
+		}
 	}
 	var snapshot Snapshot
 	if err := json.Unmarshal(raw, &snapshot); err != nil {

@@ -39,7 +39,7 @@ export function Propose({ databaseId, row }: { databaseId: ID; row: HistoryAttem
       {offers.map((o) => (
         <Button
           key={o.action}
-          variant="outline-primary"
+          variant={o.danger ? 'outline-danger' : 'outline-primary'}
           pending={pending === o.action}
           disabled={pending !== null && pending !== o.action}
           onClick={() => void propose(o.action)}

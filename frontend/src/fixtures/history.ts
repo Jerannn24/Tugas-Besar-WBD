@@ -34,7 +34,7 @@ function rowActions(a: AttemptRecord, rc: RowContext): AllowedAction[] {
   const draft = rc.state.drafts.find((d) => d.id === a.migration_id && d.database_id === a.database_id)
   if (!draft || draft.revision !== a.revision) return []
   const actions: AllowedAction[] = []
-  if (a.execution_id === rc.head && draft.sql_down) actions.push('propose_rollback')
+  if (a.execution_id === rc.head && draft.sql_down) actions.push(draft.mode === 'batch' ? 'propose_compensate' : 'propose_rollback')
   if (rc.reverted.has(a.execution_id) && rc.head !== a.execution_id) actions.push('propose_forward')
   return actions
 }

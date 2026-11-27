@@ -29,6 +29,7 @@ func TestMapErrorContractMatchesAPIContract(t *testing.T) {
 		{name: "approval required", err: ErrPendingApprovals, status: http.StatusConflict, code: "APPROVAL_REQUIRED"},
 		{name: "leader required", err: ErrLeaderRequired, status: http.StatusForbidden, code: "LEADER_REQUIRED"},
 		{name: "validation failed", err: executioncontract.ContractError{Code: "VALIDATION_FAILED", Message: "invalid", Issues: []executioncontract.Issue{issue}}, status: http.StatusUnprocessableEntity, code: "VALIDATION_FAILED", hasIssues: true},
+		{name: "migration irreversible", err: executioncontract.ContractError{Code: "MIGRATION_IRREVERSIBLE", Message: "no sql down"}, status: http.StatusUnprocessableEntity, code: "MIGRATION_IRREVERSIBLE"},
 		{name: "retryable internal", err: executioncontract.ContractError{Code: "INTERNAL_ERROR", Message: "temporarily unavailable", Retryable: true}, status: http.StatusInternalServerError, code: "INTERNAL_ERROR", retryable: true},
 	}
 

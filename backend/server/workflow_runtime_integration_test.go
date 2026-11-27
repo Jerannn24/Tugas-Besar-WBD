@@ -312,6 +312,7 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 		t.Fatalf("expected one complete job-linked history projection, matches=%t: %v", projectedOnce, err)
 	}
 
+	var extraApprovals []func(path string, revision int)
 	runApproved := func(migrationID string, revision int, action executioncontract.Action, source *string, want executioncontract.JobStatus) executioncontract.JobView {
 		t.Helper()
 		var next workflow.Proposal
@@ -323,6 +324,9 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 		review.request(t, post, path+"/approvals", workflow.ApproveInput{
 			GroupID: groupID.String(), Revision: next.Revision,
 		}, http.StatusOK, &next)
+		for _, approve := range extraApprovals {
+			approve(path, next.Revision)
+		}
 		var queued workflow.EnqueueOutput
 		edit.request(t, post, path+"/jobs", workflow.EnqueueInput{RequestID: uuid.NewString(), Revision: next.Revision}, http.StatusAccepted, &queued)
 		return waitForWorkflowJob(t, ctx, edit, queued.StatusURL, want)
@@ -397,18 +401,136 @@ func TestWorkflowRuntimePostgreSQL(t *testing.T) {
 				t.Fatalf("processed=%d, want %d: %v", got, want, err)
 			}
 		}
+		batchConfig := executioncontract.BatchConfig{Schema: "managed", Table: "batch_items", CursorColumn: "id", BatchSize: 2}
+		var unsupported drafts.Draft
+		edit.request(t, post, databasePath+"/drafts", map[string]any{
+			"title": "Batch unsupported pattern", "mode": executioncontract.Batch,
+			"sql":      "UPDATE managed.batch_items SET processed = TRUE",
+			"sql_down": "UPDATE managed.batch_items SET processed = FALSE WHERE id = ANY($1::bigint[]);",
+			"batch":    batchConfig,
+		}, http.StatusCreated, &unsupported)
+		var rejected workflow.Proposal
+		edit.request(t, post, databasePath+"/proposals", workflow.CreateInput{
+			MigrationID: unsupported.ID, Revision: unsupported.Revision, Action: string(executioncontract.Apply),
+		}, http.StatusCreated, &rejected)
+		rejectedPath := databasePath + "/proposals/" + rejected.ProposalID
+		if code := edit.request(t, post, rejectedPath+"/submit-review", map[string]int{"revision": rejected.Revision}, http.StatusUnprocessableEntity, nil); code != "SQL_UNSUPPORTED" {
+			t.Fatalf("submit of unsupported batch SQL error=%q, want SQL_UNSUPPORTED", code)
+		}
+		edit.request(t, get, rejectedPath, nil, http.StatusOK, &rejected)
+		if rejected.Status != "draft" || rejected.Validation == nil || rejected.Validation.Status != "failed" ||
+			len(rejected.Validation.Issues) != 1 || rejected.Validation.Issues[0].Code != "SQL_UNSUPPORTED" {
+			t.Fatalf("unsupported batch should stay draft with a SQL_UNSUPPORTED issue: %+v", rejected)
+		}
+		var unsupportedJobs int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM app.jobs WHERE migration_id=$1`, unsupported.ID).Scan(&unsupportedJobs); err != nil || unsupportedJobs != 0 {
+			t.Fatalf("unsupported batch must not reach the queue: jobs=%d err=%v", unsupportedJobs, err)
+		}
+		outsider := login(createUser("outsider"))
+		if code := outsider.request(t, post, rejectedPath+"/submit-review", map[string]int{"revision": rejected.Revision}, http.StatusForbidden, nil); code != "FORBIDDEN" {
+			t.Fatalf("submit without access error=%q, want FORBIDDEN", code)
+		}
+		if code := outsider.request(t, get, databasePath+"/migrations?limit=20", nil, http.StatusForbidden, nil); code != "FORBIDDEN" {
+			t.Fatalf("history without access error=%q, want FORBIDDEN", code)
+		}
+
+		rowActions := func(client workflowSmokeClient, execution string) []string {
+			t.Helper()
+			client.request(t, get, databasePath+"/migrations?limit=20", nil, http.StatusOK, &list)
+			for _, item := range list.Items {
+				if item.ExecutionID == execution && item.Status == string(executioncontract.Succeeded) {
+					return item.AllowedActions
+				}
+			}
+			t.Fatalf("execution %s missing from history: %+v", execution, list.Items)
+			return nil
+		}
 		batch := runApproved(draft.ID, draft.Revision, executioncontract.Apply, nil, executioncontract.Succeeded)
 		checkBatch(3)
+		if !slices.Contains(batch.AllowedActions, executioncontract.AllowedAction("propose_compensate")) {
+			t.Fatalf("reversible batch job should offer compensation: %v", batch.AllowedActions)
+		}
+		if actions := rowActions(edit, batch.ExecutionID); !slices.Contains(actions, "propose_compensate") || slices.Contains(actions, "propose_rollback") {
+			t.Fatalf("active batch head should offer compensation only: %v", actions)
+		}
 		compensation := runApproved(draft.ID, draft.Revision, executioncontract.Compensate, &batch.ExecutionID, executioncontract.Succeeded)
 		checkBatch(0)
+		if actions := rowActions(edit, batch.ExecutionID); slices.Contains(actions, "propose_compensate") {
+			t.Fatalf("compensated batch must not offer compensation again: %v", actions)
+		}
 		edit.request(t, get, databasePath+"/migrations?limit=20&hide_rollback=true", nil, http.StatusOK, &list)
 		for _, item := range list.Items {
 			if item.ExecutionID == batch.ExecutionID || item.ExecutionID == compensation.ExecutionID {
 				t.Fatalf("fully compensated batch should be hidden: %+v", list.Items)
 			}
 		}
-		runApproved(draft.ID, draft.Revision, executioncontract.Forward, &batch.ExecutionID, executioncontract.Succeeded)
+		forwardBatch := runApproved(draft.ID, draft.Revision, executioncontract.Forward, &batch.ExecutionID, executioncontract.Succeeded)
 		checkBatch(3)
+		if actions := rowActions(edit, forwardBatch.ExecutionID); !slices.Contains(actions, "propose_compensate") {
+			t.Fatalf("forwarded batch head should offer compensation: %v", actions)
+		}
+		viewer := createUser("viewer")
+		viewGroup := uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO app.groups (id,name,leader_user_id) VALUES ($1,$2,$3)`, viewGroup, "view-"+suffix, viewer.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO app.group_memberships (group_id,user_id) VALUES ($1,$2)`, viewGroup, viewer.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO app.group_database_grants (group_id,database_id,access) VALUES ($1,$2,'view')`, viewGroup, connection.ID); err != nil {
+			t.Fatal(err)
+		}
+		viewerClient := login(viewer)
+		if actions := rowActions(viewerClient, forwardBatch.ExecutionID); len(actions) != 0 {
+			t.Fatalf("view-only user must not get batch actions: %v", actions)
+		}
+		if actions := rowActions(edit, forwardBatch.ExecutionID); !slices.Contains(actions, "propose_compensate") {
+			t.Fatalf("editor should keep compensation after roster change: %v", actions)
+		}
+		extraApprovals = append(extraApprovals, func(path string, revision int) {
+			viewerClient.request(t, post, path+"/approvals", workflow.ApproveInput{GroupID: viewGroup.String(), Revision: revision}, http.StatusOK, nil)
+		})
+		var irreversibleDraft drafts.Draft
+		edit.request(t, post, databasePath+"/drafts", map[string]any{
+			"title": "Batch without rollback SQL", "mode": executioncontract.Batch,
+			"sql":                 "UPDATE managed.batch_items SET processed = TRUE WHERE id = ANY($1::bigint[]);",
+			"irreversible_reason": "Test only",
+			"batch":               batchConfig,
+		}, http.StatusCreated, &irreversibleDraft)
+		if _, err := target.Exec(ctx, `UPDATE managed.batch_items SET processed = false`); err != nil {
+			t.Fatal(err)
+		}
+		irreversible := runApproved(irreversibleDraft.ID, irreversibleDraft.Revision, executioncontract.Apply, nil, executioncontract.Succeeded)
+		checkBatch(3)
+		var head *string
+		if err := pool.QueryRow(ctx, `SELECT active_head_execution_id::text FROM app.migration_active_heads WHERE database_id=$1`, connection.ID).Scan(&head); err != nil ||
+			head == nil || *head != irreversible.ExecutionID {
+			t.Fatalf("irreversible batch apply should be the active head: head=%v err=%v", head, err)
+		}
+		var irreversibleJob executioncontract.JobView
+		edit.request(t, get, irreversible.StatusURL, nil, http.StatusOK, &irreversibleJob)
+		if slices.Contains(irreversibleJob.AllowedActions, executioncontract.AllowedAction("propose_compensate")) {
+			t.Fatalf("irreversible batch job must not offer compensation: %v", irreversibleJob.AllowedActions)
+		}
+		if actions := rowActions(edit, irreversible.ExecutionID); slices.Contains(actions, "propose_compensate") {
+			t.Fatalf("irreversible batch history row must not offer compensation: %v", actions)
+		}
+		if code := edit.request(t, post, databasePath+"/proposals", workflow.CreateInput{
+			MigrationID: irreversibleDraft.ID, Revision: irreversibleDraft.Revision,
+			Action: string(executioncontract.Compensate), SourceExecutionID: &irreversible.ExecutionID,
+		}, http.StatusUnprocessableEntity, nil); code != "MIGRATION_IRREVERSIBLE" {
+			t.Fatalf("compensate of irreversible batch error=%q, want MIGRATION_IRREVERSIBLE", code)
+		}
+		if code := outsider.request(t, post, databasePath+"/proposals", workflow.CreateInput{
+			MigrationID: irreversibleDraft.ID, Revision: irreversibleDraft.Revision,
+			Action: string(executioncontract.Compensate), SourceExecutionID: &irreversible.ExecutionID,
+		}, http.StatusForbidden, nil); code != "FORBIDDEN" {
+			t.Fatalf("compensate without access error=%q, want FORBIDDEN", code)
+		}
+		var irreversibleProposals int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM app.migration_proposals WHERE migration_id=$1 AND action='compensate'`, irreversibleDraft.ID).Scan(&irreversibleProposals); err != nil || irreversibleProposals != 0 {
+			t.Fatalf("rejected compensation must not create a proposal: count=%d err=%v", irreversibleProposals, err)
+		}
 	}
 }
 
